@@ -16,7 +16,7 @@ static const char *WIFI_SSID = "NETGEAR11";
 static const char *WIFI_PASS = "breezypiano838";
 
 // ===== DS18B20 on D5 (GPIO14) =====
-#define ONE_WIRE_BUS D5 // Wemos D1 mini alias for GPIO14
+#define ONE_WIRE_BUS D4 // Wemos D1 mini alias for GPIO14
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 
@@ -121,30 +121,40 @@ void loop()
 
   // Request and read temperature
   sensors.requestTemperatures();
-  float tempC = sensors.getTempCByIndex(0); // first sensor on the bus
+  float tempC = sensors.getTempCByIndex(0); // first sensor
 
-  // Handle read errors
   bool valid = (tempC != DEVICE_DISCONNECTED_C && tempC > -100 && tempC < 125);
-  if (!valid)
-  {
-    Serial.println("[DS18B20] Read failed (disconnected or invalid)");
-  }
 
-  // Build a compact JSON payload
+  // Build JSON
   JsonDocument doc;
   doc["type"] = "telemetry";
   doc["count"] = counter;
-  doc["temp"] = valid ? tempC : nullptr; // send null if invalid
+  if (valid)
+  {
+    doc["temp"] = tempC;
+  }
+  else
+  {
+    doc["temp"] = nullptr; // or comment this line to omit the field
+  }
   doc["note"] = "d1mini-ds18b20@D5";
 
   char buf[200];
-  size_t n = serializeJson(doc, buf, sizeof(buf)); // <= ~250B for ESP-NOW
+  size_t n = serializeJson(doc, buf, sizeof(buf)); // keep < ~250B
 
-  // ESP8266 esp_now_send signature uses non-const pointer; cast is fine here
+  // esp_now_send needs non-const pointer + int len on ESP8266
   uint8_t rc = esp_now_send(TARGET, (uint8_t *)buf, (int)n);
+
   Serial.print("[TX] send -> ");
-  Serial.println(rc == 0 ? "OK" : rc);
+  if (rc == 0)
+  {
+    Serial.println("OK");
+  }
+  else
+  {
+    Serial.println(rc);
+  }
 
   counter++;
-  delay(1000); // 1 Hz updates; DS18B20 at 12-bit takes ~750ms conversion
+  delay(1000);
 }
