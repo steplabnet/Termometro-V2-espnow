@@ -17,6 +17,7 @@
 #include <DallasTemperature.h>
 #include <LittleFS.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266mDNS.h>
 #include <time.h>
 
 extern "C"
@@ -27,6 +28,8 @@ extern "C"
 // ===== Wi‑Fi credentials (change if needed) =====
 static const char *WIFI_SSID = "NETGEAR11";
 static const char *WIFI_PASS = "breezypiano838";
+// Hostname for DHCP + mDNS (.local)
+static const char *HOSTNAME = "esp-thermo";
 
 // ===== Timezone / NTP =====
 // Europe/Rome (CET/CEST): TZ string below handles DST automatically
@@ -50,14 +53,16 @@ float setpoints[7][24];
 // ===== Web server
 ESP8266WebServer server(80);
 
-// ===== Simple utility =====
+// ===== Utilities =====
 static void printMac(const uint8_t *mac)
 {
   for (int i = 0; i < 6; ++i)
   {
     if (i)
       Serial.print(":");
-    Serial.printf("%02X", mac[i]);
+    char b[3];
+    sprintf(b, "%02X", mac[i]);
+    Serial.print(b);
   }
 }
 
@@ -78,9 +83,7 @@ const char INDEX_HTML[] PROGMEM = R"HTML(
 <meta name="viewport" content="width=device-width, initial-scale=1" />
 <title>ESP8266 Scheduler</title>
 <style>
-:root{
-  --bg:#f6f9ff; --card:#ffffff; --muted:#3c5a82; --accent:#2d6cdf; --accent-2:#4e89ff; --border:#d8e3f8; --ok:#1e9e4a; --err:#c62828;
-}
+:root{ --bg:#f6f9ff; --card:#ffffff; --muted:#3c5a82; --accent:#2d6cdf; --accent-2:#4e89ff; --border:#d8e3f8; --ok:#1e9e4a; --err:#c62828; }
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:#0b274d;font:14px ui-sans-serif,system-ui,Segoe UI,Roboto,Arial}
 .header{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);position:sticky;top:0;background:linear-gradient(180deg,#f6f9ff,#eef4ff)}
@@ -247,7 +250,8 @@ void loadSetpoints()
   f.close();
   if (e)
   {
-    Serial.printf("[FS] JSON load error: %s\n", e.c_str());
+    Serial.print("[FS] JSON load error: ");
+    Serial.println(e.c_str());
     return;
   }
   JsonArray outer = doc["grid"].as<JsonArray>();
@@ -354,14 +358,18 @@ void handleTime()
   server.send(200, "application/json", out);
 }
 
-// ===== Wi‑Fi / NTP =====
+// ===== Wi‑Fi / NTP / mDNS =====
 static void connectWiFi()
 {
-  Serial.printf("[TX] Connecting to %s ...\n", WIFI_SSID);
+  Serial.print("[TX] Connecting to ");
+  Serial.print(WIFI_SSID);
+  Serial.println(" ...");
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
   WiFi.disconnect(true);
   delay(100);
+  // Set hostname before connecting
+  WiFi.hostname(HOSTNAME);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000)
@@ -372,7 +380,12 @@ static void connectWiFi()
   Serial.println();
   if (WiFi.status() == WL_CONNECTED)
   {
-    Serial.printf("[TX] WiFi OK. IP=%s  RSSI=%d dBm  CH=%d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.channel());
+    Serial.print("[TX] WiFi OK. IP=");
+    Serial.print(WiFi.localIP());
+    Serial.print("  RSSI=");
+    Serial.print(WiFi.RSSI());
+    Serial.print(" dBm  CH=");
+    Serial.println(WiFi.channel());
   }
   else
   {
@@ -389,12 +402,34 @@ static void setupTimeNTP()
     time_t now = time(nullptr);
     if (now > 1700000000)
     { // sanity (2023+)
-      Serial.printf("[TIME] Synced: %lu\n", (unsigned long)now);
+      Serial.print("[TIME] Synced: ");
+      Serial.println((unsigned long)now);
       return;
     }
     delay(500);
   }
   Serial.println("[TIME] NTP sync timeout; will continue without exact time.");
+}
+
+static void setupMDNS()
+{
+  if (WiFi.status() != WL_CONNECTED)
+    return;
+
+  // Try a few times in case Wi-Fi just came up
+  for (int i = 0; i < 5; i++)
+  {
+    if (MDNS.begin(HOSTNAME))
+    {
+      MDNS.addService("http", "tcp", 80);
+      Serial.print("[MDNS] Started: http://");
+      Serial.print(HOSTNAME);
+      Serial.println(".local/");
+      return;
+    }
+    delay(500);
+  }
+  Serial.println("[MDNS] Failed to start mDNS");
 }
 
 // ===== Helpers =====
@@ -429,9 +464,10 @@ void setup()
   sensors.setResolution(12);
   Serial.println("[DS18B20] Started on D5");
 
-  // Wi‑Fi + Time
+  // Wi‑Fi + Time + mDNS
   connectWiFi();
   setupTimeNTP();
+  setupMDNS();
 
   // Web server routes
   server.on("/", HTTP_GET, handleIndex);
@@ -449,9 +485,11 @@ void setup()
     Serial.println("[TX] Using fallback channel=1");
   }
   wifi_set_channel(channel);
-  Serial.printf("[TX] Locked radio to channel %d\n", channel);
+  Serial.print("[TX] Locked radio to channel ");
+  Serial.println(channel);
   int rc = esp_now_init();
-  Serial.printf("[TX] esp_now_init -> %d\n", rc);
+  Serial.print("[TX] esp_now_init -> ");
+  Serial.println(rc);
   if (rc != 0)
   {
     Serial.println("[TX] ESPNOW init failed; rebooting...");
@@ -466,12 +504,17 @@ void setup()
   Serial.print(") -> ");
   Serial.println(rc);
 
-  Serial.printf("[TX] STA MAC: %s\n", WiFi.macAddress().c_str());
-  Serial.println(String("[TX] Ready. Open http://") + WiFi.localIP().toString());
+  Serial.print("[TX] STA MAC: ");
+  Serial.println(WiFi.macAddress());
+  Serial.print("[TX] Ready. Open http://");
+  Serial.print(HOSTNAME);
+  Serial.print(".local or http://");
+  Serial.println(WiFi.localIP());
 }
 
 void loop()
 {
+  MDNS.update();
   static uint32_t counter = 0;
   server.handleClient(); // service HTTP
 
