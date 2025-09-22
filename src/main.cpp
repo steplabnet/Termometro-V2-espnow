@@ -37,8 +37,8 @@ static const char *TZ_INFO = "CET-1CEST,M3.5.0,M10.5.0/3"; // IANA-like TZ rule
 static const char *NTP_1 = "pool.ntp.org";
 static const char *NTP_2 = "time.google.com";
 
-// ===== DS18B20 on D5 (GPIO14) =====
-#define ONE_WIRE_BUS D5
+// ===== DS18B20 on D4 (GPIO14) =====
+#define ONE_WIRE_BUS D4 // termometro
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 
@@ -130,7 +130,6 @@ body{margin:0;background:var(--bg);color:#0b274d;font:14px ui-sans-serif,system-
       <div class="hint">Tip: Click “Set whole day…” to assign one temperature to all 24 hours of a chosen day. Use “Copy day → day…” to duplicate a day’s schedule.</div>
     </div>
   </div>
-
 <script>
 const days=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
 const hours=Array.from({length:24},(_,h)=>h);
@@ -142,21 +141,27 @@ function setMessage(text,ok){msgEl.textContent=text; msgEl.style.color= ok? 'var
 function buildTable(){
   const thead=document.createElement('thead');
   const trH=document.createElement('tr');
-  trH.appendChild(document.createElement('th')).textContent='Day/Hour';
-  hours.forEach(h=>{const th=document.createElement('th');th.textContent=h;trH.appendChild(th)});
+  trH.appendChild(document.createElement('th')).textContent='Hour/Day';
+  // Days as columns
+  days.forEach(d=>{const th=document.createElement('th'); th.textContent=d; trH.appendChild(th)});
   thead.appendChild(trH);
+
   const tbody=document.createElement('tbody');
-  days.forEach((d,di)=>{
+  // Hours as rows
+  hours.forEach((h)=>{
     const tr=document.createElement('tr');
-    const th=document.createElement('th'); th.className='day'; th.textContent=d; tr.appendChild(th);
-    hours.forEach((h,hi)=>{
+    const th=document.createElement('th'); th.className='hour'; th.textContent=h; tr.appendChild(th);
+    // For each day column create an input cell
+    days.forEach((d,di)=>{
       const td=document.createElement('td');
       const inp=document.createElement('input');
       inp.type='number'; inp.step='0.1'; inp.min='5'; inp.max='35'; inp.value='21.0';
-      inp.dataset.day=di; inp.dataset.hour=hi; td.appendChild(inp); tr.appendChild(td);
+      inp.dataset.day=di; inp.dataset.hour=h;
+      td.appendChild(inp); tr.appendChild(td);
     });
     tbody.appendChild(tr);
   });
+
   grid.innerHTML=''; grid.appendChild(thead); grid.appendChild(tbody);
 }
 
@@ -231,6 +236,7 @@ document.getElementById('save').onclick=save;
 document.getElementById('setDay').onclick=setWholeDay;
 document.getElementById('copyDay').onclick=copyDay;
 </script>
+
 </body></html>
 )HTML";
 
