@@ -2,12 +2,13 @@
 // Wi-Fi + ESP-NOW JSON sender + DS18B20 + Modern Local Web UI for 7×24 setpoints
 // - Connects to your Wi-Fi (NETGEAR11)
 // - Locks ESP-NOW to AP channel
-// - Reads DS18B20 on D5 (GPIO14)
+// - Reads DS18B20 on D5 (GPIO14) with robust diagnostics
 // - Serves a modern local webpage to edit per-hour setpoints for each weekday
-// - Buttons: Set entire day's temperature, Copy a day's settings to another
 // - Shows live device date/time and actual temperature on page
 // - Persists setpoints to LittleFS (/setpoints.json)
 // - Sends ESP-NOW JSON with "action" = 1 if temp < setpoint (at current local hour/day), else 0
+// - Reports temperature to remote server via HTTPS GET:
+//     https://cesana.steplab.net/get_setpoint.php?temp=<1-dec>&cald=<0|1>
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -19,30 +20,31 @@
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
 #include <time.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecureBearSSL.h>
 
-extern "C"
-{
+extern "C" {
 #include "user_interface.h"
 }
 
-// ===== Wi-Fi credentials (change if needed) =====
+// ===== Wi-Fi credentials / Hostname =====
 static const char *WIFI_SSID = "NETGEAR11";
 static const char *WIFI_PASS = "breezypiano838";
-// Hostname for DHCP + mDNS (.local)
-static const char *HOSTNAME = "esp-thermo";
+static const char *HOSTNAME  = "esp-thermo";
 
-// ===== Timezone / NTP =====
-// Europe/Rome (CET/CEST): TZ string below handles DST automatically
-static const char *TZ_INFO = "CET-1CEST,M3.5.0,M10.5.0/3"; // IANA-like TZ rule
-static const char *NTP_1 = "pool.ntp.org";
-static const char *NTP_2 = "time.google.com";
+// ===== Timezone / NTP (Europe/Rome) =====
+static const char *TZ_INFO = "CET-1CEST,M3.5.0,M10.5.0/3";
+static const char *NTP_1   = "pool.ntp.org";
+static const char *NTP_2   = "time.google.com";
 
 // ===== DS18B20 on D5 (GPIO14) =====
-#define ONE_WIRE_BUS D5 // termometro (GPIO14)
+#define ONE_WIRE_BUS D5
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
+DeviceAddress g_dsAddr{};
+bool g_haveSensor = false;
 
-// ===== ESP-NOW target
+// ===== ESP-NOW target =====
 static uint8_t TARGET[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 // After receiver works, change to unicast:
 // static uint8_t TARGET[6] = { 0x84,0xF3,0xEB,0xAA,0xBB,0xCC };
@@ -51,27 +53,30 @@ static uint8_t TARGET[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 float setpoints[7][24];
 
 // ===== Live telemetry for web UI =====
-volatile float g_lastTempC = NAN;
-volatile uint8_t g_lastAction = 0; // 1=heat ON, 0=OFF
+volatile float   g_lastTempC   = NAN;
+volatile uint8_t g_lastAction  = 0; // 1=heat ON, 0=OFF
 
-// ===== Web server
+// ===== Remote "cesana" reporting (HTTPS GET) =====
+static uint32_t g_lastHttpMs = 0;
+static const uint32_t HTTP_MIN_INTERVAL_MS = 1500;
+// Cache last server response for UI/diagnostics
+static bool   g_remoteOk       = false;
+static float  g_remoteSetpoint = NAN;
+static String g_remoteMode     = "";
+static float  g_remoteActual   = NAN;
+
+// ===== Web server =====
 ESP8266WebServer server(80);
 
-// ===== Utilities =====
-static void printMac(const uint8_t *mac)
-{
-  for (int i = 0; i < 6; ++i)
-  {
-    if (i)
-      Serial.print(":");
-    char b[3];
-    sprintf(b, "%02X", mac[i]);
-    Serial.print(b);
+// ===== Utils =====
+static void printMac(const uint8_t *mac) {
+  for (int i = 0; i < 6; ++i) {
+    if (i) Serial.print(":");
+    char b[3]; sprintf(b, "%02X", mac[i]); Serial.print(b);
   }
 }
 
-static void onDataSent(uint8_t *mac, uint8_t status)
-{
+static void onDataSent(uint8_t *mac, uint8_t status) {
   Serial.print("[TX] Sent to ");
   printMac(mac);
   Serial.print(" -> status=");
@@ -122,6 +127,7 @@ body{margin:0;background:var(--bg);color:#0b274d;font:14px ui-sans-serif,system-
         <span id="now">--</span>
         <span id="tempBadge" class="badge">Temp: --</span>
         <span id="heatBadge" class="badge">Heat: --</span>
+        <span id="remoteBadge" class="badge">Remote: --</span>
       </div>
     </div>
     <div class="toolbar">
@@ -151,16 +157,13 @@ function buildTable(){
   const thead=document.createElement('thead');
   const trH=document.createElement('tr');
   trH.appendChild(document.createElement('th')).textContent='Hour/Day';
-  // Days as columns
   days.forEach(d=>{const th=document.createElement('th'); th.textContent=d; trH.appendChild(th)});
   thead.appendChild(trH);
 
   const tbody=document.createElement('tbody');
-  // Hours as rows
   hours.forEach((h)=>{
     const tr=document.createElement('tr');
     const th=document.createElement('th'); th.className='hour'; th.textContent=h; tr.appendChild(th);
-    // For each day column create an input cell
     days.forEach((d,di)=>{
       const td=document.createElement('td');
       const inp=document.createElement('input');
@@ -175,7 +178,8 @@ function buildTable(){
 }
 
 async function load(){
-  try{const r=await fetch('/api/setpoints'); if(!r.ok) throw new Error('HTTP '+r.status);
+  try{
+    const r=await fetch('/api/setpoints'); if(!r.ok) throw new Error('HTTP '+r.status);
     const j=await r.json();
     (j.grid||[]).forEach((row,di)=> row.forEach((v,hi)=>{
       const inp=document.querySelector(`input[data-day="${di}"][data-hour="${hi}"]`);
@@ -231,35 +235,35 @@ async function tickTime(){
     document.getElementById('now').textContent=d.toLocaleString();
 
     // Highlight current day/hour cell
-    const day=d.getDay();
-    const hour=d.getHours();
+    const day=d.getDay(), hour=d.getHours();
     document.querySelectorAll('td.now').forEach(td=>td.classList.remove('now'));
     const inp=document.querySelector(`input[data-day="${day}"][data-hour="${hour}"]`);
     if(inp && inp.parentElement) inp.parentElement.classList.add('now');
 
-    // Temperature + heat badges
+    // Temp + heat badges
     const tEl=document.getElementById('tempBadge');
     if (j.temp !== null && typeof j.temp !== 'undefined') {
       tEl.textContent = `Temp: ${Number(j.temp).toFixed(1)} °C`;
       tEl.style.color = 'var(--ok)';
-    } else {
-      tEl.textContent = 'Temp: --';
-      tEl.style.color = 'var(--err)';
-    }
+    } else { tEl.textContent = 'Temp: --'; tEl.style.color = 'var(--err)'; }
 
     const hEl=document.getElementById('heatBadge');
     const heating = j.action === 1;
     hEl.textContent = heating ? 'Heat: ON' : 'Heat: OFF';
     hEl.style.color = heating ? 'var(--ok)' : 'var(--muted)';
 
+    const rEl=document.getElementById('remoteBadge');
+    if ('remoteSetpoint' in j && j.remoteSetpoint !== null) {
+      rEl.textContent = `Remote: ${j.remoteMode||'?'} @ ${Number(j.remoteSetpoint).toFixed(1)}°C`;
+    } else {
+      rEl.textContent = 'Remote: --';
+    }
+
   }catch(e){
     document.getElementById('now').textContent='--';
-    const tEl=document.getElementById('tempBadge');
-    tEl.textContent = 'Temp: --';
-    tEl.style.color = 'var(--err)';
-    const hEl=document.getElementById('heatBadge');
-    hEl.textContent = 'Heat: --';
-    hEl.style.color = 'var(--err)';
+    const tEl=document.getElementById('tempBadge'); tEl.textContent = 'Temp: --'; tEl.style.color = 'var(--err)';
+    const hEl=document.getElementById('heatBadge'); hEl.textContent = 'Heat: --'; hEl.style.color = 'var(--err)';
+    const rEl=document.getElementById('remoteBadge'); rEl.textContent = 'Remote: --';
   }
 }
 
@@ -278,211 +282,220 @@ document.getElementById('copyDay').onclick=copyDay;
 )HTML";
 
 // ===== Setpoints persistence =====
-void loadSetpoints()
-{
+void loadSetpoints() {
   for (int d = 0; d < 7; ++d)
     for (int h = 0; h < 24; ++h)
       setpoints[d][h] = 21.0f;
 
-  if (!LittleFS.exists("/setpoints.json"))
-    return;
+  if (!LittleFS.exists("/setpoints.json")) return;
 
   File f = LittleFS.open("/setpoints.json", "r");
-  if (!f)
-    return;
+  if (!f) return;
 
   DynamicJsonDocument doc(8192);
   DeserializationError e = deserializeJson(doc, f);
   f.close();
-  if (e)
-  {
-    Serial.print("[FS] JSON load error: ");
-    Serial.println(e.c_str());
+  if (e) {
+    Serial.print("[FS] JSON load error: "); Serial.println(e.c_str());
     return;
   }
   JsonArray outer = doc["grid"].as<JsonArray>();
-  if (outer.isNull() || outer.size() != 7)
-    return;
+  if (outer.isNull() || outer.size() != 7) return;
 
-  for (int d = 0; d < 7; ++d)
-  {
+  for (int d = 0; d < 7; ++d) {
     JsonArray row = outer[d].as<JsonArray>();
-    if (row.isNull() || row.size() != 24)
-      continue;
+    if (row.isNull() || row.size() != 24) continue;
     for (int h = 0; h < 24; ++h)
       setpoints[d][h] = row[h].as<float>();
   }
   Serial.println("[FS] Setpoints loaded");
 }
 
-bool saveSetpoints()
-{
+bool saveSetpoints() {
   DynamicJsonDocument doc(8192);
   JsonArray outer = doc.createNestedArray("grid");
-  for (int d = 0; d < 7; ++d)
-  {
+  for (int d = 0; d < 7; ++d) {
     JsonArray row = outer.createNestedArray();
     for (int h = 0; h < 24; ++h)
       row.add(setpoints[d][h]);
   }
   File f = LittleFS.open("/setpoints.json", "w");
-  if (!f)
-  {
-    Serial.println("[FS] open write failed");
-    return false;
-  }
+  if (!f) { Serial.println("[FS] open write failed"); return false; }
   bool ok = (serializeJson(doc, f) > 0);
   f.close();
   Serial.println(ok ? "[FS] Setpoints saved" : "[FS] Save failed");
   return ok;
 }
 
+// ===== HTTPS GET to cesana.steplab.net =====
+// URL: https://cesana.steplab.net/get_setpoint.php?temp=<1-decimal>&cald=<0|1>
+static bool cesanaReportAndFetch(float tempC, bool heating) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("[HTTP] Skipped: WiFi not connected");
+    return false;
+  }
+
+  String url = "https://cesana.steplab.net/get_setpoint.php?temp=";
+  url += String(tempC, 1);
+  url += "&cald=";
+  url += heating ? "1" : "0";
+
+  std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
+  client->setInsecure(); // NOTE: for production, validate certificate / pin fingerprint
+
+  HTTPClient https;
+  Serial.printf("[HTTP] GET %s\n", url.c_str());
+  if (!https.begin(*client, url)) {
+    Serial.println("[HTTP] begin() failed");
+    return false;
+  }
+
+  int code = https.GET();
+  if (code <= 0) {
+    Serial.printf("[HTTP] GET failed: %s\n", https.errorToString(code).c_str());
+    https.end();
+    return false;
+  }
+
+  Serial.printf("[HTTP] Status: %d\n", code);
+  if (code != HTTP_CODE_OK) {
+    https.end();
+    return false;
+  }
+
+  String payload = https.getString();
+  https.end();
+
+  // Expected: {"ok":true,"mode":"AUTO","setpoint":21,"actualTemp":21.3,"actualTemp_str":"21.3"}
+  DynamicJsonDocument doc(512);
+  DeserializationError err = deserializeJson(doc, payload);
+  if (err) {
+    Serial.printf("[JSON-HTTP] Parse error: %s\n", err.c_str());
+    Serial.print("[JSON-HTTP] Raw: "); Serial.println(payload);
+    return false;
+  }
+
+  g_remoteOk       = doc["ok"] | false;
+  g_remoteMode     = (const char*)(doc["mode"] | "");
+  g_remoteSetpoint = doc["setpoint"] | NAN;
+  g_remoteActual   = doc["actualTemp"] | NAN;
+
+  Serial.printf("[HTTP] ok=%s mode=%s setpoint=%.1f actual=%.1f\n",
+                g_remoteOk ? "true" : "false",
+                g_remoteMode.c_str(), g_remoteSetpoint, g_remoteActual);
+  return g_remoteOk;
+}
+
 // ===== Web handlers =====
 void handleIndex() { server.send_P(200, "text/html", INDEX_HTML); }
 
-void handleGetSetpoints()
-{
+void handleGetSetpoints() {
   DynamicJsonDocument doc(8192);
   JsonArray outer = doc.createNestedArray("grid");
-  for (int d = 0; d < 7; ++d)
-  {
+  for (int d = 0; d < 7; ++d) {
     JsonArray row = outer.createNestedArray();
     for (int h = 0; h < 24; ++h)
       row.add(setpoints[d][h]);
   }
-  String out;
-  serializeJson(doc, out);
+  String out; serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
 
-void handlePostSetpoints()
-{
-  if (server.method() != HTTP_POST)
-  {
-    server.send(405, "text/plain", "Method Not Allowed");
-    return;
-  }
-  if (!server.hasArg("plain"))
-  {
-    server.send(400, "text/plain", "Missing body");
-    return;
-  }
+void handlePostSetpoints() {
+  if (server.method() != HTTP_POST) { server.send(405, "text/plain", "Method Not Allowed"); return; }
+  if (!server.hasArg("plain"))      { server.send(400, "text/plain", "Missing body"); return; }
   DynamicJsonDocument doc(8192);
   DeserializationError e = deserializeJson(doc, server.arg("plain"));
-  if (e)
-  {
-    server.send(400, "text/plain", String("JSON error: ") + e.c_str());
-    return;
-  }
+  if (e) { server.send(400, "text/plain", String("JSON error: ") + e.c_str()); return; }
   JsonArray outer = doc["grid"].as<JsonArray>();
-  if (outer.isNull() || outer.size() != 7)
-  {
-    server.send(422, "text/plain", "grid must be 7 arrays");
-    return;
-  }
-  for (int d = 0; d < 7; ++d)
-  {
+  if (outer.isNull() || outer.size() != 7) { server.send(422, "text/plain", "grid must be 7 arrays"); return; }
+  for (int d = 0; d < 7; ++d) {
     JsonArray row = outer[d].as<JsonArray>();
-    if (row.isNull() || row.size() != 24)
-    {
-      server.send(422, "text/plain", "each day needs 24 values");
-      return;
-    }
-    for (int h = 0; h < 24; ++h)
-      setpoints[d][h] = row[h].as<float>();
+    if (row.isNull() || row.size() != 24) { server.send(422, "text/plain", "each day needs 24 values"); return; }
+    for (int h = 0; h < 24; ++h) setpoints[d][h] = row[h].as<float>();
   }
   bool ok = saveSetpoints();
   server.send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
 }
 
-void handleTime()
-{
+void handleTime() {
   time_t now = time(nullptr);
   DynamicJsonDocument doc(256);
   doc["epoch"] = (uint32_t)now;
-  String out;
-  serializeJson(doc, out);
+  String out; serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
 
-void handleStatus()
-{
+void handleStatus() {
   time_t now = time(nullptr);
   float sp = NAN;
-  // compute active setpoint cheaply here to keep status coherent
-  {
-    time_t tnow = now;
-    struct tm lt;
-    localtime_r(&tnow, &lt);
-    int d = lt.tm_wday; // 0..6 (Sun..Sat)
-    int h = lt.tm_hour; // 0..23
-    if (d >= 0 && d <= 6 && h >= 0 && h <= 23)
-      sp = setpoints[d][h];
+  { // compute active setpoint for coherent status
+    time_t tnow = now; struct tm lt; localtime_r(&tnow, &lt);
+    int d = lt.tm_wday; int h = lt.tm_hour;
+    if (d >= 0 && d <= 6 && h >= 0 && h <= 23) sp = setpoints[d][h];
   }
 
-  DynamicJsonDocument doc(256);
+  DynamicJsonDocument doc(384);
   doc["epoch"] = (uint32_t)now;
-  if (!isnan(g_lastTempC))
-    doc["temp"] = g_lastTempC;
-  else
-    doc["temp"] = nullptr;
-  if (!isnan(sp))
-    doc["setpoint"] = sp;
-  else
-    doc["setpoint"] = nullptr;
+  if (!isnan(g_lastTempC)) doc["temp"] = g_lastTempC; else doc["temp"] = nullptr;
+  if (!isnan(sp))          doc["setpoint"] = sp;      else doc["setpoint"] = nullptr;
   doc["action"] = g_lastAction;
 
-  String out;
-  serializeJson(doc, out);
+  // Expose last remote info (optional)
+  if (!isnan(g_remoteSetpoint)) doc["remoteSetpoint"] = g_remoteSetpoint; else doc["remoteSetpoint"] = nullptr;
+  if (g_remoteMode.length())    doc["remoteMode"]     = g_remoteMode;
+  if (!isnan(g_remoteActual))   doc["remoteActual"]   = g_remoteActual; else doc["remoteActual"] = nullptr;
+
+  String out; serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+// Quick 1-Wire bus inspection
+void handleOwBus() {
+  DynamicJsonDocument doc(512);
+  JsonArray arr = doc.createNestedArray("devices");
+  uint8_t count = sensors.getDeviceCount();
+  for (uint8_t i=0;i<count;i++){
+    DeviceAddress a{};
+    if (sensors.getAddress(a, i)) {
+      char s[24]; int p=0;
+      for (int k=0;k<8;k++){ p+=sprintf(s+p, "%02X%s", a[k], (k<7?":":"")); }
+      arr.add(s);
+    } else arr.add(nullptr);
+  }
+  doc["parasite"] = sensors.isParasitePowerMode();
+  String out; serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
 
 // ===== Wi-Fi / NTP / mDNS =====
-static void connectWiFi()
-{
-  Serial.print("[TX] Connecting to ");
-  Serial.print(WIFI_SSID);
-  Serial.println(" ...");
+static void connectWiFi() {
+  Serial.print("[TX] Connecting to "); Serial.print(WIFI_SSID); Serial.println(" ...");
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
   WiFi.disconnect(true);
   delay(100);
-  // Set hostname before connecting
   WiFi.hostname(HOSTNAME);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
   uint32_t t0 = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000)
-  {
-    Serial.print(".");
-    delay(500);
-  }
+  while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000) { Serial.print("."); delay(500); }
   Serial.println();
-  if (WiFi.status() == WL_CONNECTED)
-  {
-    Serial.print("[TX] WiFi OK. IP=");
-    Serial.print(WiFi.localIP());
-    Serial.print("  RSSI=");
-    Serial.print(WiFi.RSSI());
-    Serial.print(" dBm  CH=");
-    Serial.println(WiFi.channel());
-  }
-  else
-  {
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.print("[TX] WiFi OK. IP="); Serial.print(WiFi.localIP());
+    Serial.print("  RSSI="); Serial.print(WiFi.RSSI());
+    Serial.print(" dBm  CH="); Serial.println(WiFi.channel());
+  } else {
     Serial.println("[TX] WiFi timeout; UI will be unreachable until connected.");
   }
 }
 
-static void setupTimeNTP()
-{
+static void setupTimeNTP() {
   configTime(TZ_INFO, NTP_1, NTP_2);
   Serial.println("[TIME] Syncing NTP...");
-  for (int i = 0; i < 30; i++)
-  { // up to ~30s
+  for (int i = 0; i < 30; i++) {
     time_t now = time(nullptr);
-    if (now > 1700000000)
-    { // sanity (2023+)
-      Serial.print("[TIME] Synced: ");
-      Serial.println((unsigned long)now);
+    if (now > 1700000000) { // sanity (2023+)
+      Serial.print("[TIME] Synced: "); Serial.println((unsigned long)now);
       return;
     }
     delay(500);
@@ -490,20 +503,12 @@ static void setupTimeNTP()
   Serial.println("[TIME] NTP sync timeout; will continue without exact time.");
 }
 
-static void setupMDNS()
-{
-  if (WiFi.status() != WL_CONNECTED)
-    return;
-
-  // Try a few times in case Wi-Fi just came up
-  for (int i = 0; i < 5; i++)
-  {
-    if (MDNS.begin(HOSTNAME))
-    {
+static void setupMDNS() {
+  if (WiFi.status() != WL_CONNECTED) return;
+  for (int i = 0; i < 5; i++) {
+    if (MDNS.begin(HOSTNAME)) {
       MDNS.addService("http", "tcp", 80);
-      Serial.print("[MDNS] Started: http://");
-      Serial.print(HOSTNAME);
-      Serial.println(".local/");
+      Serial.print("[MDNS] Started: http://"); Serial.print(HOSTNAME); Serial.println(".local/");
       return;
     }
     delay(500);
@@ -512,26 +517,20 @@ static void setupMDNS()
 }
 
 // ===== Helpers =====
-static float getActiveSetpoint()
-{
+static float getActiveSetpoint() {
   time_t now = time(nullptr);
-  struct tm lt;
-  localtime_r(&now, &lt);
-  int d = lt.tm_wday; // 0..6 (Sun..Sat)
-  int h = lt.tm_hour; // 0..23
-  if (d < 0 || d > 6 || h < 0 || h > 23)
-    return 21.0f;
+  struct tm lt; localtime_r(&now, &lt);
+  int d = lt.tm_wday; int h = lt.tm_hour;
+  if (d < 0 || d > 6 || h < 0 || h > 23) return 21.0f;
   return setpoints[d][h];
 }
 
-void setup()
-{
+void setup() {
   Serial.begin(115200);
   delay(200);
 
-  // Start FS
-  if (!LittleFS.begin())
-  {
+  // FS
+  if (!LittleFS.begin()) {
     Serial.println("[FS] LittleFS mount failed, formatting...");
     LittleFS.format();
     LittleFS.begin();
@@ -539,9 +538,22 @@ void setup()
   loadSetpoints();
 
   // DS18B20 init
+  pinMode(ONE_WIRE_BUS, INPUT_PULLUP);   // Still require external 4.7k to 3V3
   sensors.begin();
+  sensors.setWaitForConversion(true);    // block until conversion completes
   sensors.setResolution(12);
-  Serial.println("[DS18B20] Started on D5 (GPIO14)");
+  uint8_t count = sensors.getDeviceCount();
+  Serial.printf("[DS18B20] Devices on bus: %u\n", count);
+  Serial.printf("[DS18B20] Parasite power: %s\n", sensors.isParasitePowerMode() ? "YES" : "NO");
+  if (count > 0 && sensors.getAddress(g_dsAddr, 0)) {
+    g_haveSensor = true;
+    Serial.print("[DS18B20] Sensor[0] address: ");
+    for (uint8_t i=0;i<8;i++){ Serial.printf("%02X", g_dsAddr[i]); if (i<7) Serial.print(":"); }
+    Serial.println();
+    sensors.setResolution(g_dsAddr, 12);
+  } else {
+    Serial.println("[DS18B20] No sensor found on the bus! Check wiring (D5), 4.7k pull-up, and power.");
+  }
 
   // Wi-Fi + Time + mDNS
   connectWiFi();
@@ -554,83 +566,82 @@ void setup()
   server.on("/api/setpoints", HTTP_POST, handlePostSetpoints);
   server.on("/api/time", HTTP_GET, handleTime);
   server.on("/api/status", HTTP_GET, handleStatus);
+  server.on("/api/owbus", HTTP_GET, handleOwBus);
   server.begin();
   Serial.println("[WEB] HTTP server started on port 80");
 
   // ESPNOW on AP channel
   int channel = WiFi.channel();
-  if (channel <= 0)
-  {
-    channel = 1;
-    Serial.println("[TX] Using fallback channel=1");
-  }
+  if (channel <= 0) { channel = 1; Serial.println("[TX] Using fallback channel=1"); }
   wifi_set_channel(channel);
-  Serial.print("[TX] Locked radio to channel ");
-  Serial.println(channel);
+  Serial.print("[TX] Locked radio to channel "); Serial.println(channel);
   int rc = esp_now_init();
-  Serial.print("[TX] esp_now_init -> ");
-  Serial.println(rc);
-  if (rc != 0)
-  {
-    Serial.println("[TX] ESPNOW init failed; rebooting...");
-    delay(1500);
-    ESP.restart();
-  }
+  Serial.print("[TX] esp_now_init -> "); Serial.println(rc);
+  if (rc != 0) { Serial.println("[TX] ESPNOW init failed; rebooting..."); delay(1500); ESP.restart(); }
   esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
   esp_now_register_send_cb(onDataSent);
   rc = esp_now_add_peer(TARGET, ESP_NOW_ROLE_COMBO, channel, NULL, 0);
-  Serial.print("[TX] add_peer(");
-  printMac(TARGET);
-  Serial.print(") -> ");
-  Serial.println(rc);
+  Serial.print("[TX] add_peer("); printMac(TARGET); Serial.print(") -> "); Serial.println(rc);
 
-  Serial.print("[TX] STA MAC: ");
-  Serial.println(WiFi.macAddress());
-  Serial.print("[TX] Ready. Open http://");
-  Serial.print(HOSTNAME);
-  Serial.print(".local or http://");
-  Serial.println(WiFi.localIP());
+  Serial.print("[TX] STA MAC: "); Serial.println(WiFi.macAddress());
+  Serial.print("[TX] Ready. Open http://"); Serial.print(HOSTNAME);
+  Serial.print(".local or http://"); Serial.println(WiFi.localIP());
 }
 
-void loop()
-{
+void loop() {
   MDNS.update();
+  server.handleClient();
+
   static uint32_t counter = 0;
-  server.handleClient(); // service HTTP
 
-  // Read temperature periodically
+  // --- Temperature read cycle (every ~1s)
   static uint32_t tRead = 0;
-  if (millis() - tRead > 1000)
-  {
+  if (millis() - tRead > 1000) {
     tRead = millis();
-    sensors.requestTemperatures();
-  }
-  float tempC = sensors.getTempCByIndex(0);
-  bool valid = (tempC != DEVICE_DISCONNECTED_C && tempC > -100 && tempC < 125);
 
-  // Determine active setpoint based on local day/hour
-  float sp = getActiveSetpoint();
-  uint8_t action = 0; // default off
-  if (valid)
-    action = (tempC < sp) ? 1 : 0;
+    float tempC = NAN;
 
-  // Keep latest for web UI
-  if (valid)
-    g_lastTempC = tempC;
-  g_lastAction = action;
+    if (g_haveSensor) {
+      sensors.requestTemperatures();        // blocking (~750ms @12-bit)
+      tempC = sensors.getTempC(g_dsAddr);   // by address (more robust)
+      if (tempC == DEVICE_DISCONNECTED_C || tempC <= -100 || tempC >= 125) {
+        Serial.println("[DS18B20] Read failed (disconnected/out of range).");
+        tempC = NAN;
+      }
+    } else {
+      // Try to detect hot-plugged sensor
+      uint8_t count = sensors.getDeviceCount();
+      if (count > 0 && sensors.getAddress(g_dsAddr, 0)) {
+        g_haveSensor = true;
+        Serial.println("[DS18B20] Sensor appeared — using it.");
+        sensors.setResolution(g_dsAddr, 12);
+      } else {
+        Serial.println("[DS18B20] Still no sensor on bus.");
+      }
+    }
 
-  // JSON telemetry (every 1s)
-  static uint32_t tSend = 0;
-  if (millis() - tSend > 1000)
-  {
-    tSend = millis();
+    bool valid = !isnan(tempC);
+
+    // Determine active setpoint
+    float sp = getActiveSetpoint();
+    uint8_t action = 0;
+    if (valid) action = (tempC < sp) ? 1 : 0;
+
+    // Keep latest for web UI
+    if (valid) g_lastTempC = tempC;
+    g_lastAction = action;
+
+    // Report to remote (rate-limited) if we have valid temp
+    if (valid && (millis() - g_lastHttpMs >= HTTP_MIN_INTERVAL_MS)) {
+      cesanaReportAndFetch(tempC, action == 1);
+      g_lastHttpMs = millis();
+    }
+
+    // ESP-NOW telemetry (every ~1s)
     DynamicJsonDocument doc(256);
     doc["type"] = "telemetry";
-    doc["count"] = counter;
-    if (valid)
-      doc["temp"] = tempC;
-    else
-      doc["temp"] = nullptr;
+    doc["count"] = counter++;
+    if (valid) doc["temp"] = tempC; else doc["temp"] = nullptr;
     doc["setpoint"] = sp;
     doc["action"] = action; // 1 if temp < setpoint (heat on), else 0
     doc["note"] = "d1mini-ds18b20@D5";
@@ -638,11 +649,6 @@ void loop()
     char buf[256];
     size_t n = serializeJson(doc, buf, sizeof(buf));
     uint8_t rc = esp_now_send(TARGET, (uint8_t *)buf, (int)n);
-    Serial.print("[TX] send -> ");
-    if (rc == 0)
-      Serial.println("OK");
-    else
-      Serial.println(rc);
-    counter++;
+    Serial.print("[TX] send -> "); Serial.println(rc == 0 ? "OK" : String(rc));
   }
 }
