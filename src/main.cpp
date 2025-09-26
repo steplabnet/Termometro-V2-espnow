@@ -1,13 +1,13 @@
 // src/main.cpp — Wemos D1 mini (ESP8266)
-// Wi‑Fi + ESP‑NOW JSON sender + DS18B20 + Modern Local Web UI for 7×24 setpoints
-// - Connects to your Wi‑Fi (NETGEAR11)
-// - Locks ESP‑NOW to AP channel
+// Wi-Fi + ESP-NOW JSON sender + DS18B20 + Modern Local Web UI for 7×24 setpoints
+// - Connects to your Wi-Fi (NETGEAR11)
+// - Locks ESP-NOW to AP channel
 // - Reads DS18B20 on D5 (GPIO14)
-// - Serves a modern local webpage to edit per‑hour setpoints for each weekday
+// - Serves a modern local webpage to edit per-hour setpoints for each weekday
 // - Buttons: Set entire day's temperature, Copy a day's settings to another
-// - Shows live device date/time on page
+// - Shows live device date/time and actual temperature on page
 // - Persists setpoints to LittleFS (/setpoints.json)
-// - Sends ESP‑NOW JSON with "action" = 1 if temp < setpoint (at current local hour/day), else 0
+// - Sends ESP-NOW JSON with "action" = 1 if temp < setpoint (at current local hour/day), else 0
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -25,7 +25,7 @@ extern "C"
 #include "user_interface.h"
 }
 
-// ===== Wi‑Fi credentials (change if needed) =====
+// ===== Wi-Fi credentials (change if needed) =====
 static const char *WIFI_SSID = "NETGEAR11";
 static const char *WIFI_PASS = "breezypiano838";
 // Hostname for DHCP + mDNS (.local)
@@ -37,18 +37,22 @@ static const char *TZ_INFO = "CET-1CEST,M3.5.0,M10.5.0/3"; // IANA-like TZ rule
 static const char *NTP_1 = "pool.ntp.org";
 static const char *NTP_2 = "time.google.com";
 
-// ===== DS18B20 on D4 (GPIO14) =====
-#define ONE_WIRE_BUS D4 // termometro
+// ===== DS18B20 on D5 (GPIO14) =====
+#define ONE_WIRE_BUS D5 // termometro (GPIO14)
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 
-// ===== ESP‑NOW target
+// ===== ESP-NOW target
 static uint8_t TARGET[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 // After receiver works, change to unicast:
 // static uint8_t TARGET[6] = { 0x84,0xF3,0xEB,0xAA,0xBB,0xCC };
 
 // ===== 7×24 setpoints (°C). Index: day [0..6]=Sun..Sat, hour [0..23]
 float setpoints[7][24];
+
+// ===== Live telemetry for web UI =====
+volatile float g_lastTempC = NAN;
+volatile uint8_t g_lastAction = 0; // 1=heat ON, 0=OFF
 
 // ===== Web server
 ESP8266WebServer server(80);
@@ -107,13 +111,18 @@ body{margin:0;background:var(--bg);color:#0b274d;font:14px ui-sans-serif,system-
  td.now{background:#daf5e3 !important; box-shadow: inset 0 0 0 2px #25a244}
  .rowtools{display:flex;gap:6px;justify-content:center}
  .hint{color:#476ea6;font-size:12px;margin-top:8px}
+ .badge{margin-left:8px;padding:2px 8px;border:1px solid var(--border);border-radius:10px;background:var(--card)}
 </style>
 </head>
 <body>
   <div class="header">
     <div class="hleft">
       <div class="title">ESP8266 Weekly Setpoints</div>
-      <div class="time"><span id="now">--</span></div>
+      <div class="time">
+        <span id="now">--</span>
+        <span id="tempBadge" class="badge">Temp: --</span>
+        <span id="heatBadge" class="badge">Heat: --</span>
+      </div>
     </div>
     <div class="toolbar">
       <button class="btn" id="load">Load</button>
@@ -214,16 +223,44 @@ function copyDay(){
 
 async function tickTime(){
   try{
-    const r=await fetch('/api/time'); if(!r.ok) throw new Error(); const j=await r.json();
+    const r=await fetch('/api/status'); if(!r.ok) throw new Error('HTTP '+r.status);
+    const j=await r.json();
+
+    // Time
     const d=new Date(j.epoch*1000);
     document.getElementById('now').textContent=d.toLocaleString();
+
     // Highlight current day/hour cell
     const day=d.getDay();
     const hour=d.getHours();
     document.querySelectorAll('td.now').forEach(td=>td.classList.remove('now'));
     const inp=document.querySelector(`input[data-day="${day}"][data-hour="${hour}"]`);
     if(inp && inp.parentElement) inp.parentElement.classList.add('now');
-  }catch(e){ document.getElementById('now').textContent='--'; }
+
+    // Temperature + heat badges
+    const tEl=document.getElementById('tempBadge');
+    if (j.temp !== null && typeof j.temp !== 'undefined') {
+      tEl.textContent = `Temp: ${Number(j.temp).toFixed(1)} °C`;
+      tEl.style.color = 'var(--ok)';
+    } else {
+      tEl.textContent = 'Temp: --';
+      tEl.style.color = 'var(--err)';
+    }
+
+    const hEl=document.getElementById('heatBadge');
+    const heating = j.action === 1;
+    hEl.textContent = heating ? 'Heat: ON' : 'Heat: OFF';
+    hEl.style.color = heating ? 'var(--ok)' : 'var(--muted)';
+
+  }catch(e){
+    document.getElementById('now').textContent='--';
+    const tEl=document.getElementById('tempBadge');
+    tEl.textContent = 'Temp: --';
+    tEl.style.color = 'var(--err)';
+    const hEl=document.getElementById('heatBadge');
+    hEl.textContent = 'Heat: --';
+    hEl.style.color = 'var(--err)';
+  }
 }
 
 // init
@@ -246,12 +283,15 @@ void loadSetpoints()
   for (int d = 0; d < 7; ++d)
     for (int h = 0; h < 24; ++h)
       setpoints[d][h] = 21.0f;
+
   if (!LittleFS.exists("/setpoints.json"))
     return;
+
   File f = LittleFS.open("/setpoints.json", "r");
   if (!f)
     return;
-  JsonDocument doc;
+
+  DynamicJsonDocument doc(8192);
   DeserializationError e = deserializeJson(doc, f);
   f.close();
   if (e)
@@ -261,12 +301,13 @@ void loadSetpoints()
     return;
   }
   JsonArray outer = doc["grid"].as<JsonArray>();
-  if (outer.size() != 7)
+  if (outer.isNull() || outer.size() != 7)
     return;
+
   for (int d = 0; d < 7; ++d)
   {
     JsonArray row = outer[d].as<JsonArray>();
-    if (row.size() != 24)
+    if (row.isNull() || row.size() != 24)
       continue;
     for (int h = 0; h < 24; ++h)
       setpoints[d][h] = row[h].as<float>();
@@ -276,11 +317,11 @@ void loadSetpoints()
 
 bool saveSetpoints()
 {
-  JsonDocument doc;
-  JsonArray outer = doc["grid"].to<JsonArray>();
+  DynamicJsonDocument doc(8192);
+  JsonArray outer = doc.createNestedArray("grid");
   for (int d = 0; d < 7; ++d)
   {
-    JsonArray row = outer.add<JsonArray>();
+    JsonArray row = outer.createNestedArray();
     for (int h = 0; h < 24; ++h)
       row.add(setpoints[d][h]);
   }
@@ -301,11 +342,11 @@ void handleIndex() { server.send_P(200, "text/html", INDEX_HTML); }
 
 void handleGetSetpoints()
 {
-  JsonDocument doc;
-  JsonArray outer = doc["grid"].to<JsonArray>();
+  DynamicJsonDocument doc(8192);
+  JsonArray outer = doc.createNestedArray("grid");
   for (int d = 0; d < 7; ++d)
   {
-    JsonArray row = outer.add<JsonArray>();
+    JsonArray row = outer.createNestedArray();
     for (int h = 0; h < 24; ++h)
       row.add(setpoints[d][h]);
   }
@@ -326,7 +367,7 @@ void handlePostSetpoints()
     server.send(400, "text/plain", "Missing body");
     return;
   }
-  JsonDocument doc;
+  DynamicJsonDocument doc(8192);
   DeserializationError e = deserializeJson(doc, server.arg("plain"));
   if (e)
   {
@@ -334,7 +375,7 @@ void handlePostSetpoints()
     return;
   }
   JsonArray outer = doc["grid"].as<JsonArray>();
-  if (outer.size() != 7)
+  if (outer.isNull() || outer.size() != 7)
   {
     server.send(422, "text/plain", "grid must be 7 arrays");
     return;
@@ -342,7 +383,7 @@ void handlePostSetpoints()
   for (int d = 0; d < 7; ++d)
   {
     JsonArray row = outer[d].as<JsonArray>();
-    if (row.size() != 24)
+    if (row.isNull() || row.size() != 24)
     {
       server.send(422, "text/plain", "each day needs 24 values");
       return;
@@ -357,14 +398,46 @@ void handlePostSetpoints()
 void handleTime()
 {
   time_t now = time(nullptr);
-  JsonDocument doc;
+  DynamicJsonDocument doc(256);
   doc["epoch"] = (uint32_t)now;
   String out;
   serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
 
-// ===== Wi‑Fi / NTP / mDNS =====
+void handleStatus()
+{
+  time_t now = time(nullptr);
+  float sp = NAN;
+  // compute active setpoint cheaply here to keep status coherent
+  {
+    time_t tnow = now;
+    struct tm lt;
+    localtime_r(&tnow, &lt);
+    int d = lt.tm_wday; // 0..6 (Sun..Sat)
+    int h = lt.tm_hour; // 0..23
+    if (d >= 0 && d <= 6 && h >= 0 && h <= 23)
+      sp = setpoints[d][h];
+  }
+
+  DynamicJsonDocument doc(256);
+  doc["epoch"] = (uint32_t)now;
+  if (!isnan(g_lastTempC))
+    doc["temp"] = g_lastTempC;
+  else
+    doc["temp"] = nullptr;
+  if (!isnan(sp))
+    doc["setpoint"] = sp;
+  else
+    doc["setpoint"] = nullptr;
+  doc["action"] = g_lastAction;
+
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+// ===== Wi-Fi / NTP / mDNS =====
 static void connectWiFi()
 {
   Serial.print("[TX] Connecting to ");
@@ -468,9 +541,9 @@ void setup()
   // DS18B20 init
   sensors.begin();
   sensors.setResolution(12);
-  Serial.println("[DS18B20] Started on D5");
+  Serial.println("[DS18B20] Started on D5 (GPIO14)");
 
-  // Wi‑Fi + Time + mDNS
+  // Wi-Fi + Time + mDNS
   connectWiFi();
   setupTimeNTP();
   setupMDNS();
@@ -480,6 +553,7 @@ void setup()
   server.on("/api/setpoints", HTTP_GET, handleGetSetpoints);
   server.on("/api/setpoints", HTTP_POST, handlePostSetpoints);
   server.on("/api/time", HTTP_GET, handleTime);
+  server.on("/api/status", HTTP_GET, handleStatus);
   server.begin();
   Serial.println("[WEB] HTTP server started on port 80");
 
@@ -540,12 +614,17 @@ void loop()
   if (valid)
     action = (tempC < sp) ? 1 : 0;
 
+  // Keep latest for web UI
+  if (valid)
+    g_lastTempC = tempC;
+  g_lastAction = action;
+
   // JSON telemetry (every 1s)
   static uint32_t tSend = 0;
   if (millis() - tSend > 1000)
   {
     tSend = millis();
-    JsonDocument doc;
+    DynamicJsonDocument doc(256);
     doc["type"] = "telemetry";
     doc["count"] = counter;
     if (valid)
