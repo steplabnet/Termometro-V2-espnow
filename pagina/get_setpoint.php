@@ -2,8 +2,7 @@
 // get_setpoint.php
 // - Optional ?temp= updates state.json.actualTemp (rounded to 1 decimal)
 // - Optional ?cald=0|1 updates state.json.cald (relay status)
-// - Reads state from /dev/shm/state.json when available (fallback to script dir)
-// - Writes to disk state.json and mirrors to /dev/shm/state.json best-effort
+// - Reads/Writes state.json from the same directory as this script
 // - Returns JSON: { ok, mode, setpoint, actualTemp, actualTemp_str, cald, date, time, timezone }
 
 header('Content-Type: application/json; charset=utf-8');
@@ -16,12 +15,8 @@ header('Access-Control-Allow-Origin: *'); // allow microcontrollers / other orig
 // ---------- timezone ----------
 date_default_timezone_set('Europe/Rome');
 
-// Disk + SHM paths
-$stateFileDisk = __DIR__ . '/state.json';
-$stateFileShm = '/dev/shm/state.json';
-// Prefer SHM for reads if available; always keep disk as the source of truth for errors
-$stateFileRead = is_readable($stateFileShm) ? $stateFileShm : $stateFileDisk;
-
+// Disk paths (same folder as this file)
+$stateFile = __DIR__ . '/state.json';
 $scheduleFile = __DIR__ . '/schedule.json';
 
 // ---------- helpers ----------
@@ -89,7 +84,7 @@ function one_decimal_str($n)
 }
 
 // ---------- load state & schedule ----------
-$state = read_json($stateFileRead);
+$state = read_json($stateFile);
 $scheduleWrap = read_json($scheduleFile);
 $schedule = isset($scheduleWrap['schedule']) && is_array($scheduleWrap['schedule'])
     ? $scheduleWrap['schedule'] : [];
@@ -116,14 +111,11 @@ if ($caldParam !== null) {
 
 // Save back if we updated anything
 if ($tempParam !== null || $caldParam !== null) {
-    // Write to disk first (source of truth)
-    $okDisk = write_json_atomic($stateFileDisk, $state);
+    $okDisk = write_json_atomic($stateFile, $state);
     if (!$okDisk) {
-        echo json_encode(['ok' => false, 'error' => 'Failed to write state.json on disk (permissions?)']);
+        echo json_encode(['ok' => false, 'error' => 'Failed to write state.json (permissions?)']);
         exit;
     }
-    // Mirror to SHM (best-effort; do not fail the request if it can’t be written)
-    @write_json_atomic($stateFileShm, $state);
 }
 
 // ---------- compute current setpoint ----------
