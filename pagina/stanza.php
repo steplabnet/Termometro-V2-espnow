@@ -7,9 +7,48 @@
 header('X-Content-Type-Options: nosniff');
 $action = $_GET['action'] ?? '';
 
-// ---- API: Load schedule ----
+/** ---------- helpers for state in /dev/shm ---------- */
+$RAM_DIR = '/dev/shm';
+$STATE_FILENAME = 'state.json'; // change to 'state.json' if you prefer that spelling
+
+function resolve_state_path(string $ramDir, string $filename): string
+{
+    // Prefer /dev/shm, fallback to script dir if not usable
+    if (is_dir($ramDir) && is_writable($ramDir)) {
+        return rtrim($ramDir, '/') . '/' . $filename;
+    }
+    return __DIR__ . '/' . $filename;
+}
+
+function write_json_atomic(string $path, array $data): bool
+{
+    $dir = dirname($path);
+    if (!is_dir($dir))
+        return false;
+    $tmp = $dir . '/.' . basename($path) . '.' . bin2hex(random_bytes(6)) . '.tmp';
+    $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    if ($json === false)
+        return false;
+
+    // Use LOCK_EX to reduce races in case rename isn’t truly atomic on the FS
+    if (@file_put_contents($tmp, $json, LOCK_EX) === false)
+        return false;
+    // Best-effort chmod (so other processes can read it)
+    @chmod($tmp, 0664);
+    // Atomic replace
+    return @rename($tmp, $path);
+}
+
+$STATE_FILE = resolve_state_path($RAM_DIR, $STATE_FILENAME);
+
+/** ---------- API: Load schedule (unchanged) ---------- */
 if ($action === 'load_schedule') {
+    // Tell browsers and proxies: do NOT cache
     header('Content-Type: application/json; charset=utf-8');
+    header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+    header('Pragma: no-cache');   // for older HTTP/1.0 proxies
+    header('Expires: 0');         // set expiry in the past
+
     $file = __DIR__ . '/schedule.json';
     if (is_readable($file)) {
         echo file_get_contents($file);
@@ -19,7 +58,7 @@ if ($action === 'load_schedule') {
     exit;
 }
 
-// ---- API: Save schedule ----
+/** ---------- API: Save schedule (unchanged) ---------- */
 if ($action === 'save_schedule' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     header('Content-Type: application/json; charset=utf-8');
     $file = __DIR__ . '/schedule.json';
@@ -39,10 +78,9 @@ if ($action === 'save_schedule' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     exit;
 }
 
-// ---- API: Save state (mode + manualSetpoint [+ optional actualTemp passthrough]) ----
+/** ---------- API: Save state (NOW writes to /dev/shm) ---------- */
 if ($action === 'save_state' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     header('Content-Type: application/json; charset=utf-8');
-    $file = __DIR__ . '/state.json';
     $body = file_get_contents('php://input');
     $decoded = json_decode($body, true);
     if (!is_array($decoded) || !isset($decoded['mode']) || !isset($decoded['manualSetpoint'])) {
@@ -50,45 +88,52 @@ if ($action === 'save_state' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         echo json_encode(["ok" => false, "error" => "Invalid payload"]);
         exit;
     }
-    $mode = in_array($decoded['mode'], ['OFF', 'ON', 'AUTO']) ? $decoded['mode'] : 'AUTO';
+    $mode = in_array($decoded['mode'], ['OFF', 'ON', 'AUTO'], true) ? $decoded['mode'] : 'AUTO';
     $manual = floatval($decoded['manualSetpoint']);
     $state = ['mode' => $mode, 'manualSetpoint' => $manual];
+
+    // optional passthroughs
     if (isset($decoded['actualTemp'])) {
         $state['actualTemp'] = floatval($decoded['actualTemp']);
     }
-    $ok = @file_put_contents($file, json_encode($state, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-    if ($ok === false) {
-        echo json_encode(["ok" => false, "error" => "Could not write state.json. Check file permissions."]);
+    if (isset($decoded['cald'])) { // allow writer to set heater status too
+        $state['cald'] = (int) $decoded['cald'];
+    }
+
+    if (!write_json_atomic($GLOBALS['STATE_FILE'], $state)) {
+        echo json_encode([
+            "ok" => false,
+            "error" => "Could not write " . basename($GLOBALS['STATE_FILE']) . ". Check permissions or /dev/shm availability."
+        ]);
     } else {
-        echo json_encode(["ok" => true, "saved_to" => basename($file)]);
+        echo json_encode(["ok" => true, "saved_to" => $GLOBALS['STATE_FILE']]);
     }
     exit;
 }
 
-// ---- API: Load state ----
+/** ---------- API: Load state (NOW reads from /dev/shm) ---------- */
 if ($action === 'load_state') {
     header('Content-Type: application/json; charset=utf-8');
-    $file = __DIR__ . '/state.json';
+    $file = $GLOBALS['STATE_FILE'];
     if (is_readable($file)) {
         $raw = file_get_contents($file);
         $j = json_decode($raw, true);
-        if (!is_array($j)) {
+        if (!is_array($j))
             $j = [];
-        }
         echo json_encode([
             'ok' => true,
             'mode' => $j['mode'] ?? null,
             'manualSetpoint' => isset($j['manualSetpoint']) ? (float) $j['manualSetpoint'] : null,
             'actualTemp' => isset($j['actualTemp']) ? (float) $j['actualTemp'] : null,
-            'cald' => isset($j['cald']) ? (int) $j['cald'] : 0   // <--- add this
+            'cald' => isset($j['cald']) ? (int) $j['cald'] : 0
         ]);
-
     } else {
-        echo json_encode(['ok' => true, 'mode' => null, 'manualSetpoint' => null, 'actualTemp' => null]);
+        echo json_encode(['ok' => true, 'mode' => null, 'manualSetpoint' => null, 'actualTemp' => null, 'cald' => 0]);
     }
     exit;
 }
 ?>
+
 <!doctype html>
 <html lang="en">
 
@@ -401,7 +446,7 @@ if ($action === 'load_state') {
 <body>
     <div class="container">
         <div class="header">
-            <div class="title">Stanza · Chronothermostat</div>
+            <div class="title">Studio · Chronothermostat</div>
             <div class="pill"><span class="status-dot" id="statusDot"></span><span id="statusText">Running</span></div>
         </div>
 
