@@ -1,14 +1,9 @@
 // src/main.cpp — Wemos D1 mini (ESP8266)
-// Wi-Fi + ESP-NOW JSON sender + DS18B20 + Modern Local Web UI for 7×24 setpoints
-// - Connects to your Wi-Fi (NETGEAR11)
-// - Locks ESP-NOW to AP channel
-// - Reads DS18B20 on D4 (GPIO2) with robust diagnostics (pre-WiFi probe + raw search + by-index fallback)
-// - Serves a modern local webpage to edit per-hour setpoints for each weekday
-// - Shows live device date/time and actual temperature on page
-// - Persists setpoints to LittleFS (/setpoints.json)
-// - Sends ESP-NOW JSON with "action" = 1 if temp < setpoint (at current local hour/day), else 0
-// - Reports temperature to remote server via HTTPS GET:
-//     https://cesana.steplab.net/get_setpoint.php?temp=<1-dec>&cald=<0|1>
+// Fixed setpoint thermostat + modern Wi-Fi setup page (scan, select, save)
+// - Thermostat UI at "/" (blue/green theme) with presets and +/-
+// - Wi-Fi setup at "/wifi": scans nearby SSIDs, allows selection + password
+// - Credentials stored in LittleFS (/wifi.json). After saving, device reboots.
+// - Uses fixed setpoint for control logic (temp < setpoint => action=1)
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -28,10 +23,14 @@ extern "C"
 #include "user_interface.h"
 }
 
-// ===== Wi-Fi credentials / Hostname =====
-static const char *WIFI_SSID = "NETGEAR11";
-static const char *WIFI_PASS = "breezypiano838";
+// ===== Default Wi-Fi credentials (fallback only) =====
+static const char *WIFI_SSID_DEFAULT = "NETGEAR11";
+static const char *WIFI_PASS_DEFAULT = "breezypiano838";
 static const char *HOSTNAME = "esp-thermo";
+
+// Mutable Wi-Fi creds (loaded from /wifi.json or default)
+static String g_wifiSsid;
+static String g_wifiPass;
 
 // ===== Timezone / NTP (Europe/Rome) =====
 static const char *TZ_INFO = "CET-1CEST,M3.5.0,M10.5.0/3";
@@ -46,13 +45,13 @@ DeviceAddress g_dsAddr{};
 bool g_haveSensor = false;  // any device present
 bool g_haveAddress = false; // address for index 0 resolved
 
-// ===== ESP-NOW target =====
+// ===== ESP-NOW target (broadcast by default) =====
 static uint8_t TARGET[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-// After receiver works, change to unicast:
-// static uint8_t TARGET[6] = { 0x84,0xF3,0xEB,0xAA,0xBB,0xCC };
 
-// ===== 7×24 setpoints (°C). Index: day [0..6]=Sun..Sat, hour [0..23]
-float setpoints[7][24];
+// ===== Fixed setpoint state (persisted) =====
+static float g_fixedSetpoint = 19.0f; // default: "on" preset
+static String g_fixedPreset = "on";   // "off" | "on" | "away" | "custom"
+static bool g_fixedEnabled = true;    // always use fixed setpoint for control
 
 // ===== Live telemetry for web UI =====
 volatile float g_lastTempC = NAN;
@@ -65,9 +64,15 @@ static bool g_remoteOk = false;
 static float g_remoteSetpoint = NAN;
 static String g_remoteMode = "";
 static float g_remoteActual = NAN;
+static bool g_remoteHeating = false;
+static float g_remoteDelta = NAN;
 
 // ===== Web server =====
 ESP8266WebServer server(80);
+
+// Pending reboot after saving Wi-Fi
+static bool g_pendingRestart = false;
+static uint32_t g_restartAtMs = 0;
 
 // ===== Utils =====
 static void printMac(const uint8_t *mac)
@@ -90,262 +95,384 @@ static void onDataSent(uint8_t *mac, uint8_t status)
   Serial.println(status == 0 ? "OK" : "ERR");
 }
 
-// ===== Modern HTML UI (embedded) =====
+// ======== Thermostat HTML (blue/green theme) at "/" ========
 const char INDEX_HTML[] PROGMEM = R"HTML(
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>ESP8266 Scheduler</title>
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>ESP8266 Thermostat</title>
 <style>
-:root{ --bg:#f6f9ff; --card:#ffffff; --muted:#3c5a82; --accent:#2d6cdf; --accent-2:#4e89ff; --border:#d8e3f8; --ok:#1e9e4a; --err:#c62828; }
-*{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:#0b274d;font:14px ui-sans-serif,system-ui,Segoe UI,Roboto,Arial}
-.header{display:flex;align-items:center;justify-content:space-between;padding:16px 20px;border-bottom:1px solid var(--border);position:sticky;top:0;background:linear-gradient(180deg,#f6f9ff,#eef4ff)}
-.hleft{display:flex;gap:12px;align-items:center}
-.title{font-size:18px;font-weight:700;color:#0b274d}
-.time{font:12px/1.2 ui-monospace,Consolas;color:#476ea6}
-.toolbar{display:flex;gap:8px;flex-wrap:wrap}
-.btn{border:1px solid var(--border);background:var(--card);color:#0b274d;padding:8px 12px;border-radius:10px;cursor:pointer;box-shadow:0 1px 1px rgba(45,108,223,.08)}
-.btn:hover{border-color:var(--accent)}
-.btn.primary{background:linear-gradient(180deg,#e6efff,#d8e6ff);border-color:#b8cffb}
-.btn.ghost{background:transparent}
-.status{margin-left:8px;font-weight:600}
-.container{padding:16px}
-.card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:12px}
-.tablewrap{overflow:auto;max-height:70vh}
- table{border-collapse:collapse;width:100%;min-width:980px}
- th,td{border:1px solid var(--border);padding:6px;text-align:center}
- th{position:sticky;top:0;background:#eaf1ff}
- th.day{position:sticky;left:0;background:#eaf1ff;z-index:1}
- input[type=number]{width:5em;background:#f5f9ff;border:1px solid var(--border);color:#0b274d;border-radius:8px;padding:6px;text-align:right}
- td.now{background:#daf5e3 !important; box-shadow: inset 0 0 0 2px #25a244}
- .rowtools{display:flex;gap:6px;justify-content:center}
- .hint{color:#476ea6;font-size:12px;margin-top:8px}
- .badge{margin-left:8px;padding:2px 8px;border:1px solid var(--border);border-radius:10px;background:var(--card)}
+:root{
+  --bg:#f4fbfd; --card:#ffffff; --ink:#0b3440; --muted:#4d7580;
+  --accent:#1aa6b7; --accent-2:#36d1b1; --border:#d7eef2;
+  --ok:#1b9e77; --warn:#ffb703; --err:#c1121f;
+}
+*{box-sizing:border-box} html,body{height:100%}
+body{margin:0;background:linear-gradient(180deg,#f4fbfd 0%,#e8f7fa 100%);
+  color:var(--ink); font:16px ui-sans-serif,system-ui,Segoe UI,Roboto,Arial; display:grid; place-items:center; padding:18px;}
+.app{width:min(680px,100%); background:var(--card); border:1px solid var(--border);
+  border-radius:18px; box-shadow:0 8px 30px rgba(26,166,183,.15); overflow:hidden;}
+.header{display:flex;justify-content:space-between;align-items:center; padding:14px 16px; background:
+  linear-gradient(180deg,#e9fbff,#d9f5f7); border-bottom:1px solid var(--border)}
+.title{font-weight:800; letter-spacing:.2px}
+.badges{display:flex; gap:8px; flex-wrap:wrap}
+.badge{font:12px/1 ui-monospace,Consolas; color:var(--ink); background:#eefbfd; border:1px solid var(--border);
+  padding:6px 8px; border-radius:999px}
+.nav{display:flex; gap:8px}
+.nav a{color:#055968; text-decoration:none; font-weight:800; padding:6px 10px; border:1px solid var(--border); border-radius:10px; background:#f1fdff}
+.content{padding:18px; display:grid; gap:14px}
+.card{border:1px solid var(--border); border-radius:14px; padding:16px; background:linear-gradient(180deg,#ffffff,#f7fffe)}
+.row{display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap}
+.kpi{display:flex; align-items:baseline; gap:10px}
+.kpi .label{color:var(--muted); font-size:14px}
+.kpi .value{font-size:40px; font-weight:900}
+.controls{display:flex; align-items:center; gap:10px}
+.btn{border:1px solid var(--border); background:linear-gradient(180deg,#faffff,#e9fffb);
+  color:var(--ink); padding:10px 14px; border-radius:12px; cursor:pointer; font-weight:700; min-width:44px;
+  transition:transform .05s ease, box-shadow .15s ease}
+.btn:hover{box-shadow:0 3px 10px rgba(54,209,177,.15)}
+.btn:active{transform:translateY(1px)}
+.btn.primary{background:linear-gradient(180deg,#bff6ec,#8df0dc); border-color:#8de9d8}
+.btn.pill{border-radius:999px}
+.presetbar{display:flex; gap:10px; flex-wrap:wrap}
+.preset{padding:10px 14px; border-radius:999px; border:1px solid var(--border); background:#f7fffe; cursor:pointer; font-weight:700}
+.preset.active{outline:2px solid var(--accent); box-shadow:0 0 0 3px rgba(26,166,183,.15) inset}
+.hint{font-size:13px; color:var(--muted)}
+.dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px; vertical-align:middle}
+.on{background:var(--ok)} .off{background:#9aaeb5}
 </style>
-</head>
-<body>
+</head><body>
+<div class="app">
   <div class="header">
-    <div class="hleft">
-      <div class="title">ESP8266 Weekly Setpoints</div>
-      <div class="time">
-        <span id="now">--</span>
-        <span id="tempBadge" class="badge">Temp: --</span>
-        <span id="heatBadge" class="badge">Heat: --</span>
-        <span id="remoteBadge" class="badge">Remote: --</span>
+    <div style="display:flex;gap:10px;align-items:center">
+      <div class="title">ESP8266 Thermostat</div>
+      <div class="nav">
+        <a href="/">Thermostat</a>
+        <a href="/wifi">Wi-Fi</a>
       </div>
     </div>
-    <div class="toolbar">
-      <button class="btn" id="load">Load</button>
-      <button class="btn primary" id="save">Save</button>
-      <button class="btn" id="setDay">Set whole day…</button>
-      <button class="btn" id="copyDay">Copy day → day…</button>
-      <span id="msg" class="status"></span>
+    <div class="badges">
+      <div class="badge"><span class="dot" id="heatDot"></span><span id="heatText">Heat: --</span></div>
+      <div class="badge" id="time">--</div>
     </div>
   </div>
+  <div class="content">
+    <div class="card row">
+      <div class="kpi"><div class="label">Actual</div><div class="value" id="actual">--.-°C</div></div>
+      <div class="kpi"><div class="label">Setpoint</div><div class="value" id="sp">--.-°C</div></div>
+    </div>
 
-  <div class="container">
-    <div class="card">
-      <div class="tablewrap"><table id="grid"></table></div>
-      <div class="hint">Tip: Click “Set whole day…” to assign one temperature to all 24 hours of a chosen day. Use “Copy day → day…” to duplicate a day’s schedule.</div>
+    <div class="card row">
+      <div class="controls">
+        <button class="btn pill" id="minus">−</button>
+        <button class="btn pill" id="plus">+</button>
+        <button class="btn primary pill" id="save">Save</button>
+      </div>
+      <div class="presetbar">
+        <button class="preset" data-name="off"  data-val="10">Off · 10°C</button>
+        <button class="preset" data-name="on"   data-val="19">On · 19°C</button>
+        <button class="preset" data-name="away" data-val="15">Away · 15°C</button>
+        <span class="hint" id="state">—</span>
+      </div>
     </div>
   </div>
+</div>
+
 <script>
-const days=["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
-const hours=Array.from({length:24},(_,h)=>h);
-const grid=document.getElementById('grid');
-const msgEl=document.getElementById('msg');
+let sp = 19.0;
+let preset = 'on';
 
-function setMessage(text,ok){msgEl.textContent=text; msgEl.style.color= ok? 'var(--ok)':'var(--err)';}
-
-function buildTable(){
-  const thead=document.createElement('thead');
-  const trH=document.createElement('tr');
-  trH.appendChild(document.createElement('th')).textContent='Hour/Day';
-  days.forEach(d=>{const th=document.createElement('th'); th.textContent=d; trH.appendChild(th)});
-  thead.appendChild(trH);
-
-  const tbody=document.createElement('tbody');
-  hours.forEach((h)=>{
-    const tr=document.createElement('tr');
-    const th=document.createElement('th'); th.className='hour'; th.textContent=h; tr.appendChild(th);
-    days.forEach((d,di)=>{
-      const td=document.createElement('td');
-      const inp=document.createElement('input');
-      inp.type='number'; inp.step='0.1'; inp.min='5'; inp.max='35'; inp.value='21.0';
-      inp.dataset.day=di; inp.dataset.hour=h;
-      td.appendChild(inp); tr.appendChild(td);
-    });
-    tbody.appendChild(tr);
+function fmt(v){ return Number(v).toFixed(1) + '°C'; }
+function setActivePreset(name){
+  document.querySelectorAll('.preset').forEach(b=>{
+    b.classList.toggle('active', b.dataset.name===name);
   });
-
-  grid.innerHTML=''; grid.appendChild(thead); grid.appendChild(tbody);
 }
 
-async function load(){
+async function loadFixed(){
   try{
-    const r=await fetch('/api/setpoints'); if(!r.ok) throw new Error('HTTP '+r.status);
-    const j=await r.json();
-    (j.grid||[]).forEach((row,di)=> row.forEach((v,hi)=>{
-      const inp=document.querySelector(`input[data-day="${di}"][data-hour="${hi}"]`);
-      if(inp) inp.value=Number(v).toFixed(1);
-    }));
-    setMessage('Loaded',true);
-  }catch(e){setMessage('Load failed: '+e.message,false)}
+    const r = await fetch('/api/fixed');
+    const j = await r.json();
+    sp = typeof j.setpoint === 'number' ? j.setpoint : 19.0;
+    preset = j.preset || 'custom';
+    document.getElementById('sp').textContent = fmt(sp);
+    setActivePreset(preset);
+    document.getElementById('state').textContent = 'Preset: ' + preset;
+  }catch(e){}
 }
 
-async function save(){
-  const gridData=[];
-  for(let di=0;di<7;di++){
-    const row=[]; for(let hi=0;hi<24;hi++){
-      const inp=document.querySelector(`input[data-day="${di}"][data-hour="${hi}"]`);
-      row.push(parseFloat(inp.value));
-    } gridData.push(row);
-  }
+async function saveFixed(newPreset){
   try{
-    const r=await fetch('/api/setpoints',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({grid:gridData})});
-    if(!r.ok) throw new Error('HTTP '+r.status);
-    setMessage('Saved',true);
-  }catch(e){setMessage('Save failed: '+e.message,false)}
-}
-
-function setWholeDay(){
-  const d=prompt('Which day index? 0=Sun .. 6=Sat'); if(d===null) return; const di=parseInt(d);
-  if(!(di>=0&&di<7)) return alert('Day must be 0..6');
-  const t=prompt('Temperature (°C) for all 24 hours', '21.0'); if(t===null) return; const val=parseFloat(t);
-  for(let hi=0;hi<24;hi++){
-    const inp=document.querySelector(`input[data-day="${di}"][data-hour="${hi}"]`);
-    if(inp) inp.value=val.toFixed(1);
-  }
-}
-
-function copyDay(){
-  const from=prompt('Copy FROM day index? 0=Sun .. 6=Sat'); if(from===null) return; const a=parseInt(from);
-  const to=prompt('Copy TO day index? 0=Sun .. 6=Sat'); if(to===null) return; const b=parseInt(to);
-  if(!(a>=0&&a<7&&b>=0&&b<7)) return alert('Indices must be 0..6');
-  for(let hi=0;hi<24;hi++){
-    const src=document.querySelector(`input[data-day="${a}"][data-hour="${hi}"]`);
-    const dst=document.querySelector(`input[data-day="${b}"][data-hour="${hi}"]`);
-    if(src&&dst) dst.value=src.value;
-  }
-}
-
-async function tickTime(){
-  try{
-    const r=await fetch('/api/status'); if(!r.ok) throw new Error('HTTP '+r.status);
-    const j=await r.json();
-
-    // Time
-    const d=new Date(j.epoch*1000);
-    document.getElementById('now').textContent=d.toLocaleString();
-
-    // Highlight current day/hour cell
-    const day=d.getDay(), hour=d.getHours();
-    document.querySelectorAll('td.now').forEach(td=>td.classList.remove('now'));
-    const inp=document.querySelector(`input[data-day="${day}"][data-hour="${hour}"]`);
-    if(inp && inp.parentElement) inp.parentElement.classList.add('now');
-
-    // Temp + heat badges
-    const tEl=document.getElementById('tempBadge');
-    if (j.temp !== null && typeof j.temp !== 'undefined') {
-      tEl.textContent = `Temp: ${Number(j.temp).toFixed(1)} °C`;
-      tEl.style.color = 'var(--ok)';
-    } else { tEl.textContent = 'Temp: --'; tEl.style.color = 'var(--err)'; }
-
-    const hEl=document.getElementById('heatBadge');
-    const heating = j.action === 1;
-    hEl.textContent = heating ? 'Heat: ON' : 'Heat: OFF';
-    hEl.style.color = heating ? 'var(--ok)' : 'var(--muted)';
-
-    const rEl=document.getElementById('remoteBadge');
-    if ('remoteSetpoint' in j && j.remoteSetpoint !== null) {
-      rEl.textContent = `Remote: ${j.remoteMode||'?'} @ ${Number(j.remoteSetpoint).toFixed(1)}°C`;
-    } else {
-      rEl.textContent = 'Remote: --';
-    }
-
+    const body = newPreset ? { preset:newPreset } : { setpoint: sp, preset:'custom' };
+    const r = await fetch('/api/fixed',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
+    const j = await r.json();
+    sp = j.setpoint; preset = j.preset || 'custom';
+    document.getElementById('sp').textContent = fmt(sp);
+    setActivePreset(preset);
+    document.getElementById('state').textContent = 'Saved · Preset: ' + preset;
   }catch(e){
-    document.getElementById('now').textContent='--';
-    const tEl=document.getElementById('tempBadge'); tEl.textContent = 'Temp: --'; tEl.style.color = 'var(--err)';
-    const hEl=document.getElementById('heatBadge'); hEl.textContent = 'Heat: --'; hEl.style.color = 'var(--err)';
-    const rEl=document.getElementById('remoteBadge'); rEl.textContent = 'Remote: --';
+    document.getElementById('state').textContent = 'Save failed';
   }
 }
 
-// init
-buildTable();
-load();
-setInterval(tickTime, 1000);
+async function tick(){
+  try{
+    const r = await fetch('/api/status');
+    const j = await r.json();
+    if (typeof j.temp === 'number') document.getElementById('actual').textContent = fmt(j.temp);
+    if (typeof j.setpoint === 'number'){
+      sp = j.setpoint;
+      document.getElementById('sp').textContent = fmt(sp);
+    }
+    const on = j.action===1;
+    document.getElementById('heatText').textContent = 'Heat: ' + (on?'ON':'OFF');
+    document.getElementById('heatDot').className = 'dot ' + (on?'on':'off');
+    if (typeof j.epoch === 'number'){
+      const d=new Date(j.epoch*1000);
+      document.getElementById('time').textContent=d.toLocaleString();
+    }
+  }catch(e){}
+}
 
-document.getElementById('load').onclick=load;
-document.getElementById('save').onclick=save;
-document.getElementById('setDay').onclick=setWholeDay;
-document.getElementById('copyDay').onclick=copyDay;
+document.getElementById('minus').onclick = ()=>{ sp = Math.max(5, Math.round((sp-0.5)*10)/10); document.getElementById('sp').textContent = fmt(sp); setActivePreset('custom'); };
+document.getElementById('plus').onclick  = ()=>{ sp = Math.min(35, Math.round((sp+0.5)*10)/10); document.getElementById('sp').textContent = fmt(sp); setActivePreset('custom'); };
+document.getElementById('save').onclick  = ()=> saveFixed(null);
+document.querySelectorAll('.preset').forEach(b=>{
+  b.onclick = ()=> saveFixed(b.dataset.name);
+});
+
+loadFixed();
+tick();
+setInterval(tick, 1000);
 </script>
-
 </body></html>
 )HTML";
 
-// ===== Setpoints persistence =====
-void loadSetpoints()
+// ======== Wi-Fi Setup HTML at "/wifi" ========
+const char WIFI_HTML[] PROGMEM = R"HTML(
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Wi-Fi Setup</title>
+<style>
+:root{
+  --bg:#f4fbfd; --card:#ffffff; --ink:#0b3440; --muted:#4d7580;
+  --accent:#1aa6b7; --accent-2:#36d1b1; --border:#d7eef2; --ok:#1b9e77; --err:#c1121f;
+}
+*{box-sizing:border-box} body{margin:0;background:linear-gradient(180deg,#f4fbfd 0%,#e8f7fa 100%);color:var(--ink);
+  font:16px ui-sans-serif,system-ui,Segoe UI,Roboto,Arial;display:grid;place-items:center;min-height:100vh;padding:18px}
+.app{width:min(720px,100%); background:var(--card); border:1px solid var(--border); border-radius:18px;
+  box-shadow:0 8px 30px rgba(26,166,183,.15); overflow:hidden}
+.header{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;background:linear-gradient(180deg,#e9fbff,#d9f5f7); border-bottom:1px solid var(--border)}
+.title{font-weight:800}
+.nav a{color:#055968;text-decoration:none;font-weight:800;padding:6px 10px;border:1px solid var(--border);border-radius:10px;background:#f1fdff}
+.content{padding:18px; display:grid; gap:16px}
+.card{border:1px solid var(--border); border-radius:14px; padding:16px; background:linear-gradient(180deg,#ffffff,#f7fffe)}
+.row{display:grid; grid-template-columns:140px 1fr; gap:12px; align-items:center}
+select,input{border:1px solid var(--border); border-radius:12px; padding:10px; background:#fbffff}
+.btn{border:1px solid var(--border); background:linear-gradient(180deg,#faffff,#e9fffb); color:var(--ink); padding:10px 14px; border-radius:12px; cursor:pointer; font-weight:800}
+.btn.primary{background:linear-gradient(180deg,#bff6ec,#8df0dc); border-color:#8de9d8}
+.kv{display:flex; gap:8px; flex-wrap:wrap; color:var(--muted); font-size:14px}
+.badge{border:1px solid var(--border); border-radius:999px; padding:6px 10px; background:#eefbfd}
+.msg{font-size:14px}
+.ok{color:var(--ok)} .err{color:var(--err)}
+</style>
+</head><body>
+<div class="app">
+  <div class="header">
+    <div class="title">Wi-Fi Setup</div>
+    <div class="nav">
+      <a href="/">Thermostat</a>
+      <a href="/wifi">Wi-Fi</a>
+    </div>
+  </div>
+  <div class="content">
+    <div class="card">
+      <div class="row">
+        <label for="ssid">Available Wi-Fi</label>
+        <div style="display:flex;gap:8px;align-items:center">
+          <select id="ssid" style="min-width:260px"></select>
+          <button class="btn" id="refresh">Refresh</button>
+        </div>
+      </div>
+      <div class="row">
+        <label for="pass">Password</label>
+        <input id="pass" type="password" placeholder="Enter Wi-Fi password"/>
+      </div>
+      <div class="row">
+        <div></div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button class="btn primary" id="save">Save & Reboot</button>
+          <span class="msg" id="msg"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <div class="kv">
+          <span class="badge" id="curSsid">SSID: --</span>
+          <span class="badge" id="curIp">IP: --</span>
+          <span class="badge" id="curRssi">RSSI: --</span>
+        </div>
+        <button class="btn" id="reloadCur">Reload</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+function securityLabel(enc){
+  const map={ "7":"WPA3","5":"WEP","4":"AUTO","3":"WPA/WPA2","2":"WPA2","1":"WPA","0":"OPEN" };
+  return map[String(enc)]||("ENC"+enc);
+}
+async function loadScan(){
+  const sel = document.getElementById('ssid');
+  sel.innerHTML = '<option>Scanning…</option>';
+  try{
+    const r = await fetch('/api/wifi/scan'); const j = await r.json();
+    sel.innerHTML='';
+    j.networks.forEach(n=>{
+      const o=document.createElement('option');
+      o.value=n.ssid; o.textContent = `${n.ssid}  ·  ${n.rssi} dBm  ·  ${securityLabel(n.enc)}  ·  ch${n.ch}`;
+      sel.appendChild(o);
+    });
+    if (j.networks.length===0) sel.innerHTML='<option>No networks found</option>';
+  }catch(e){
+    sel.innerHTML='<option>Scan failed</option>';
+  }
+}
+async function loadCurrent(){
+  try{
+    const r = await fetch('/api/wifi/current'); const j = await r.json();
+    document.getElementById('curSsid').textContent = 'SSID: ' + (j.ssid||'--');
+    document.getElementById('curIp').textContent   = 'IP: ' + (j.ip||'--');
+    document.getElementById('curRssi').textContent = 'RSSI: ' + ((j.rssi!=null)?(j.rssi+' dBm'):'--');
+  }catch(e){}
+}
+async function saveCreds(){
+  const ssid = document.getElementById('ssid').value;
+  const pass = document.getElementById('pass').value;
+  const m = document.getElementById('msg');
+  if (!ssid){ m.textContent='Select a network'; m.className='msg err'; return; }
+  m.textContent='Saving…'; m.className='msg';
+  try{
+    const r = await fetch('/api/wifi/save',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ssid,pass})});
+    if (!r.ok){ m.textContent='Save failed'; m.className='msg err'; return; }
+    m.textContent='Saved. Rebooting…'; m.className='msg ok';
+    setTimeout(()=>location.href='/', 7000);
+  }catch(e){
+    m.textContent='Save failed'; m.className='msg err';
+  }
+}
+document.getElementById('refresh').onclick = loadScan;
+document.getElementById('reloadCur').onclick = loadCurrent;
+document.getElementById('save').onclick = saveCreds;
+loadScan(); loadCurrent();
+</script>
+</body></html>
+)HTML";
+
+// ====== Persistence for fixed setpoint ======
+static const char *FIXED_PATH = "/fixed_setpoint.json";
+static const char *WIFI_PATH = "/wifi.json";
+
+static void loadFixedSetpoint()
 {
-  for (int d = 0; d < 7; ++d)
-    for (int h = 0; h < 24; ++h)
-      setpoints[d][h] = 21.0f;
-
-  if (!LittleFS.exists("/setpoints.json"))
+  g_fixedSetpoint = 19.0f;
+  g_fixedPreset = "on";
+  g_fixedEnabled = true;
+  if (!LittleFS.exists(FIXED_PATH))
     return;
-
-  File f = LittleFS.open("/setpoints.json", "r");
+  File f = LittleFS.open(FIXED_PATH, "r");
   if (!f)
     return;
-
-  DynamicJsonDocument doc(8192);
-  DeserializationError e = deserializeJson(doc, f);
+  JsonDocument doc;
+  if (deserializeJson(doc, f) == DeserializationError::Ok)
+  {
+    float sp = doc["setpoint"] | g_fixedSetpoint;
+    const char *pr = doc["preset"] | g_fixedPreset.c_str();
+    bool en = doc["enabled"] | true;
+    if (sp >= 5 && sp <= 35)
+      g_fixedSetpoint = sp;
+    g_fixedPreset = pr;
+    g_fixedEnabled = en;
+  }
   f.close();
-  if (e)
-  {
-    Serial.print("[FS] JSON load error: ");
-    Serial.println(e.c_str());
-    return;
-  }
-  JsonArray outer = doc["grid"].as<JsonArray>();
-  if (outer.isNull() || outer.size() != 7)
-    return;
-
-  for (int d = 0; d < 7; ++d)
-  {
-    JsonArray row = outer[d].as<JsonArray>();
-    if (row.isNull() || row.size() != 24)
-      continue;
-    for (int h = 0; h < 24; ++h)
-      setpoints[d][h] = row[h].as<float>();
-  }
-  Serial.println("[FS] Setpoints loaded");
+  Serial.printf("[FS] Fixed setpoint loaded: %.1f (%s)\n", g_fixedSetpoint, g_fixedPreset.c_str());
 }
 
-bool saveSetpoints()
+static bool saveFixedSetpoint()
 {
-  DynamicJsonDocument doc(8192);
-  JsonArray outer = doc.createNestedArray("grid");
-  for (int d = 0; d < 7; ++d)
-  {
-    JsonArray row = outer.createNestedArray();
-    for (int h = 0; h < 24; ++h)
-      row.add(setpoints[d][h]);
-  }
-  File f = LittleFS.open("/setpoints.json", "w");
+  JsonDocument doc;
+  doc["setpoint"] = g_fixedSetpoint;
+  doc["preset"] = g_fixedPreset;
+  doc["enabled"] = g_fixedEnabled;
+  File f = LittleFS.open(FIXED_PATH, "w");
   if (!f)
   {
-    Serial.println("[FS] open write failed");
+    Serial.println("[FS] open write failed (fixed)");
     return false;
   }
   bool ok = (serializeJson(doc, f) > 0);
   f.close();
-  Serial.println(ok ? "[FS] Setpoints saved" : "[FS] Save failed");
+  Serial.println(ok ? "[FS] Fixed setpoint saved" : "[FS] Fixed save failed");
   return ok;
+}
+
+// Wi-Fi credentials persistence
+static void loadWifiCreds()
+{
+  g_wifiSsid = WIFI_SSID_DEFAULT;
+  g_wifiPass = WIFI_PASS_DEFAULT;
+  if (!LittleFS.exists(WIFI_PATH))
+  {
+    Serial.printf("[FS] No /wifi.json, using defaults SSID=%s\n", WIFI_SSID_DEFAULT);
+    return;
+  }
+  File f = LittleFS.open(WIFI_PATH, "r");
+  if (!f)
+  {
+    Serial.println("[FS] open /wifi.json failed");
+    return;
+  }
+  JsonDocument doc;
+  if (deserializeJson(doc, f) == DeserializationError::Ok)
+  {
+    const char *s = doc["ssid"] | WIFI_SSID_DEFAULT;
+    const char *p = doc["pass"] | WIFI_PASS_DEFAULT;
+    g_wifiSsid = s;
+    g_wifiPass = p;
+    Serial.printf("[FS] Wi-Fi loaded: SSID=%s\n", g_wifiSsid.c_str());
+  }
+  else
+  {
+    Serial.println("[FS] /wifi.json parse error; using defaults");
+  }
+  f.close();
+}
+
+static bool saveWifiCreds(const String &ssid, const String &pass)
+{
+  JsonDocument doc;
+  doc["ssid"] = ssid;
+  doc["pass"] = pass;
+  File f = LittleFS.open(WIFI_PATH, "w");
+  if (!f)
+  {
+    Serial.println("[FS] open write failed (/wifi.json)");
+    return false;
+  }
+  bool ok = (serializeJson(doc, f) > 0);
+  f.close();
+  Serial.println(ok ? "[FS] Wi-Fi creds saved" : "[FS] Wi-Fi creds save failed");
+  return ok;
+}
+
+// ====== (Legacy) 7×24 schedule kept but unused ======
+float setpoints[7][24]; // retained for compatibility; not used for control now
+static void initLegacySchedule()
+{
+  for (int d = 0; d < 7; ++d)
+    for (int h = 0; h < 24; ++h)
+      setpoints[d][h] = g_fixedSetpoint;
 }
 
 // ===== HTTPS GET to cesana.steplab.net =====
@@ -356,14 +483,13 @@ static bool cesanaReportAndFetch(float tempC, bool heating)
     Serial.println("[HTTP] Skipped: WiFi not connected");
     return false;
   }
-
   String url = "https://cesana.steplab.net/get_setpoint.php?temp=";
   url += String(tempC, 1);
   url += "&cald=";
   url += heating ? "1" : "0";
 
   std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
-  client->setInsecure(); // NOTE: for production, validate certificate / pin fingerprint
+  client->setInsecure();
 
   HTTPClient https;
   Serial.printf("[HTTP] GET %s\n", url.c_str());
@@ -380,7 +506,6 @@ static bool cesanaReportAndFetch(float tempC, bool heating)
     https.end();
     return false;
   }
-
   Serial.printf("[HTTP] Status: %d\n", code);
   if (code != HTTP_CODE_OK)
   {
@@ -391,8 +516,7 @@ static bool cesanaReportAndFetch(float tempC, bool heating)
   String payload = https.getString();
   https.end();
 
-  // Expected: {"ok":true,"mode":"AUTO","setpoint":21,"actualTemp":21.3,"actualTemp_str":"21.3"}
-  DynamicJsonDocument doc(512);
+  JsonDocument doc;
   DeserializationError err = deserializeJson(doc, payload);
   if (err)
   {
@@ -407,31 +531,42 @@ static bool cesanaReportAndFetch(float tempC, bool heating)
   g_remoteSetpoint = doc["setpoint"] | NAN;
   g_remoteActual = doc["actualTemp"] | NAN;
 
-  Serial.printf("[HTTP] ok=%s mode=%s setpoint=%.1f actual=%.1f\n",
-                g_remoteOk ? "true" : "false",
-                g_remoteMode.c_str(), g_remoteSetpoint, g_remoteActual);
+  if (!isnan(g_remoteSetpoint) && !isnan(g_remoteActual))
+  {
+    g_remoteHeating = (g_remoteActual < g_remoteSetpoint);
+    g_remoteDelta = g_remoteActual - g_remoteSetpoint;
+  }
+  else
+  {
+    g_remoteHeating = false;
+    g_remoteDelta = NAN;
+  }
+
+  Serial.printf("[HTTP] ok=%s mode=%s setpoint=%.1f actual=%.1f heat=%s Δ=%.1f\n",
+                g_remoteOk ? "true" : "false", g_remoteMode.c_str(),
+                g_remoteSetpoint, g_remoteActual,
+                g_remoteHeating ? "ON" : "OFF",
+                (isnan(g_remoteDelta) ? NAN : g_remoteDelta));
   return g_remoteOk;
 }
 
 // ===== Web handlers =====
 void handleIndex() { server.send_P(200, "text/html", INDEX_HTML); }
+void handleWifiPage() { server.send_P(200, "text/html", WIFI_HTML); }
 
-void handleGetSetpoints()
+// Fixed setpoint APIs
+void handleGetFixed()
 {
-  DynamicJsonDocument doc(8192);
-  JsonArray outer = doc.createNestedArray("grid");
-  for (int d = 0; d < 7; ++d)
-  {
-    JsonArray row = outer.createNestedArray();
-    for (int h = 0; h < 24; ++h)
-      row.add(setpoints[d][h]);
-  }
+  JsonDocument doc;
+  doc["setpoint"] = g_fixedSetpoint;
+  doc["preset"] = g_fixedPreset;
+  doc["enabled"] = g_fixedEnabled;
   String out;
   serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
 
-void handlePostSetpoints()
+void handlePostFixed()
 {
   if (server.method() != HTTP_POST)
   {
@@ -443,38 +578,71 @@ void handlePostSetpoints()
     server.send(400, "text/plain", "Missing body");
     return;
   }
-  DynamicJsonDocument doc(8192);
-  DeserializationError e = deserializeJson(doc, server.arg("plain"));
+
+  JsonDocument in; // <-- rename to avoid redeclaration
+  DeserializationError e = deserializeJson(in, server.arg("plain"));
   if (e)
   {
     server.send(400, "text/plain", String("JSON error: ") + e.c_str());
     return;
   }
-  JsonArray outer = doc["grid"].as<JsonArray>();
-  if (outer.isNull() || outer.size() != 7)
+
+  String preset = in["preset"] | "";
+  bool changed = false;
+
+  auto applyPreset = [&](const String &p)
   {
-    server.send(422, "text/plain", "grid must be 7 arrays");
+    if (p == "off")
+      g_fixedSetpoint = 10.0f;
+    else if (p == "on")
+      g_fixedSetpoint = 19.0f;
+    else if (p == "away")
+      g_fixedSetpoint = 15.0f;
+    else
+      return false;
+    g_fixedPreset = p;
+    g_fixedEnabled = true;
+    return true;
+  };
+
+  if (preset.length() && preset != "custom")
+  {
+    changed = applyPreset(preset);
+  }
+  else
+  {
+    float sp = in["setpoint"] | NAN;
+    if (!isnan(sp) && sp >= 5.0f && sp <= 35.0f)
+    {
+      g_fixedSetpoint = sp;
+      g_fixedPreset = "custom";
+      g_fixedEnabled = true;
+      changed = true;
+    }
+  }
+
+  if (!changed)
+  {
+    server.send(422, "application/json", "{\"ok\":false}");
     return;
   }
-  for (int d = 0; d < 7; ++d)
-  {
-    JsonArray row = outer[d].as<JsonArray>();
-    if (row.isNull() || row.size() != 24)
-    {
-      server.send(422, "text/plain", "each day needs 24 values");
-      return;
-    }
-    for (int h = 0; h < 24; ++h)
-      setpoints[d][h] = row[h].as<float>();
-  }
-  bool ok = saveSetpoints();
-  server.send(ok ? 200 : 500, "application/json", ok ? "{\"ok\":true}" : "{\"ok\":false}");
+  bool ok = saveFixedSetpoint();
+
+  JsonDocument out; // <-- declare this 'out'
+  out["ok"] = ok;
+  out["setpoint"] = g_fixedSetpoint;
+  out["preset"] = g_fixedPreset;
+  out["enabled"] = g_fixedEnabled;
+
+  String s;
+  serializeJson(out, s);
+  server.send(ok ? 200 : 500, "application/json", s);
 }
 
 void handleTime()
 {
   time_t now = time(nullptr);
-  DynamicJsonDocument doc(256);
+  JsonDocument doc;
   doc["epoch"] = (uint32_t)now;
   String out;
   serializeJson(doc, out);
@@ -484,55 +652,48 @@ void handleTime()
 void handleStatus()
 {
   time_t now = time(nullptr);
-  float sp = NAN;
-  { // compute active setpoint for coherent status
-    time_t tnow = now;
-    struct tm lt;
-    localtime_r(&tnow, &lt);
-    int d = lt.tm_wday;
-    int h = lt.tm_hour;
-    if (d >= 0 && d <= 6 && h >= 0 && h <= 23)
-      sp = setpoints[d][h];
-  }
+  float sp = g_fixedEnabled ? g_fixedSetpoint : 19.0f;
 
-  DynamicJsonDocument doc(384);
+  JsonDocument doc;
   doc["epoch"] = (uint32_t)now;
-  if (!isnan(g_lastTempC))
-    doc["temp"] = g_lastTempC;
-  else
+  if (isnan(g_lastTempC))
     doc["temp"] = nullptr;
-  if (!isnan(sp))
-    doc["setpoint"] = sp;
   else
-    doc["setpoint"] = nullptr;
+    doc["temp"] = g_lastTempC;
+  doc["setpoint"] = sp;
+  doc["preset"] = g_fixedPreset;
   doc["action"] = g_lastAction;
 
-  // Expose last remote info (optional)
-  if (!isnan(g_remoteSetpoint))
-    doc["remoteSetpoint"] = g_remoteSetpoint;
-  else
+  // Remote info
+  if (isnan(g_remoteSetpoint))
     doc["remoteSetpoint"] = nullptr;
+  else
+    doc["remoteSetpoint"] = g_remoteSetpoint;
   if (g_remoteMode.length())
     doc["remoteMode"] = g_remoteMode;
-  if (!isnan(g_remoteActual))
-    doc["remoteActual"] = g_remoteActual;
-  else
+  if (isnan(g_remoteActual))
     doc["remoteActual"] = nullptr;
+  else
+    doc["remoteActual"] = g_remoteActual;
+  doc["remoteHeating"] = g_remoteHeating;
+  if (isnan(g_remoteDelta))
+    doc["remoteDelta"] = nullptr;
+  else
+    doc["remoteDelta"] = g_remoteDelta;
 
   String out;
   serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
 
-// Quick 1-Wire bus inspection
+// Quick 1-Wire bus inspection (debug)
 void handleOwBus()
 {
-  // Nudge the bus before listing (helps some setups)
   sensors.requestTemperatures();
   delay(5);
 
-  DynamicJsonDocument doc(512);
-  JsonArray arr = doc.createNestedArray("devices");
+  JsonDocument doc;
+  JsonArray arr = doc["devices"].to<JsonArray>(); // v7 style
   uint8_t count = sensors.getDeviceCount();
   for (uint8_t i = 0; i < count; i++)
   {
@@ -556,18 +717,95 @@ void handleOwBus()
   server.send(200, "application/json", out);
 }
 
+// ===== Wi-Fi API handlers =====
+void handleWifiScan()
+{
+  int n = WiFi.scanNetworks(/*async=*/false, /*hidden=*/true);
+
+  JsonDocument doc;
+  JsonArray arr = doc["networks"].to<JsonArray>(); // v7 style
+  for (int i = 0; i < n; ++i)
+  {
+    JsonObject o = arr.add<JsonObject>(); // v7 style
+    o["ssid"] = WiFi.SSID(i);
+    o["rssi"] = WiFi.RSSI(i);
+    o["enc"] = (int)WiFi.encryptionType(i);
+    o["ch"] = WiFi.channel(i);
+  }
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+void handleWifiCurrent()
+{
+  JsonDocument doc;
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    doc["ssid"] = WiFi.SSID();
+    doc["ip"] = WiFi.localIP().toString();
+    doc["rssi"] = WiFi.RSSI();
+  }
+  else
+  {
+    doc["ssid"] = nullptr;
+    doc["ip"] = nullptr;
+    doc["rssi"] = nullptr;
+  }
+  String out;
+  serializeJson(doc, out);
+  server.send(200, "application/json", out);
+}
+
+void handleWifiSave()
+{
+  if (server.method() != HTTP_POST)
+  {
+    server.send(405, "text/plain", "Method Not Allowed");
+    return;
+  }
+  if (!server.hasArg("plain"))
+  {
+    server.send(400, "text/plain", "Missing body");
+    return;
+  }
+  JsonDocument doc;
+  DeserializationError e = deserializeJson(doc, server.arg("plain"));
+  if (e)
+  {
+    server.send(400, "text/plain", String("JSON error: ") + e.c_str());
+    return;
+  }
+  String ssid = doc["ssid"] | "";
+  String pass = doc["pass"] | "";
+  if (ssid.length() == 0)
+  {
+    server.send(422, "application/json", "{\"ok\":false,\"err\":\"ssid required\"}");
+    return;
+  }
+  bool ok = saveWifiCreds(ssid, pass);
+  if (ok)
+  {
+    server.send(200, "application/json", "{\"ok\":true,\"reboot\":true}");
+    g_pendingRestart = true;
+    g_restartAtMs = millis() + 1500;
+  }
+  else
+  {
+    server.send(500, "application/json", "{\"ok\":false}");
+  }
+}
+
 // ===== Wi-Fi / NTP / mDNS =====
 static void connectWiFi()
 {
-  Serial.print("[TX] Connecting to ");
-  Serial.print(WIFI_SSID);
-  Serial.println(" ...");
+  Serial.printf("[TX] Connecting to SSID='%s' ...\n", g_wifiSsid.c_str());
   WiFi.mode(WIFI_STA);
   WiFi.persistent(false);
   WiFi.disconnect(true);
   delay(100);
   WiFi.hostname(HOSTNAME);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.begin(g_wifiSsid.c_str(), g_wifiPass.c_str());
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000)
   {
@@ -577,12 +815,8 @@ static void connectWiFi()
   Serial.println();
   if (WiFi.status() == WL_CONNECTED)
   {
-    Serial.print("[TX] WiFi OK. IP=");
-    Serial.print(WiFi.localIP());
-    Serial.print("  RSSI=");
-    Serial.print(WiFi.RSSI());
-    Serial.print(" dBm  CH=");
-    Serial.println(WiFi.channel());
+    Serial.printf("[TX] WiFi OK. IP=%s  RSSI=%d dBm  CH=%d\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.channel());
   }
   else
   {
@@ -598,9 +832,8 @@ static void setupTimeNTP()
   {
     time_t now = time(nullptr);
     if (now > 1700000000)
-    { // sanity (2023+)
-      Serial.print("[TIME] Synced: ");
-      Serial.println((unsigned long)now);
+    {
+      Serial.printf("[TIME] Synced: %lu\n", (unsigned long)now);
       return;
     }
     delay(500);
@@ -617,9 +850,7 @@ static void setupMDNS()
     if (MDNS.begin(HOSTNAME))
     {
       MDNS.addService("http", "tcp", 80);
-      Serial.print("[MDNS] Started: http://");
-      Serial.print(HOSTNAME);
-      Serial.println(".local/");
+      Serial.printf("[MDNS] Started: http://%s.local/\n", HOSTNAME);
       return;
     }
     delay(500);
@@ -627,18 +858,8 @@ static void setupMDNS()
   Serial.println("[MDNS] Failed to start mDNS");
 }
 
-// ===== Scheduler Helpers =====
-static float getActiveSetpoint()
-{
-  time_t now = time(nullptr);
-  struct tm lt;
-  localtime_r(&now, &lt);
-  int d = lt.tm_wday;
-  int h = lt.tm_hour;
-  if (d < 0 || d > 6 || h < 0 || h > 23)
-    return 21.0f;
-  return setpoints[d][h];
-}
+// ===== Control helper =====
+static float getActiveSetpoint() { return g_fixedEnabled ? g_fixedSetpoint : 19.0f; }
 
 // ======== DS18B20 Robust Bring-Up (BEFORE WiFi) ========
 static uint8_t rom[8];
@@ -652,14 +873,11 @@ static bool onewire_find_any()
 
 static void ds_init_bus_and_probe_pre_wifi()
 {
-  pinMode(ONE_WIRE_BUS, INPUT_PULLUP); // keep external 4.7k to 3V3
-  delay(200);                          // let GPIO2 settle (boot strap)
-
+  pinMode(ONE_WIRE_BUS, INPUT_PULLUP);
+  delay(200);
   sensors.begin();
   sensors.setWaitForConversion(true);
   sensors.setResolution(12);
-
-  // Wake up devices with a first conversion
   sensors.requestTemperatures();
   delay(10);
 
@@ -670,8 +888,7 @@ static void ds_init_bus_and_probe_pre_wifi()
     delay(200);
     found = onewire_find_any();
   }
-
-  uint8_t count = sensors.getDeviceCount(); // Dallas counter
+  uint8_t count = sensors.getDeviceCount();
   Serial.printf("[DS18B20] Dallas count: %u  RawFound:%s\n", count, found ? "YES" : "NO");
   g_haveSensor = found || (count > 0);
 
@@ -682,9 +899,7 @@ static void ds_init_bus_and_probe_pre_wifi()
     {
       Serial.print("[DS18B20] Sensor[0] address: ");
       for (uint8_t i = 0; i < 8; i++)
-      {
         Serial.printf("%02X%s", g_dsAddr[i], (i < 7 ? ":" : ""));
-      }
       Serial.println();
       sensors.setResolution(g_dsAddr, 12);
     }
@@ -717,7 +932,7 @@ static bool ds_try_hotplug()
 
 static float ds_read_c()
 {
-  sensors.requestTemperatures(); // blocking (~750ms @12-bit)
+  sensors.requestTemperatures();
   float t = g_haveAddress ? sensors.getTempC(g_dsAddr) : sensors.getTempCByIndex(0);
   if (t == DEVICE_DISCONNECTED_C || t < -55 || t > 125)
     return NAN;
@@ -737,9 +952,13 @@ void setup()
     LittleFS.format();
     LittleFS.begin();
   }
-  loadSetpoints();
 
-  // PROBE 1-WIRE BUS **BEFORE** Wi-Fi/ESP-NOW to avoid timing contention
+  // Load fixed setpoint + Wi-Fi creds + init legacy schedule
+  loadFixedSetpoint();
+  loadWifiCreds();
+  initLegacySchedule();
+
+  // Probe 1-Wire BEFORE WiFi
   ds_init_bus_and_probe_pre_wifi();
 
   // Wi-Fi + Time + mDNS
@@ -747,13 +966,20 @@ void setup()
   setupTimeNTP();
   setupMDNS();
 
-  // Web server routes
+  // Web routes
   server.on("/", HTTP_GET, handleIndex);
-  server.on("/api/setpoints", HTTP_GET, handleGetSetpoints);
-  server.on("/api/setpoints", HTTP_POST, handlePostSetpoints);
+  server.on("/wifi", HTTP_GET, handleWifiPage);
+
+  server.on("/api/fixed", HTTP_GET, handleGetFixed);
+  server.on("/api/fixed", HTTP_POST, handlePostFixed);
   server.on("/api/time", HTTP_GET, handleTime);
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/owbus", HTTP_GET, handleOwBus);
+
+  server.on("/api/wifi/scan", HTTP_GET, handleWifiScan);
+  server.on("/api/wifi/current", HTTP_GET, handleWifiCurrent);
+  server.on("/api/wifi/save", HTTP_POST, handleWifiSave);
+
   server.begin();
   Serial.println("[WEB] HTTP server started on port 80");
 
@@ -765,11 +991,9 @@ void setup()
     Serial.println("[TX] Using fallback channel=1");
   }
   wifi_set_channel(channel);
-  Serial.print("[TX] Locked radio to channel ");
-  Serial.println(channel);
+  Serial.printf("[TX] Locked radio to channel %d\n", channel);
   int rc = esp_now_init();
-  Serial.print("[TX] esp_now_init -> ");
-  Serial.println(rc);
+  Serial.printf("[TX] esp_now_init -> %d\n", rc);
   if (rc != 0)
   {
     Serial.println("[TX] ESPNOW init failed; rebooting...");
@@ -784,12 +1008,8 @@ void setup()
   Serial.print(") -> ");
   Serial.println(rc);
 
-  Serial.print("[TX] STA MAC: ");
-  Serial.println(WiFi.macAddress());
-  Serial.print("[TX] Ready. Open http://");
-  Serial.print(HOSTNAME);
-  Serial.print(".local or http://");
-  Serial.println(WiFi.localIP());
+  Serial.printf("[TX] STA MAC: %s\n", WiFi.macAddress().c_str());
+  Serial.printf("[TX] Ready. Open http://%s.local or http://%s\n", HOSTNAME, WiFi.localIP().toString().c_str());
 }
 
 // ===================== LOOP =====================
@@ -797,6 +1017,14 @@ void loop()
 {
   MDNS.update();
   server.handleClient();
+
+  // Handle deferred reboot after saving Wi-Fi
+  if (g_pendingRestart && (int32_t)(millis() - g_restartAtMs) >= 0)
+  {
+    Serial.println("[SYS] Rebooting to apply new Wi-Fi credentials...");
+    delay(100);
+    ESP.restart();
+  }
 
   static uint32_t counter = 0;
 
@@ -820,14 +1048,12 @@ void loop()
     {
       tempC = ds_read_c();
       if (isnan(tempC))
-      {
         Serial.println("[DS18B20] Read failed (disconnected/out of range).");
-      }
     }
 
     bool valid = !isnan(tempC);
 
-    // Determine active setpoint
+    // Determine active setpoint (fixed)
     float sp = getActiveSetpoint();
     uint8_t action = 0;
     if (valid)
@@ -846,7 +1072,8 @@ void loop()
     }
 
     // ESP-NOW telemetry (every ~1s)
-    DynamicJsonDocument doc(256);
+    // ...
+    JsonDocument doc;
     doc["type"] = "telemetry";
     doc["count"] = counter++;
     if (valid)
@@ -854,8 +1081,10 @@ void loop()
     else
       doc["temp"] = nullptr;
     doc["setpoint"] = sp;
-    doc["action"] = action; // 1 if temp < setpoint (heat on), else 0
+    doc["action"] = action;
+    doc["preset"] = g_fixedPreset;
     doc["note"] = "d1mini-ds18b20@D4";
+    // ...
 
     char buf[256];
     size_t n = serializeJson(doc, buf, sizeof(buf));
