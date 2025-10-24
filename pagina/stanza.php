@@ -41,7 +41,7 @@ function write_json_atomic(string $path, array $data): bool
 
 $STATE_FILE = resolve_state_path($RAM_DIR, $STATE_FILENAME);
 
-/** ---------- API: Load schedule (unchanged) ---------- */
+/** ---------- API: Load schedule (now returns version) ---------- */
 if ($action === 'load_schedule') {
     // Tell browsers and proxies: do NOT cache
     header('Content-Type: application/json; charset=utf-8');
@@ -51,14 +51,38 @@ if ($action === 'load_schedule') {
 
     $file = __DIR__ . '/schedule.json';
     if (is_readable($file)) {
-        echo file_get_contents($file);
+        $raw = file_get_contents($file);
+        $j = json_decode($raw, true);
+        if (is_array($j)) {
+            // Ensure keys exist
+            $out = [
+                "ok" => true,
+                "version" => isset($j['version']) ? (int) $j['version'] : null,
+                "saved_at" => $j['saved_at'] ?? null,
+                "schedule" => $j['schedule'] ?? null,
+            ];
+            echo json_encode($out, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        } else {
+            // Legacy/plain file: try to interpret as schedule-only content
+            $maybe = json_decode($raw, true);
+            if (is_array($maybe) && isset($maybe['schedule'])) {
+                echo json_encode([
+                    "ok" => true,
+                    "version" => null,
+                    "saved_at" => null,
+                    "schedule" => $maybe['schedule']
+                ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+            } else {
+                echo json_encode(["ok" => true, "version" => null, "saved_at" => null, "schedule" => null]);
+            }
+        }
     } else {
-        echo json_encode(["ok" => true, "source" => "default", "schedule" => null]);
+        echo json_encode(["ok" => true, "version" => null, "saved_at" => null, "schedule" => null]);
     }
     exit;
 }
 
-/** ---------- API: Save schedule (unchanged) ---------- */
+/** ---------- API: Save schedule (now versions) ---------- */
 if ($action === 'save_schedule' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     header('Content-Type: application/json; charset=utf-8');
     $file = __DIR__ . '/schedule.json';
@@ -69,11 +93,40 @@ if ($action === 'save_schedule' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         echo json_encode(["ok" => false, "error" => "Invalid payload"]);
         exit;
     }
-    $ok = @file_put_contents($file, json_encode(["schedule" => $decoded['schedule']], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
-    if ($ok === false) {
+
+    // Read previous version if present
+    $prevVersion = 0;
+    if (is_readable($file)) {
+        $prev = json_decode(@file_get_contents($file), true);
+        if (is_array($prev) && isset($prev['version'])) {
+            $prevVersion = (int) $prev['version'];
+        }
+    }
+
+    $version = $prevVersion + 1;
+    $saved_at = gmdate('c'); // ISO 8601 in UTC
+
+    $payloadToSave = [
+        "version" => $version,
+        "saved_at" => $saved_at,
+        "schedule" => $decoded['schedule'],
+    ];
+
+    // Try to write atomically where possible; fall back to file_put_contents if write_json_atomic fails for schedule file location
+    $wrote = false;
+    $schedule_path = $file;
+    if (is_writable(dirname($schedule_path))) {
+        $wrote = write_json_atomic($schedule_path, $payloadToSave);
+    }
+    if (!$wrote) {
+        $ok = @file_put_contents($schedule_path, json_encode($payloadToSave, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+        $wrote = $ok !== false;
+    }
+
+    if (!$wrote) {
         echo json_encode(["ok" => false, "error" => "Could not write schedule.json. Check file permissions."]);
     } else {
-        echo json_encode(["ok" => true, "saved_to" => basename($file)]);
+        echo json_encode(["ok" => true, "saved_to" => basename($file), "version" => $version, "saved_at" => $saved_at]);
     }
     exit;
 }
@@ -490,6 +543,7 @@ if ($action === 'load_state') {
                     <span class="save-note">AUTO mode uses these time points. Each day can have multiple time→setpoint
                         entries.</span>
                     <span style="flex:1"></span>
+                    <span id="serverVersion" class="save-note"></span>
                     <button class="btn" id="btnSaveServer" title="Save on server (schedule.json)">Save to
                         server</button>
                     <button class="btn" id="btnLoadServer" title="Load from server (schedule.json)">Load from
@@ -600,6 +654,8 @@ if ($action === 'load_state') {
             const btnSavePresets = byId('btnSavePresets');
             const btnClosePresets = byId('btnClosePresets');
             const btnPresets = byId('btnPresets');
+
+            const serverVersionEl = byId('serverVersion');
 
             const STORAGE_KEY = 'chrono.schedule.v1';
             const MODE_KEY = 'chrono.mode.v1';
@@ -999,8 +1055,17 @@ if ($action === 'load_state') {
                 try {
                     const payload = { schedule: state.schedule };
                     const j = await postJSON('?action=save_schedule', payload);
-                    if (j.ok) { flashStatus('Saved on server'); }
-                    else { flashStatus(j.error || 'Save failed', true); }
+                    if (j.ok) {
+                        if (j.version) {
+                            serverVersionEl.textContent = `Server schedule v${j.version}` + (j.saved_at ? ` · ${j.saved_at}` : '');
+                            flashStatus(`Saved on server (v${j.version})`);
+                        } else {
+                            serverVersionEl.textContent = '';
+                            flashStatus('Saved on server');
+                        }
+                    } else {
+                        flashStatus(j.error || 'Save failed', true);
+                    }
                 } catch (e) { flashStatus('Save failed', true); }
             });
             document.getElementById('btnLoadServer').addEventListener('click', async () => {
@@ -1009,8 +1074,22 @@ if ($action === 'load_state') {
                     if (!res.ok) throw new Error('HTTP ' + res.status);
                     const j = await res.json();
                     if (j && (j.schedule || j.schedule === null)) {
-                        if (j.schedule) { state.schedule = j.schedule; saveLocalSchedule(); renderDays(); updateSetpointFromMode(); flashStatus('Loaded from server'); }
-                        else { flashStatus('No server schedule found'); }
+                        if (j.schedule) {
+                            state.schedule = j.schedule;
+                            saveLocalSchedule();
+                            renderDays();
+                            updateSetpointFromMode();
+                            if (j.version) {
+                                serverVersionEl.textContent = `Server schedule v${j.version}` + (j.saved_at ? ` · ${j.saved_at}` : '');
+                                flashStatus(`Loaded from server (v${j.version})`);
+                            } else {
+                                serverVersionEl.textContent = '';
+                                flashStatus('Loaded from server');
+                            }
+                        } else {
+                            serverVersionEl.textContent = '';
+                            flashStatus('No server schedule found');
+                        }
                     } else { flashStatus('Load failed', true); }
                 } catch (e) { flashStatus('Load failed', true); }
             });
