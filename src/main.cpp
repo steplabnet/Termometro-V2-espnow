@@ -1,9 +1,12 @@
 // src/main.cpp — Wemos D1 mini (ESP8266)
-// Fixed setpoint thermostat + modern Wi-Fi setup page (scan, select, save)
+// Fixed setpoint thermostat + mobile-friendly light theme
 // - Thermostat UI at "/" (blue/green theme) with presets and +/-
 // - Wi-Fi setup at "/wifi": scans nearby SSIDs, allows selection + password
 // - Credentials stored in LittleFS (/wifi.json). After saving, device reboots.
-// - Uses fixed setpoint for control logic (temp < setpoint => action=1)
+// - Control logic: temp < setpoint => action=1
+// - UX: Light theme only; no manual mode; preset click saves immediately;
+//        +/- adjusts and auto-saves as "custom" without preset in payload;
+//        polling does not override the setpoint display.
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -86,7 +89,6 @@ static void printMac(const uint8_t *mac)
     Serial.print(b);
   }
 }
-
 static void onDataSent(uint8_t *mac, uint8_t status)
 {
   Serial.print("[TX] Sent to ");
@@ -95,50 +97,94 @@ static void onDataSent(uint8_t *mac, uint8_t status)
   Serial.println(status == 0 ? "OK" : "ERR");
 }
 
-// ======== Thermostat HTML (blue/green theme) at "/" ========
+// ======== Thermostat HTML (light theme, mobile-friendly) at "/" ========
 const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html><html lang="en"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
 <title>ESP8266 Thermostat</title>
 <style>
 :root{
   --bg:#f4fbfd; --card:#ffffff; --ink:#0b3440; --muted:#4d7580;
   --accent:#1aa6b7; --accent-2:#36d1b1; --border:#d7eef2;
   --ok:#1b9e77; --warn:#ffb703; --err:#c1121f;
+  --radius:16px; --pad:clamp(12px,2.5vw,18px); --tap:48px;
+  --font:16px ui-sans-serif,system-ui,"Segoe UI",Roboto,Arial;
 }
-*{box-sizing:border-box} html,body{height:100%}
-body{margin:0;background:linear-gradient(180deg,#f4fbfd 0%,#e8f7fa 100%);
-  color:var(--ink); font:16px ui-sans-serif,system-ui,Segoe UI,Roboto,Arial; display:grid; place-items:center; padding:18px;}
-.app{width:min(680px,100%); background:var(--card); border:1px solid var(--border);
-  border-radius:18px; box-shadow:0 8px 30px rgba(26,166,183,.15); overflow:hidden;}
-.header{display:flex;justify-content:space-between;align-items:center; padding:14px 16px; background:
-  linear-gradient(180deg,#e9fbff,#d9f5f7); border-bottom:1px solid var(--border)}
-.title{font-weight:800; letter-spacing:.2px}
-.badges{display:flex; gap:8px; flex-wrap:wrap}
-.badge{font:12px/1 ui-monospace,Consolas; color:var(--ink); background:#eefbfd; border:1px solid var(--border);
-  padding:6px 8px; border-radius:999px}
+*{box-sizing:border-box; -webkit-tap-highlight-color:transparent}
+html,body{height:100%}
+body{
+  margin:0; background:linear-gradient(180deg,#f4fbfd 0%,#e8f7fa 100%);
+  color:var(--ink); font:var(--font); display:grid; grid-template-rows:auto 1fr; gap:0; padding:0;
+}
+.app{ width:min(840px,100%); margin:0 auto; }
+.header{
+  position:sticky; top:0; z-index:10;
+  display:flex; justify-content:space-between; align-items:center;
+  padding:var(--pad); background:linear-gradient(180deg,#e9fbff,#d9f5f7);
+  border-bottom:1px solid var(--border);
+}
+.title{font-weight:800; letter-spacing:.2px; font-size:clamp(16px,2.8vw,20px)}
 .nav{display:flex; gap:8px}
-.nav a{color:#055968; text-decoration:none; font-weight:800; padding:6px 10px; border:1px solid var(--border); border-radius:10px; background:#f1fdff}
-.content{padding:18px; display:grid; gap:14px}
-.card{border:1px solid var(--border); border-radius:14px; padding:16px; background:linear-gradient(180deg,#ffffff,#f7fffe)}
+.nav a{
+  color:#055968; text-decoration:none; font-weight:800; padding:10px 12px; line-height:1;
+  border:1px solid var(--border); border-radius:12px; background:#f1fdff; min-height:var(--tap);
+  display:inline-flex; align-items:center; justify-content:center;
+}
+.badges{display:flex; gap:8px; flex-wrap:wrap; margin-left:auto}
+.badge{
+  font:12px/1 ui-monospace,Consolas; color:var(--ink); background:#eefbfd;
+  border:1px solid var(--border); padding:8px 10px; border-radius:999px; min-height:var(--tap);
+  display:inline-flex; align-items:center; gap:8px;
+}
+
+.content{ padding:var(--pad); display:grid; gap:12px }
+.card{
+  border:1px solid var(--border); border-radius:var(--radius); padding:var(--pad);
+  background:linear-gradient(180deg,#ffffff,#f7fffe);
+  box-shadow:0 8px 26px rgba(26,166,183,.12);
+}
 .row{display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap}
-.kpi{display:flex; align-items:baseline; gap:10px}
-.kpi .label{color:var(--muted); font-size:14px}
-.kpi .value{font-size:40px; font-weight:900}
-.controls{display:flex; align-items:center; gap:10px}
-.btn{border:1px solid var(--border); background:linear-gradient(180deg,#faffff,#e9fffb);
-  color:var(--ink); padding:10px 14px; border-radius:12px; cursor:pointer; font-weight:700; min-width:44px;
-  transition:transform .05s ease, box-shadow .15s ease}
+
+.kpi{display:flex; align-items:baseline; gap:10px; min-height:var(--tap)}
+.kpi .label{color:var(--muted); font-size:clamp(13px,2.2vw,14px)}
+.kpi .value{font-size:clamp(28px,9vw,44px); font-weight:900}
+
+.controls{display:flex; align-items:center; gap:10px; flex-wrap:wrap}
+.btn{
+  border:1px solid var(--border); background:linear-gradient(180deg,#faffff,#e9fffb);
+  color:var(--ink); padding:12px 18px; border-radius:14px; cursor:pointer; font-weight:700; min-width:52px;
+  min-height:var(--tap); line-height:1; user-select:none; touch-action:manipulation;
+  transition:transform .05s ease, box-shadow .15s ease;
+}
 .btn:hover{box-shadow:0 3px 10px rgba(54,209,177,.15)}
 .btn:active{transform:translateY(1px)}
 .btn.primary{background:linear-gradient(180deg,#bff6ec,#8df0dc); border-color:#8de9d8}
 .btn.pill{border-radius:999px}
-.presetbar{display:flex; gap:10px; flex-wrap:wrap}
-.preset{padding:10px 14px; border-radius:999px; border:1px solid var(--border); background:#f7fffe; cursor:pointer; font-weight:700}
+
+.presetbar{
+  display:flex; gap:10px; flex-wrap:nowrap; overflow-x:auto; padding-bottom:2px; margin:0 -4px;
+  scrollbar-width:thin;
+}
+.presetbar::-webkit-scrollbar{height:6px}
+.presetbar::-webkit-scrollbar-thumb{background:#bfeff3; border-radius:999px}
+.preset{
+  flex:0 0 auto; padding:10px 14px; border-radius:999px; border:1px solid var(--border);
+  background:#f7fffe; cursor:pointer; font-weight:700; min-height:var(--tap);
+}
 .preset.active{outline:2px solid var(--accent); box-shadow:0 0 0 3px rgba(26,166,183,.15) inset}
-.hint{font-size:13px; color:var(--muted)}
-.dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:6px; vertical-align:middle}
+.hint{font-size:clamp(12px,2.4vw,13px); color:var(--muted); min-height:var(--tap); display:flex; align-items:center}
+
+.dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:6px; vertical-align:middle}
 .on{background:var(--ok)} .off{background:#9aaeb5}
+
+/* Responsive stack for small screens */
+@media (max-width: 480px){
+  .row{flex-direction:column; align-items:stretch}
+  .controls{justify-content:space-between}
+  .badges{width:100%; justify-content:flex-end}
+  .nav{flex-wrap:wrap}
+}
 </style>
 </head><body>
 <div class="app">
@@ -161,25 +207,32 @@ body{margin:0;background:linear-gradient(180deg,#f4fbfd 0%,#e8f7fa 100%);
       <div class="kpi"><div class="label">Setpoint</div><div class="value" id="sp">--.-°C</div></div>
     </div>
 
-    <div class="card row">
-      <div class="controls">
-        <button class="btn pill" id="minus">−</button>
-        <button class="btn pill" id="plus">+</button>
-        <button class="btn primary pill" id="save">Save</button>
-      </div>
-      <div class="presetbar">
-        <button class="preset" data-name="off"  data-val="10">Off · 10°C</button>
-        <button class="preset" data-name="on"   data-val="19">On · 19°C</button>
-        <button class="preset" data-name="away" data-val="15">Away · 15°C</button>
-        <span class="hint" id="state">—</span>
+    <div class="card">
+      <div class="row" style="gap:14px">
+        <div class="controls">
+          <button class="btn pill" id="minus" aria-label="Decrease setpoint">−</button>
+          <button class="btn pill" id="plus"  aria-label="Increase setpoint">+</button>
+          <button class="btn primary pill" id="save">Save</button>
+        </div>
+        <div class="presetbar" role="tablist" aria-label="Presets">
+          <button class="preset" data-name="off"  data-val="10">Off · 10°C</button>
+          <button class="preset" data-name="on"   data-val="19">On · 19°C</button>
+          <button class="preset" data-name="away" data-val="15">Away · 15°C</button>
+        </div>
+        <div class="hint" id="state">—</div>
       </div>
     </div>
   </div>
 </div>
 
 <script>
+// Do NOT let polling overwrite the setpoint being edited.
+// We poll only Actual/Heat/time. Setpoint in UI changes only from your actions.
+
 let sp = 19.0;
 let preset = 'on';
+let saveTimer = null;
+const SAVE_DEBOUNCE_MS = 350;
 
 function fmt(v){ return Number(v).toFixed(1) + '°C'; }
 function setActivePreset(name){
@@ -187,42 +240,83 @@ function setActivePreset(name){
     b.classList.toggle('active', b.dataset.name===name);
   });
 }
+function showState(msg){ document.getElementById('state').textContent = msg; }
 
+// Load initial fixed state once
 async function loadFixed(){
   try{
     const r = await fetch('/api/fixed');
+    if (!r.ok) throw new Error('http');
     const j = await r.json();
-    sp = typeof j.setpoint === 'number' ? j.setpoint : 19.0;
+    sp = (typeof j.setpoint === 'number' && Number.isFinite(j.setpoint)) ? j.setpoint : 19.0;
     preset = j.preset || 'custom';
     document.getElementById('sp').textContent = fmt(sp);
     setActivePreset(preset);
-    document.getElementById('state').textContent = 'Preset: ' + preset;
-  }catch(e){}
-}
-
-async function saveFixed(newPreset){
-  try{
-    const body = newPreset ? { preset:newPreset } : { setpoint: sp, preset:'custom' };
-    const r = await fetch('/api/fixed',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
-    const j = await r.json();
-    sp = j.setpoint; preset = j.preset || 'custom';
+    showState('Preset: ' + preset);
+  }catch(e){
+    sp = 19.0; preset = 'custom';
     document.getElementById('sp').textContent = fmt(sp);
     setActivePreset(preset);
-    document.getElementById('state').textContent = 'Saved · Preset: ' + preset;
-  }catch(e){
-    document.getElementById('state').textContent = 'Save failed';
+    showState('Preset: custom');
   }
 }
 
+// Save helpers
+async function savePreset(name){
+  try{
+    showState('Saving preset…');
+    const r = await fetch('/api/fixed',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({preset:name})
+    });
+    if (!r.ok){ showState('Save failed'); return; }
+    const j = await r.json();
+    if (typeof j.setpoint === 'number'){
+      sp = j.setpoint; preset = j.preset || name;
+      document.getElementById('sp').textContent = fmt(sp);
+      setActivePreset(preset);
+      showState('Saved · Preset: ' + preset);
+    }else{
+      showState('Save failed');
+    }
+  }catch(e){ showState('Save failed'); }
+}
+
+async function saveCustomNow(){
+  try{
+    const r = await fetch('/api/fixed',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      // IMPORTANT: send only setpoint; backend will mark as "custom"
+      body:JSON.stringify({ setpoint: sp })
+    });
+    if (!r.ok){ showState('Save failed'); return; }
+    const j = await r.json();
+    if (typeof j.setpoint === 'number'){
+      sp = j.setpoint; preset = j.preset || 'custom';
+      document.getElementById('sp').textContent = fmt(sp);
+      setActivePreset(preset);
+      showState('Saved · Preset: ' + preset);
+    }else{
+      showState('Save failed');
+    }
+  }catch(e){ showState('Save failed'); }
+}
+
+function queueSaveCustom(){
+  if (saveTimer) clearTimeout(saveTimer);
+  showState('Saving…');
+  saveTimer = setTimeout(saveCustomNow, SAVE_DEBOUNCE_MS);
+}
+
+// Poll status BUT DO NOT TOUCH setpoint/preset in UI
 async function tick(){
   try{
     const r = await fetch('/api/status');
+    if (!r.ok) return;
     const j = await r.json();
     if (typeof j.temp === 'number') document.getElementById('actual').textContent = fmt(j.temp);
-    if (typeof j.setpoint === 'number'){
-      sp = j.setpoint;
-      document.getElementById('sp').textContent = fmt(sp);
-    }
     const on = j.action===1;
     document.getElementById('heatText').textContent = 'Heat: ' + (on?'ON':'OFF');
     document.getElementById('heatDot').className = 'dot ' + (on?'on':'off');
@@ -233,45 +327,82 @@ async function tick(){
   }catch(e){}
 }
 
-document.getElementById('minus').onclick = ()=>{ sp = Math.max(5, Math.round((sp-0.5)*10)/10); document.getElementById('sp').textContent = fmt(sp); setActivePreset('custom'); };
-document.getElementById('plus').onclick  = ()=>{ sp = Math.min(35, Math.round((sp+0.5)*10)/10); document.getElementById('sp').textContent = fmt(sp); setActivePreset('custom'); };
-document.getElementById('save').onclick  = ()=> saveFixed(null);
+document.getElementById('minus').onclick = ()=>{
+  if (!Number.isFinite(sp)) sp = 19.0; // guard against NaN
+  sp = Math.max(5, Math.round((sp - 0.5) * 10) / 10);
+  document.getElementById('sp').textContent = fmt(sp);
+  setActivePreset('custom');
+  queueSaveCustom();
+};
+document.getElementById('plus').onclick  = ()=>{
+  if (!Number.isFinite(sp)) sp = 19.0; // guard against NaN
+  sp = Math.min(35, Math.round((sp + 0.5) * 10) / 10);
+  document.getElementById('sp').textContent = fmt(sp);
+  setActivePreset('custom');
+  queueSaveCustom();
+};
+document.getElementById('save').onclick  = ()=> saveCustomNow();
+
 document.querySelectorAll('.preset').forEach(b=>{
-  b.onclick = ()=> saveFixed(b.dataset.name);
+  b.onclick = ()=> savePreset(b.dataset.name);
 });
 
 loadFixed();
 tick();
-setInterval(tick, 1000);
+setInterval(tick, 1500); // modest polling; does not override setpoint UI
 </script>
 </body></html>
 )HTML";
 
-// ======== Wi-Fi Setup HTML at "/wifi" ========
+// ======== Wi-Fi Setup HTML (light theme) at "/wifi" ========
 const char WIFI_HTML[] PROGMEM = R"HTML(
 <!doctype html><html lang="en"><head>
-<meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
 <title>Wi-Fi Setup</title>
 <style>
 :root{
   --bg:#f4fbfd; --card:#ffffff; --ink:#0b3440; --muted:#4d7580;
   --accent:#1aa6b7; --accent-2:#36d1b1; --border:#d7eef2; --ok:#1b9e77; --err:#c1121f;
+  --radius:16px; --pad:clamp(12px,2.5vw,18px); --tap:48px;
+  --font:16px ui-sans-serif,system-ui,"Segoe UI",Roboto,Arial;
 }
-*{box-sizing:border-box} body{margin:0;background:linear-gradient(180deg,#f4fbfd 0%,#e8f7fa 100%);color:var(--ink);
-  font:16px ui-sans-serif,system-ui,Segoe UI,Roboto,Arial;display:grid;place-items:center;min-height:100vh;padding:18px}
-.app{width:min(720px,100%); background:var(--card); border:1px solid var(--border); border-radius:18px;
-  box-shadow:0 8px 30px rgba(26,166,183,.15); overflow:hidden}
-.header{display:flex;justify-content:space-between;align-items:center;padding:14px 16px;background:linear-gradient(180deg,#e9fbff,#d9f5f7); border-bottom:1px solid var(--border)}
-.title{font-weight:800}
-.nav a{color:#055968;text-decoration:none;font-weight:800;padding:6px 10px;border:1px solid var(--border);border-radius:10px;background:#f1fdff}
-.content{padding:18px; display:grid; gap:16px}
-.card{border:1px solid var(--border); border-radius:14px; padding:16px; background:linear-gradient(180deg,#ffffff,#f7fffe)}
-.row{display:grid; grid-template-columns:140px 1fr; gap:12px; align-items:center}
-select,input{border:1px solid var(--border); border-radius:12px; padding:10px; background:#fbffff}
-.btn{border:1px solid var(--border); background:linear-gradient(180deg,#faffff,#e9fffb); color:var(--ink); padding:10px 14px; border-radius:12px; cursor:pointer; font-weight:800}
+*{box-sizing:border-box; -webkit-tap-highlight-color:transparent}
+body{
+  margin:0;background:linear-gradient(180deg,#f4fbfd 0%,#e8f7fa 100%);color:var(--ink);
+  font:var(--font);display:grid;place-items:start;min-height:100vh;padding:0;
+}
+.app{width:min(840px,100%); margin:0 auto}
+.header{
+  position:sticky; top:0; z-index:10; padding:var(--pad);
+  display:flex;justify-content:space-between;align-items:center;
+  background:linear-gradient(180deg,#e9fbff,#d9f5f7);
+  border-bottom:1px solid var(--border)
+}
+.title{font-weight:800; font-size:clamp(16px,2.8vw,20px)}
+.nav a{
+  color:#055968;text-decoration:none;font-weight:800;padding:10px 12px;border:1px solid var(--border);
+  border-radius:12px;background:#f1fdff; min-height:var(--tap); display:inline-flex; align-items:center
+}
+.content{padding:var(--pad); display:grid; gap:12px}
+.card{
+  border:1px solid var(--border); border-radius:var(--radius); padding:var(--pad);
+  background:linear-gradient(180deg,#ffffff,#f7fffe);
+  box-shadow:0 8px 26px rgba(26,166,183,.12)
+}
+.row{display:grid; grid-template-columns:1fr; gap:10px; align-items:center}
+@media (min-width:560px){ .row{ grid-template-columns:180px 1fr } }
+select,input{
+  border:1px solid var(--border); border-radius:12px; padding:12px; background:#fbffff; min-height:var(--tap); width:100%;
+  font-size:16px; /* prevents iOS zoom */
+}
+.btn{
+  border:1px solid var(--border); background:linear-gradient(180deg,#faffff,#e9fffb);
+  color:var(--ink); padding:12px 18px; border-radius:12px; cursor:pointer; font-weight:800; min-height:var(--tap)
+}
 .btn.primary{background:linear-gradient(180deg,#bff6ec,#8df0dc); border-color:#8de9d8}
 .kv{display:flex; gap:8px; flex-wrap:wrap; color:var(--muted); font-size:14px}
-.badge{border:1px solid var(--border); border-radius:999px; padding:6px 10px; background:#eefbfd}
+.badge{border:1px solid var(--border); border-radius:999px; padding:8px 10px; background:#eefbfd; min-height:var(--tap); display:inline-flex; align-items:center}
 .msg{font-size:14px}
 .ok{color:var(--ok)} .err{color:var(--err)}
 </style>
@@ -288,26 +419,26 @@ select,input{border:1px solid var(--border); border-radius:12px; padding:10px; b
     <div class="card">
       <div class="row">
         <label for="ssid">Available Wi-Fi</label>
-        <div style="display:flex;gap:8px;align-items:center">
-          <select id="ssid" style="min-width:260px"></select>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <select id="ssid" style="min-width:min(260px,100%)"></select>
           <button class="btn" id="refresh">Refresh</button>
         </div>
       </div>
       <div class="row">
         <label for="pass">Password</label>
-        <input id="pass" type="password" placeholder="Enter Wi-Fi password"/>
+        <input id="pass" type="password" inputmode="text" autocomplete="current-password" placeholder="Enter Wi-Fi password"/>
       </div>
       <div class="row">
         <div></div>
-        <div style="display:flex;gap:8px;align-items:center">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
           <button class="btn primary" id="save">Save & Reboot</button>
-          <span class="msg" id="msg"></span>
+          <span class="msg" id="msg" role="status" aria-live="polite"></span>
         </div>
       </div>
     </div>
 
     <div class="card">
-      <div style="display:flex;justify-content:space-between;align-items:center">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
         <div class="kv">
           <span class="badge" id="curSsid">SSID: --</span>
           <span class="badge" id="curIp">IP: --</span>
@@ -335,9 +466,7 @@ async function loadScan(){
       sel.appendChild(o);
     });
     if (j.networks.length===0) sel.innerHTML='<option>No networks found</option>';
-  }catch(e){
-    sel.innerHTML='<option>Scan failed</option>';
-  }
+  }catch(e){ sel.innerHTML='<option>Scan failed</option>'; }
 }
 async function loadCurrent(){
   try{
@@ -358,9 +487,7 @@ async function saveCreds(){
     if (!r.ok){ m.textContent='Save failed'; m.className='msg err'; return; }
     m.textContent='Saved. Rebooting…'; m.className='msg ok';
     setTimeout(()=>location.href='/', 7000);
-  }catch(e){
-    m.textContent='Save failed'; m.className='msg err';
-  }
+  }catch(e){ m.textContent='Save failed'; m.className='msg err'; }
 }
 document.getElementById('refresh').onclick = loadScan;
 document.getElementById('reloadCur').onclick = loadCurrent;
@@ -448,7 +575,6 @@ static void loadWifiCreds()
   }
   f.close();
 }
-
 static bool saveWifiCreds(const String &ssid, const String &pass)
 {
   JsonDocument doc;
@@ -467,7 +593,7 @@ static bool saveWifiCreds(const String &ssid, const String &pass)
 }
 
 // ====== (Legacy) 7×24 schedule kept but unused ======
-float setpoints[7][24]; // retained for compatibility; not used for control now
+float setpoints[7][24];
 static void initLegacySchedule()
 {
   for (int d = 0; d < 7; ++d)
@@ -486,11 +612,9 @@ static bool cesanaReportAndFetch(float tempC, bool heating)
   String url = "https://cesana.steplab.net/get_setpoint.php?temp=";
   url += String(tempC, 1);
   url += "&cald=";
-  url += heating ? "1" : "0";
-
+  url += (heating ? "1" : "0");
   std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
   client->setInsecure();
-
   HTTPClient https;
   Serial.printf("[HTTP] GET %s\n", url.c_str());
   if (!https.begin(*client, url))
@@ -498,7 +622,6 @@ static bool cesanaReportAndFetch(float tempC, bool heating)
     Serial.println("[HTTP] begin() failed");
     return false;
   }
-
   int code = https.GET();
   if (code <= 0)
   {
@@ -512,10 +635,8 @@ static bool cesanaReportAndFetch(float tempC, bool heating)
     https.end();
     return false;
   }
-
   String payload = https.getString();
   https.end();
-
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, payload);
   if (err)
@@ -525,12 +646,10 @@ static bool cesanaReportAndFetch(float tempC, bool heating)
     Serial.println(payload);
     return false;
   }
-
   g_remoteOk = doc["ok"] | false;
   g_remoteMode = (const char *)(doc["mode"] | "");
   g_remoteSetpoint = doc["setpoint"] | NAN;
   g_remoteActual = doc["actualTemp"] | NAN;
-
   if (!isnan(g_remoteSetpoint) && !isnan(g_remoteActual))
   {
     g_remoteHeating = (g_remoteActual < g_remoteSetpoint);
@@ -541,12 +660,9 @@ static bool cesanaReportAndFetch(float tempC, bool heating)
     g_remoteHeating = false;
     g_remoteDelta = NAN;
   }
-
   Serial.printf("[HTTP] ok=%s mode=%s setpoint=%.1f actual=%.1f heat=%s Δ=%.1f\n",
-                g_remoteOk ? "true" : "false", g_remoteMode.c_str(),
-                g_remoteSetpoint, g_remoteActual,
-                g_remoteHeating ? "ON" : "OFF",
-                (isnan(g_remoteDelta) ? NAN : g_remoteDelta));
+                g_remoteOk ? "true" : "false", g_remoteMode.c_str(), g_remoteSetpoint, g_remoteActual,
+                g_remoteHeating ? "ON" : "OFF", (isnan(g_remoteDelta) ? NAN : g_remoteDelta));
   return g_remoteOk;
 }
 
@@ -578,8 +694,7 @@ void handlePostFixed()
     server.send(400, "text/plain", "Missing body");
     return;
   }
-
-  JsonDocument in; // <-- rename to avoid redeclaration
+  JsonDocument in;
   DeserializationError e = deserializeJson(in, server.arg("plain"));
   if (e)
   {
@@ -593,19 +708,30 @@ void handlePostFixed()
   auto applyPreset = [&](const String &p)
   {
     if (p == "off")
+    {
       g_fixedSetpoint = 10.0f;
-    else if (p == "on")
+      g_fixedPreset = "off";
+      g_fixedEnabled = true;
+      return true;
+    }
+    if (p == "on")
+    {
       g_fixedSetpoint = 19.0f;
-    else if (p == "away")
+      g_fixedPreset = "on";
+      g_fixedEnabled = true;
+      return true;
+    }
+    if (p == "away")
+    {
       g_fixedSetpoint = 15.0f;
-    else
-      return false;
-    g_fixedPreset = p;
-    g_fixedEnabled = true;
-    return true;
+      g_fixedPreset = "away";
+      g_fixedEnabled = true;
+      return true;
+    }
+    return false;
   };
 
-  if (preset.length() && preset != "custom")
+  if (preset.length())
   {
     changed = applyPreset(preset);
   }
@@ -628,12 +754,11 @@ void handlePostFixed()
   }
   bool ok = saveFixedSetpoint();
 
-  JsonDocument out; // <-- declare this 'out'
+  JsonDocument out;
   out["ok"] = ok;
   out["setpoint"] = g_fixedSetpoint;
   out["preset"] = g_fixedPreset;
   out["enabled"] = g_fixedEnabled;
-
   String s;
   serializeJson(out, s);
   server.send(ok ? 200 : 500, "application/json", s);
@@ -653,18 +778,16 @@ void handleStatus()
 {
   time_t now = time(nullptr);
   float sp = g_fixedEnabled ? g_fixedSetpoint : 19.0f;
-
   JsonDocument doc;
   doc["epoch"] = (uint32_t)now;
   if (isnan(g_lastTempC))
     doc["temp"] = nullptr;
   else
     doc["temp"] = g_lastTempC;
-  doc["setpoint"] = sp;
-  doc["preset"] = g_fixedPreset;
+  doc["setpoint"] = sp;          // UI ignores this for setpoint display to avoid disturbance
+  doc["preset"] = g_fixedPreset; // kept for API completeness
   doc["action"] = g_lastAction;
 
-  // Remote info
   if (isnan(g_remoteSetpoint))
     doc["remoteSetpoint"] = nullptr;
   else
@@ -680,7 +803,6 @@ void handleStatus()
     doc["remoteDelta"] = nullptr;
   else
     doc["remoteDelta"] = g_remoteDelta;
-
   String out;
   serializeJson(doc, out);
   server.send(200, "application/json", out);
@@ -691,9 +813,8 @@ void handleOwBus()
 {
   sensors.requestTemperatures();
   delay(5);
-
   JsonDocument doc;
-  JsonArray arr = doc["devices"].to<JsonArray>(); // v7 style
+  JsonArray arr = doc["devices"].to<JsonArray>();
   uint8_t count = sensors.getDeviceCount();
   for (uint8_t i = 0; i < count; i++)
   {
@@ -707,9 +828,7 @@ void handleOwBus()
       arr.add(s);
     }
     else
-    {
       arr.add(nullptr);
-    }
   }
   doc["parasite"] = sensors.isParasitePowerMode();
   String out;
@@ -720,13 +839,12 @@ void handleOwBus()
 // ===== Wi-Fi API handlers =====
 void handleWifiScan()
 {
-  int n = WiFi.scanNetworks(/*async=*/false, /*hidden=*/true);
-
+  int n = WiFi.scanNetworks(false, true);
   JsonDocument doc;
-  JsonArray arr = doc["networks"].to<JsonArray>(); // v7 style
+  JsonArray arr = doc["networks"].to<JsonArray>();
   for (int i = 0; i < n; ++i)
   {
-    JsonObject o = arr.add<JsonObject>(); // v7 style
+    JsonObject o = arr.add<JsonObject>();
     o["ssid"] = WiFi.SSID(i);
     o["rssi"] = WiFi.RSSI(i);
     o["enc"] = (int)WiFi.encryptionType(i);
@@ -736,7 +854,6 @@ void handleWifiScan()
   serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
-
 void handleWifiCurrent()
 {
   JsonDocument doc;
@@ -756,7 +873,6 @@ void handleWifiCurrent()
   serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
-
 void handleWifiSave()
 {
   if (server.method() != HTTP_POST)
@@ -815,15 +931,13 @@ static void connectWiFi()
   Serial.println();
   if (WiFi.status() == WL_CONNECTED)
   {
-    Serial.printf("[TX] WiFi OK. IP=%s  RSSI=%d dBm  CH=%d\n",
-                  WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.channel());
+    Serial.printf("[TX] WiFi OK. IP=%s  RSSI=%d dBm  CH=%d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.channel());
   }
   else
   {
     Serial.println("[TX] WiFi timeout; UI will be unreachable until connected.");
   }
 }
-
 static void setupTimeNTP()
 {
   configTime(TZ_INFO, NTP_1, NTP_2);
@@ -840,7 +954,6 @@ static void setupTimeNTP()
   }
   Serial.println("[TIME] NTP sync timeout; will continue without exact time.");
 }
-
 static void setupMDNS()
 {
   if (WiFi.status() != WL_CONNECTED)
@@ -870,7 +983,6 @@ static bool onewire_find_any()
     return false;
   return OneWire::crc8(rom, 7) == rom[7];
 }
-
 static void ds_init_bus_and_probe_pre_wifi()
 {
   pinMode(ONE_WIRE_BUS, INPUT_PULLUP);
@@ -880,7 +992,6 @@ static void ds_init_bus_and_probe_pre_wifi()
   sensors.setResolution(12);
   sensors.requestTemperatures();
   delay(10);
-
   bool found = onewire_find_any();
   if (!found)
   {
@@ -891,7 +1002,6 @@ static void ds_init_bus_and_probe_pre_wifi()
   uint8_t count = sensors.getDeviceCount();
   Serial.printf("[DS18B20] Dallas count: %u  RawFound:%s\n", count, found ? "YES" : "NO");
   g_haveSensor = found || (count > 0);
-
   if (g_haveSensor)
   {
     g_haveAddress = sensors.getAddress(g_dsAddr, 0);
@@ -913,7 +1023,6 @@ static void ds_init_bus_and_probe_pre_wifi()
     Serial.println("[DS18B20] No sensor found on D4. Will keep scanning in loop().");
   }
 }
-
 static bool ds_try_hotplug()
 {
   sensors.requestTemperatures();
@@ -929,7 +1038,6 @@ static bool ds_try_hotplug()
   }
   return false;
 }
-
 static float ds_read_c()
 {
   sensors.requestTemperatures();
@@ -944,46 +1052,33 @@ void setup()
 {
   Serial.begin(115200);
   delay(200);
-
-  // FS
   if (!LittleFS.begin())
   {
     Serial.println("[FS] LittleFS mount failed, formatting...");
     LittleFS.format();
     LittleFS.begin();
   }
-
-  // Load fixed setpoint + Wi-Fi creds + init legacy schedule
   loadFixedSetpoint();
   loadWifiCreds();
   initLegacySchedule();
-
-  // Probe 1-Wire BEFORE WiFi
   ds_init_bus_and_probe_pre_wifi();
-
-  // Wi-Fi + Time + mDNS
   connectWiFi();
   setupTimeNTP();
   setupMDNS();
 
-  // Web routes
   server.on("/", HTTP_GET, handleIndex);
   server.on("/wifi", HTTP_GET, handleWifiPage);
-
   server.on("/api/fixed", HTTP_GET, handleGetFixed);
   server.on("/api/fixed", HTTP_POST, handlePostFixed);
   server.on("/api/time", HTTP_GET, handleTime);
   server.on("/api/status", HTTP_GET, handleStatus);
   server.on("/api/owbus", HTTP_GET, handleOwBus);
-
   server.on("/api/wifi/scan", HTTP_GET, handleWifiScan);
   server.on("/api/wifi/current", HTTP_GET, handleWifiCurrent);
   server.on("/api/wifi/save", HTTP_POST, handleWifiSave);
-
   server.begin();
   Serial.println("[WEB] HTTP server started on port 80");
 
-  // ESPNOW on AP channel
   int channel = WiFi.channel();
   if (channel <= 0)
   {
@@ -1018,7 +1113,6 @@ void loop()
   MDNS.update();
   server.handleClient();
 
-  // Handle deferred reboot after saving Wi-Fi
   if (g_pendingRestart && (int32_t)(millis() - g_restartAtMs) >= 0)
   {
     Serial.println("[SYS] Rebooting to apply new Wi-Fi credentials...");
@@ -1027,52 +1121,40 @@ void loop()
   }
 
   static uint32_t counter = 0;
-
-  // --- Temperature read cycle (every ~1s)
   static uint32_t tRead = 0;
   if (millis() - tRead > 1000)
   {
     tRead = millis();
-
     float tempC = NAN;
 
     if (!g_haveSensor)
     {
       if (!ds_try_hotplug())
-      {
         Serial.println("[DS18B20] Still no sensor on bus.");
-      }
     }
-
     if (g_haveSensor)
     {
       tempC = ds_read_c();
       if (isnan(tempC))
         Serial.println("[DS18B20] Read failed (disconnected/out of range).");
     }
-
     bool valid = !isnan(tempC);
 
-    // Determine active setpoint (fixed)
     float sp = getActiveSetpoint();
     uint8_t action = 0;
     if (valid)
       action = (tempC < sp) ? 1 : 0;
 
-    // Keep latest for web UI
     if (valid)
       g_lastTempC = tempC;
     g_lastAction = action;
 
-    // Report to remote (rate-limited) if we have valid temp
     if (valid && (millis() - g_lastHttpMs >= HTTP_MIN_INTERVAL_MS))
     {
       cesanaReportAndFetch(tempC, action == 1);
       g_lastHttpMs = millis();
     }
 
-    // ESP-NOW telemetry (every ~1s)
-    // ...
     JsonDocument doc;
     doc["type"] = "telemetry";
     doc["count"] = counter++;
@@ -1084,8 +1166,6 @@ void loop()
     doc["action"] = action;
     doc["preset"] = g_fixedPreset;
     doc["note"] = "d1mini-ds18b20@D4";
-    // ...
-
     char buf[256];
     size_t n = serializeJson(doc, buf, sizeof(buf));
     uint8_t rc = esp_now_send(TARGET, (uint8_t *)buf, (int)n);
