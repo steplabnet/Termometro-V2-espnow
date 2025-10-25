@@ -268,7 +268,32 @@ include('../connessione.php');
         startPolling();
         hookSetpointChange();
       });
+
+      const timeEl = document.getElementById("times");  // <— add this near your other consts
+
+      function updateClock() {
+        // Always show Europe/Rome time, regardless of the device timezone
+        const now = new Date();
+        const fmt = new Intl.DateTimeFormat('it-IT', {
+          timeZone: 'Europe/Rome',
+          year: 'numeric', month: '2-digit', day: '2-digit',
+          hour: '2-digit', minute: '2-digit', second: '2-digit'
+        });
+        if (timeEl) timeEl.textContent = fmt.format(now).replace(',', '');
+      }
+
+      document.addEventListener("DOMContentLoaded", function () {
+        startPolling();
+        hookSetpointChange();
+
+        updateClock();                 // <— add
+        setInterval(updateClock, 1000); // <— add
+      });
+
     })();
+
+
+
   </script>
 
 
