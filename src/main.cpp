@@ -4,11 +4,8 @@
 // - Wi-Fi setup at "/wifi": scan/select/save (LittleFS /wifi.json). Reboots after saving.
 // - Control logic: 0.5°C hysteresis (ON <= sp-0.25, OFF >= sp+0.25)
 // - OTA: Upload via PlatformIO using mDNS (esp-thermo.local) or device IP.
-//
-// PlatformIO (platformio.ini):
-//   upload_protocol = espota
-//   upload_port = esp-thermo.local   ; or the device IP
-//   ; upload_flags = --auth=your_password   ; if OTA password is set
+// - Remote setpoint: fetch via get_setpoint.php; adopt & persist only if changed.
+// - ESP-NOW payload: only {"heater":"ON"} or {"heater":"OFF"}
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -19,10 +16,11 @@
 #include <LittleFS.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
-#include <ArduinoOTA.h> // <-- OTA
+#include <ArduinoOTA.h> // OTA
 #include <time.h>
 #include <ESP8266HTTPClient.h>
 #include <WiFiClientSecureBearSSL.h>
+#include <math.h>
 
 extern "C"
 {
@@ -59,7 +57,7 @@ static uint8_t TARGET[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
 // ===== Fixed setpoint state (persisted) =====
 static float g_fixedSetpoint = 19.0f; // default: "on" preset
-static String g_fixedPreset = "on";   // "off" | "on" | "away" | "custom"
+static String g_fixedPreset = "on";   // "off" | "on" | "away" | "custom" | "remote"
 static bool g_fixedEnabled = true;    // always use fixed setpoint for control
 
 // ===== Live telemetry for web UI =====
@@ -85,6 +83,12 @@ ESP8266WebServer server(80);
 // Pending reboot after saving Wi-Fi
 static bool g_pendingRestart = false;
 static uint32_t g_restartAtMs = 0;
+
+// ===== Persist/write minimization for fixed setpoint =====
+static float g_lastSavedSetpoint = NAN;
+static uint32_t g_lastFsWriteMs = 0;
+static const uint32_t FS_WRITE_MIN_GAP_MS = 30000; // 30s between FS writes
+static const float SP_EPS = 0.05f;                 // consider same within ±0.05°C
 
 // ===== Utils =====
 static void printMac(const uint8_t *mac)
@@ -533,6 +537,26 @@ static bool saveFixedSetpoint()
   return ok;
 }
 
+// Save only if changed, with throttle to minimize flash wear
+static bool saveFixedSetpointIfNeeded(bool force = false)
+{
+  if (!isnan(g_lastSavedSetpoint) && fabsf(g_fixedSetpoint - g_lastSavedSetpoint) < SP_EPS)
+  {
+    return true; // no meaningful change
+  }
+  if (!force && (millis() - g_lastFsWriteMs < FS_WRITE_MIN_GAP_MS))
+  {
+    return true; // defer to next opportunity
+  }
+  bool ok = saveFixedSetpoint();
+  if (ok)
+  {
+    g_lastSavedSetpoint = g_fixedSetpoint;
+    g_lastFsWriteMs = millis();
+  }
+  return ok;
+}
+
 // Wi-Fi credentials persistence
 static void loadWifiCreds()
 {
@@ -652,6 +676,21 @@ static bool cesanaReportAndFetch(float tempC, bool heating)
   Serial.printf("[HTTP] ok=%s mode=%s setpoint=%.1f actual=%.1f heat=%s Δ=%.1f\n",
                 g_remoteOk ? "true" : "false", g_remoteMode.c_str(), g_remoteSetpoint, g_remoteActual,
                 g_remoteHeating ? "ON" : "OFF", (isnan(g_remoteDelta) ? NAN : g_remoteDelta));
+
+  // === Apply remote setpoint if provided ===
+  if (g_remoteOk && !isnan(g_remoteSetpoint) && g_remoteSetpoint >= 5.0f && g_remoteSetpoint <= 35.0f)
+  {
+    if (fabsf(g_remoteSetpoint - g_fixedSetpoint) >= SP_EPS)
+    {
+      g_fixedSetpoint = g_remoteSetpoint;
+      g_fixedPreset = "remote";
+      g_fixedEnabled = true;
+      // Persist once per new value; helper throttles repetitive writes
+      saveFixedSetpointIfNeeded(/*force=*/true);
+      Serial.printf("[HTTP] Applied remote SP=%.1f and saved (preset=remote)\n", g_fixedSetpoint);
+    }
+  }
+
   return g_remoteOk;
 }
 
@@ -972,7 +1011,6 @@ static void setupOTA()
   if (OTA_PASS && OTA_PASS[0] != '\0') // optional auth
     ArduinoOTA.setPassword(OTA_PASS);
 
-  // Helpful logs
   ArduinoOTA.onStart([]()
                      {
     String t = (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
@@ -1082,6 +1120,7 @@ void setup()
     LittleFS.begin();
   }
   loadFixedSetpoint();
+  g_lastSavedSetpoint = g_fixedSetpoint; // track what's actually on disk
   loadWifiCreds();
   initLegacySchedule();
   ds_init_bus_and_probe_pre_wifi();
@@ -1089,7 +1128,7 @@ void setup()
   connectWiFi();
   setupTimeNTP();
   setupMDNS();
-  setupOTA(); // <-- enable OTA when Wi-Fi is ready
+  setupOTA(); // enable OTA when Wi-Fi is ready
 
   // Web routes
   server.on("/", HTTP_GET, handleIndex);
@@ -1138,7 +1177,7 @@ void setup()
 void loop()
 {
   MDNS.update();
-  ArduinoOTA.handle(); // <-- keep OTA responsive
+  ArduinoOTA.handle(); // keep OTA responsive
   server.handleClient();
 
   // Handle deferred reboot after saving Wi-Fi
@@ -1149,7 +1188,6 @@ void loop()
     ESP.restart();
   }
 
-  static uint32_t counter = 0;
   static uint32_t tRead = 0;
   if (millis() - tRead > 1000)
   {
@@ -1204,22 +1242,12 @@ void loop()
       g_lastHttpMs = millis();
     }
 
-    // ESPNOW telemetry
-    JsonDocument doc;
-    doc["type"] = "telemetry";
-    doc["count"] = counter++;
-    if (valid)
-      doc["temp"] = tempC;
-    else
-      doc["temp"] = nullptr;
-    doc["setpoint"] = sp;
-    doc["action"] = action;
-    doc["preset"] = g_fixedPreset;
-    doc["hysteresis"] = HYST_BAND_C;
-    doc["note"] = "d1mini-ds18b20@D4";
-
-    char buf[256];
-    size_t n = serializeJson(doc, buf, sizeof(buf));
+    // === ESPNOW minimal status ===
+    // Send only {"heater":"ON"} or {"heater":"OFF"}
+    JsonDocument jtx;
+    jtx["heater"] = (action == 1) ? "ON" : "OFF";
+    char buf[32];
+    size_t n = serializeJson(jtx, buf, sizeof(buf));
     uint8_t rc = esp_now_send(TARGET, (uint8_t *)buf, (int)n);
     Serial.print("[TX] send -> ");
     Serial.println(rc == 0 ? "OK" : String(rc));
