@@ -1,13 +1,14 @@
 // src/main.cpp — Wemos D1 mini (ESP8266)
-// Fixed setpoint thermostat + mobile-friendly light theme + 0.5°C hysteresis
-// - Thermostat UI at "/" with presets and +/-
-// - Wi-Fi setup at "/wifi": scan, select, save (LittleFS /wifi.json); device reboots after saving
-// - Control logic: 0.5°C hysteresis to prevent rapid on/off:
-//     ON  when temp <= setpoint - 0.25
-//     OFF when temp >= setpoint + 0.25
-//     otherwise keep previous action
-// - UI: Light theme only, polling does not override setpoint edits,
-//       preset click saves immediately; +/- saves setpoint as "custom" (no preset in payload)
+// Thermostat + Mobile UI + Wi-Fi setup + 0.5°C hysteresis + Arduino OTA (PlatformIO espota)
+// - UI at "/": presets & +/- (polling never overwrites editing)
+// - Wi-Fi setup at "/wifi": scan/select/save (LittleFS /wifi.json). Reboots after saving.
+// - Control logic: 0.5°C hysteresis (ON <= sp-0.25, OFF >= sp+0.25)
+// - OTA: Upload via PlatformIO using mDNS (esp-thermo.local) or device IP.
+//
+// PlatformIO (platformio.ini):
+//   upload_protocol = espota
+//   upload_port = esp-thermo.local   ; or the device IP
+//   ; upload_flags = --auth=your_password   ; if OTA password is set
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -18,6 +19,7 @@
 #include <LittleFS.h>
 #include <ESP8266WebServer.h>
 #include <ESP8266mDNS.h>
+#include <ArduinoOTA.h> // <-- OTA
 #include <time.h>
 #include <ESP8266HTTPClient.h>
 #include <WiFiClientSecureBearSSL.h>
@@ -31,6 +33,9 @@ extern "C"
 static const char *WIFI_SSID_DEFAULT = "NETGEAR11";
 static const char *WIFI_PASS_DEFAULT = "breezypiano838";
 static const char *HOSTNAME = "esp-thermo";
+
+// OPTIONAL: OTA password (set to non-empty to require it for uploads)
+static const char *OTA_PASS = ""; // e.g. "mySecret123" (remember to set upload_flags in platformio.ini)
 
 // Mutable Wi-Fi creds (loaded from /wifi.json or default)
 static String g_wifiSsid;
@@ -771,7 +776,7 @@ void handleStatus()
   doc["setpoint"] = sp;
   doc["preset"] = g_fixedPreset;
   doc["action"] = g_lastAction;
-  doc["hysteresis"] = HYST_BAND_C; // expose hysteresis band
+  doc["hysteresis"] = HYST_BAND_C;
 
   if (isnan(g_remoteSetpoint))
     doc["remoteSetpoint"] = nullptr;
@@ -897,7 +902,7 @@ void handleWifiSave()
   }
 }
 
-// ===== Wi-Fi / NTP / mDNS =====
+// ===== Wi-Fi / NTP / mDNS / OTA =====
 static void connectWiFi()
 {
   Serial.printf("[TX] Connecting to SSID='%s' ...\n", g_wifiSsid.c_str());
@@ -916,13 +921,14 @@ static void connectWiFi()
   Serial.println();
   if (WiFi.status() == WL_CONNECTED)
   {
-    Serial.printf("[TX] WiFi OK. IP=%s  RSSI=%d dBm  CH=%d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.channel());
+    Serial.printf("[TX] Wi-Fi OK. IP=%s  RSSI=%d dBm  CH=%d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.channel());
   }
   else
   {
-    Serial.println("[TX] WiFi timeout; UI will be unreachable until connected.");
+    Serial.println("[TX] Wi-Fi timeout; UI will be unreachable until connected.");
   }
 }
+
 static void setupTimeNTP()
 {
   configTime(TZ_INFO, NTP_1, NTP_2);
@@ -939,6 +945,7 @@ static void setupTimeNTP()
   }
   Serial.println("[TIME] NTP sync timeout; will continue without exact time.");
 }
+
 static void setupMDNS()
 {
   if (WiFi.status() != WL_CONNECTED)
@@ -956,10 +963,41 @@ static void setupMDNS()
   Serial.println("[MDNS] Failed to start mDNS");
 }
 
+// ---- Arduino OTA ----
+static void setupOTA()
+{
+  if (WiFi.status() != WL_CONNECTED)
+    return;
+  ArduinoOTA.setHostname(HOSTNAME);    // shows up as esp-thermo.local
+  if (OTA_PASS && OTA_PASS[0] != '\0') // optional auth
+    ArduinoOTA.setPassword(OTA_PASS);
+
+  // Helpful logs
+  ArduinoOTA.onStart([]()
+                     {
+    String t = (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
+    Serial.printf("[OTA] Start updating %s\n", t.c_str()); });
+  ArduinoOTA.onEnd([]()
+                   { Serial.println("\n[OTA] End"); });
+  ArduinoOTA.onProgress([](unsigned int prog, unsigned int total)
+                        { Serial.printf("[OTA] Progress: %u%%\n", (prog * 100) / total); });
+  ArduinoOTA.onError([](ota_error_t err)
+                     {
+    Serial.printf("[OTA] Error[%u]: ", err);
+    if (err == OTA_AUTH_ERROR)    Serial.println("Auth Failed");
+    else if (err == OTA_BEGIN_ERROR)  Serial.println("Begin Failed");
+    else if (err == OTA_CONNECT_ERROR)Serial.println("Connect Failed");
+    else if (err == OTA_RECEIVE_ERROR)Serial.println("Receive Failed");
+    else if (err == OTA_END_ERROR)    Serial.println("End Failed"); });
+
+  ArduinoOTA.begin();
+  Serial.printf("[OTA] Ready: %s.local:8266 (auth:%s)\n", HOSTNAME, (OTA_PASS && OTA_PASS[0] ? "yes" : "no"));
+}
+
 // ===== Control helper =====
 static float getActiveSetpoint() { return g_fixedEnabled ? g_fixedSetpoint : 19.0f; }
 
-// ======== DS18B20 Robust Bring-Up (BEFORE WiFi) ========
+// ======== DS18B20 Robust Bring-Up (BEFORE Wi-Fi) ========
 static uint8_t rom[8];
 static bool onewire_find_any()
 {
@@ -1047,10 +1085,13 @@ void setup()
   loadWifiCreds();
   initLegacySchedule();
   ds_init_bus_and_probe_pre_wifi();
+
   connectWiFi();
   setupTimeNTP();
   setupMDNS();
+  setupOTA(); // <-- enable OTA when Wi-Fi is ready
 
+  // Web routes
   server.on("/", HTTP_GET, handleIndex);
   server.on("/wifi", HTTP_GET, handleWifiPage);
   server.on("/api/fixed", HTTP_GET, handleGetFixed);
@@ -1064,6 +1105,7 @@ void setup()
   server.begin();
   Serial.println("[WEB] HTTP server started on port 80");
 
+  // ESPNOW on AP channel
   int channel = WiFi.channel();
   if (channel <= 0)
   {
@@ -1096,8 +1138,10 @@ void setup()
 void loop()
 {
   MDNS.update();
+  ArduinoOTA.handle(); // <-- keep OTA responsive
   server.handleClient();
 
+  // Handle deferred reboot after saving Wi-Fi
   if (g_pendingRestart && (int32_t)(millis() - g_restartAtMs) >= 0)
   {
     Serial.println("[SYS] Rebooting to apply new Wi-Fi credentials...");
@@ -1126,44 +1170,41 @@ void loop()
     bool valid = !isnan(tempC);
 
     float sp = getActiveSetpoint();
-    uint8_t action = g_lastAction; // default: keep current state
+    uint8_t action = g_lastAction; // default keep state
 
-    // ===== Hysteresis control (0.5°C total band) =====
+    // Hysteresis control (0.5°C total, +/-0.25°C)
     if (valid)
     {
-      const float half = HYST_BAND_C * 0.5f; // 0.25°C
+      const float half = HYST_BAND_C * 0.5f;
       const float low = sp - half;
       const float high = sp + half;
-
       if (g_lastAction == 0)
-      { // currently OFF -> allow turning ON only below 'low'
+      {
         if (tempC <= low)
           action = 1;
       }
       else
-      { // currently ON  -> allow turning OFF only above 'high'
+      {
         if (tempC >= high)
           action = 0;
       }
     }
     else
     {
-      action = 0; // no valid reading -> safe state OFF
+      action = 0; // safe OFF
     }
 
-    // Keep latest for web UI
     if (valid)
       g_lastTempC = tempC;
     g_lastAction = action;
 
-    // Report to remote (rate-limited) if we have valid temp
     if (valid && (millis() - g_lastHttpMs >= HTTP_MIN_INTERVAL_MS))
     {
       cesanaReportAndFetch(tempC, action == 1);
       g_lastHttpMs = millis();
     }
 
-    // ESP-NOW telemetry (every ~1s)
+    // ESPNOW telemetry
     JsonDocument doc;
     doc["type"] = "telemetry";
     doc["count"] = counter++;
