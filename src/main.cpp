@@ -82,6 +82,7 @@ static String g_remoteMode = "";
 static float g_remoteActual = NAN;
 static bool g_remoteHeating = false;
 static float g_remoteDelta = NAN;
+static bool g_apActive = false;
 
 // ===== Web server =====
 ESP8266WebServer server(80);
@@ -98,14 +99,19 @@ static const float SP_EPS = 0.05f;                 // consider same within ±0.0
 
 static void startApFallback()
 {
+  if (g_apActive)
+    return; // already running
   WiFi.mode(WIFI_AP_STA);
   const char *apSsid = "Termometro";
-  const char *apPass = "12345678"; // or ""
+  const char *apPass = "12345678";
   bool ok = WiFi.softAP(apSsid, apPass, /*channel*/ 1);
-  Serial.printf("[WiFi] AP fallback %s (ch=%d)\n", ok ? "started" : "FAILED", 1);
-  // Keep ESPNOW on the same channel as AP so sender/receiver match
+  g_apActive = ok;
+  Serial.printf("[WiFi] AP fallback %s (SSID=%s, ch=%d, IP=%s)\n",
+                ok ? "started" : "FAILED", apSsid, 1, WiFi.softAPIP().toString().c_str());
+  // Keep ESP-NOW on the same channel as AP
   wifi_set_channel(1);
 }
+
 // ===== Utils =====
 static void printMac(const uint8_t *mac)
 {
@@ -249,10 +255,67 @@ body{
   .badges{width:100%; justify-content:flex-end}
   .nav{flex-wrap:wrap}
 }
+  /* --- Mobile optimizations ------------------------------------ */
+
+/* Respect notches / rounded corners on phones */
+.header, .content {
+  padding-left: calc(var(--pad) + env(safe-area-inset-left));
+  padding-right: calc(var(--pad) + env(safe-area-inset-right));
+}
+
+/* Ensure badges push to the right and wrap neatly */
+.badges { flex: 1; justify-content: flex-end }
+
+/* Larger, square ± buttons for thumbs */
+.btn.pill#minus, .btn.pill#plus {
+  width: var(--tap);
+  height: var(--tap);
+  padding: 0;
+  font-size: 24px;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+
+/* Make the Save button easier to hit */
+#save { min-width: 110px }
+
+/* Horizontal preset scroller with snap for one-hand use */
+.presetbar {
+  scroll-snap-type: x mandatory;
+  -webkit-overflow-scrolling: touch;
+}
+.preset { scroll-snap-align: start }
+
+/* Hide scrollbars on mobile while keeping scrollability */
+.presetbar::-webkit-scrollbar { height: 0 }
+
+/* Slightly larger KPI value on small phones */
+@media (max-width: 480px){
+  :root { --tap: 52px }
+  .kpi .value { font-size: clamp(30px, 12vw, 44px) }
+  .btn { padding: 12px 16px }
+  .badge { font-size: 11px }
+  .content { gap: 10px }
+}
+
+/* Ultra-small phones */
+@media (max-width: 360px){
+  :root { --tap: 56px }
+  .title { font-size: 16px }
+  .nav a { padding: 8px 10px; font-size: 13px }
+  .btn { padding: 12px 14px; font-weight: 800 }
+  .controls { gap: 8px }
+  .preset { padding: 10px 12px; font-size: 14px }
+}
+
+/* Reduced motion users */
+@media (prefers-reduced-motion: reduce){
+  .btn { transition: none }
+}
+
 </style>
 </head><body>
 <div class="app">
-  <div class="header">
+   <div class="header">
     <div style="display:flex;gap:10px;align-items:center">
       <div class="title">ESP8266 Thermostat</div>
       <div class="nav">
@@ -262,8 +325,13 @@ body{
     </div>
     <div class="badges">
       <div class="badge"><span class="dot" id="heatDot"></span><span id="heatText">Heat: --</span></div>
+      <div class="badge"><span class="dot" id="calDot"></span><span id="calText">Caldaia: --</span></div>
+      <div class="badge"><span class="dot" id="wifiDot"></span><span id="wifiText">Wi-Fi: --</span></div>
       <div class="badge" id="time">--</div>
     </div>
+  </div>
+
+
   </div>
   <div class="content">
     <div class="card row">
@@ -368,7 +436,31 @@ async function tick(){
     if (typeof j.epoch === 'number'){
       const d=new Date(j.epoch*1000);
       document.getElementById('time').textContent=d.toLocaleString();
+    }// --- Caldaia (ACK) badge ---
+    const hasAck = !!j.ackAvailable;
+    let ackFresh = false;
+    if (hasAck) {
+      const age = (typeof j.ackAgeMs === 'number') ? j.ackAgeMs : 0;
+      ackFresh = age <= 5000;
     }
+    document.getElementById('calDot').className = 'dot ' + (ackFresh ? 'on' : 'off');
+    document.getElementById('calText').textContent = ackFresh ? 'Caldaia: OK' : (hasAck ? 'Caldaia: stale' : 'Caldaia: —');
+
+    // --- Wi-Fi badge ---
+    const wb = j.wifi || {};
+    const wifiOn = !!wb.connected;
+    const apOn   = !!wb.ap;
+    document.getElementById('wifiDot').className = 'dot ' + (wifiOn ? 'on' : 'off');
+    let wifiLabel = 'Wi-Fi: --';
+    if (wifiOn) {
+      const ip = (typeof wb.ip === 'string' && wb.ip) ? ` (${wb.ip})` : '';
+      wifiLabel = `Wi-Fi: ${wb.ssid||'—'}${ip}`;
+    } else if (apOn) {
+      wifiLabel = `AP: ${wb.ap_ip || '192.168.4.1'}`;
+    } else {
+      wifiLabel = 'Wi-Fi: offline';
+    }
+    document.getElementById('wifiText').textContent = wifiLabel;
   }catch(e){}
 }
 
@@ -447,6 +539,33 @@ select,input{
 .badge{border:1px solid var(--border); border-radius:999px; padding:8px 10px; background:#eefbfd; min-height:var(--tap); display:inline-flex; align-items:center}
 .msg{font-size:14px}
 .ok{color:var(--ok)} .err{color:var(--err)}
+/* --- Mobile optimizations (Wi-Fi page) ----------------------- */
+
+/* Safe-area padding */
+.header, .content {
+  padding-left: calc(var(--pad) + env(safe-area-inset-left));
+  padding-right: calc(var(--pad) + env(safe-area-inset-right));
+}
+
+/* Full-width controls, bigger tap targets */
+select, input { font-size: 16px; min-height: calc(var(--tap) + 6px) }
+.btn { min-height: calc(var(--tap) + 4px) }
+
+/* Let the network selector breathe and avoid overflow */
+#ssid { min-width: 100% }
+
+/* Tighter layout on small phones */
+@media (max-width: 480px){
+  .badge { font-size: 11px }
+  .nav a { padding: 8px 10px; font-size: 13px }
+  .row { gap: 8px }
+}
+
+/* Reduced motion users */
+@media (prefers-reduced-motion: reduce){
+  .btn { transition: none }
+}
+
 </style>
 </head><body>
 <div class="app">
@@ -661,14 +780,14 @@ static void initLegacySchedule()
 // ===== HTTPS GET to cesana.steplab.net =====
 static bool cesanaReportAndFetch(float tempC, bool heatingFromAck /* true=ON, false=OFF */)
 {
-  if (WiFi.status() != WL_CONNECTED)
+  /* if (WiFi.status() != WL_CONNECTED)
   {
     if (WiFi.status() != WL_CONNECTED)
     {
       Serial.println("[TX] Wi-Fi timeout; UI unreachable until connected.");
       startApFallback(); // <— enables http://192.168.4.1/ for /wifi
     }
-  }
+  } */
 
   // *** Use ACK for cald
   String url = "https://cesana.steplab.net/get_setpoint.php?temp=";
@@ -854,7 +973,7 @@ void handleStatus()
   time_t now = time(nullptr);
   float sp = g_fixedEnabled ? g_fixedSetpoint : 19.0f;
 
-  // *** actionForUi: prefer ACK state if we have it; else use local decision
+  // UI action: prefer ACK relay state when available, else local decision
   uint8_t actionForUi = g_haveAck ? (g_ackRelayOn ? 1 : 0) : g_lastAction;
 
   JsonDocument doc;
@@ -865,12 +984,15 @@ void handleStatus()
     doc["temp"] = g_lastTempC;
   doc["setpoint"] = sp;
   doc["preset"] = g_fixedPreset;
-  doc["action"] = actionForUi; // *** drives Heat ON/OFF in UI
+  doc["action"] = actionForUi; // drives Heat ON/OFF badge
   doc["hysteresis"] = HYST_BAND_C;
-  doc["ackAvailable"] = g_haveAck; // (optional info)
+
+  // ACK/Caldaia info
+  doc["ackAvailable"] = g_haveAck;
   if (g_haveAck)
     doc["ackAgeMs"] = (uint32_t)(millis() - g_ackLastMs);
 
+  // Remote (unchanged)
   if (isnan(g_remoteSetpoint))
     doc["remoteSetpoint"] = nullptr;
   else
@@ -886,6 +1008,26 @@ void handleStatus()
     doc["remoteDelta"] = nullptr;
   else
     doc["remoteDelta"] = g_remoteDelta;
+
+  // NEW: Wi-Fi status + AP info
+  JsonObject w = doc["wifi"].to<JsonObject>();
+  bool staUp = (WiFi.status() == WL_CONNECTED);
+  w["connected"] = staUp;
+  w["ap"] = g_apActive; // true if AP is running
+  if (staUp)
+  {
+    w["ssid"] = WiFi.SSID();
+    w["ip"] = WiFi.localIP().toString();
+    w["rssi"] = WiFi.RSSI();
+  }
+  else
+  {
+    w["ssid"] = nullptr;
+    w["ip"] = nullptr;
+    w["rssi"] = nullptr;
+  }
+  if (g_apActive)
+    w["ap_ip"] = WiFi.softAPIP().toString();
 
   String out;
   serializeJson(doc, out);
@@ -997,6 +1139,7 @@ void handleWifiSave()
 }
 
 // ===== Wi-Fi / NTP / mDNS / OTA =====
+
 static void connectWiFi()
 {
   Serial.printf("[TX] Connecting to SSID='%s' ...\n", g_wifiSsid.c_str());
@@ -1006,6 +1149,7 @@ static void connectWiFi()
   delay(100);
   WiFi.hostname(HOSTNAME);
   WiFi.begin(g_wifiSsid.c_str(), g_wifiPass.c_str());
+
   uint32_t t0 = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000)
   {
@@ -1013,13 +1157,17 @@ static void connectWiFi()
     delay(500);
   }
   Serial.println();
+
   if (WiFi.status() == WL_CONNECTED)
   {
-    Serial.printf("[TX] Wi-Fi OK. IP=%s  RSSI=%d dBm  CH=%d\n", WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.channel());
+    g_apActive = false; // we’re on STA now
+    Serial.printf("[TX] Wi-Fi OK. IP=%s  RSSI=%d dBm  CH=%d\n",
+                  WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.channel());
   }
   else
   {
-    Serial.println("[TX] Wi-Fi timeout; UI will be unreachable until connected.");
+    Serial.println("[TX] Wi-Fi timeout; starting AP fallback so UI is reachable.");
+    startApFallback(); // <— start AP right away
   }
 }
 
@@ -1292,6 +1440,7 @@ void loop()
     {
       JsonDocument jtx;
       jtx["heater"] = (action == 1) ? "ON" : "OFF";
+      jtx["id"] = 12;
       char buf[32];
       size_t n = serializeJson(jtx, buf, sizeof(buf));
       int rc = esp_now_send(TARGET, (uint8_t *)buf, (int)n); // note: SDK wants non-const u8*
@@ -1305,6 +1454,18 @@ void loop()
       bool heatingForReport = g_haveAck ? g_ackRelayOn : (action == 1); // *** ACK first
       cesanaReportAndFetch(tempC, heatingForReport);
       g_lastHttpMs = millis();
+    }
+  }
+
+  // Ensure AP exists whenever STA is down
+  static uint32_t lastApChk = 0;
+  if (millis() - lastApChk > 2000)
+  {
+    lastApChk = millis();
+    if (WiFi.status() != WL_CONNECTED && !g_apActive)
+    {
+      Serial.println("[WiFi] STA down & AP not active -> starting AP fallback");
+      startApFallback();
     }
   }
 }
