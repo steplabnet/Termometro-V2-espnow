@@ -147,39 +147,42 @@ include('../connessione.php');
     </div>
   </div>
 
-
   <script>
-    // --- Override: use local state.json via this same PHP ---
+    // --- Local state.json integration (read + write setPoint) ---
     (function () {
-      // Utility to GET JSON
       function getJSON(url) { return fetch(url, { cache: "no-store" }).then(r => r.json()); }
-      // Utility to POST form
       function postForm(url, data) {
         const body = new URLSearchParams(data);
         return fetch(url, { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body })
           .then(r => r.json());
       }
 
-      // Try to detect common elements in the existing page
       const spInput = document.getElementById("setPoint") || document.querySelector('input[name="setPoint"]') || document.querySelector('.dial');
       const tempEl = document.getElementById("tempmis") || document.getElementById("temperatura") || document.querySelector('#temp,#temperatura,#actualTemp,.actualTemp');
       const statusEl = document.getElementById("status") || document.querySelector('#status,#cald,.cald');
+      const imgEl = document.getElementById("caldaia");
+
+      // Clamp helper (server also clamps, but do it client-side too)
+      function clamp(v, min, max) { v = Number(v); if (isNaN(v)) v = min; return Math.max(min, Math.min(max, v)); }
 
       function renderState(state) {
-        // Temperature
         if (tempEl) {
           tempEl.textContent = (typeof state.actualTemp === 'number' ? state.actualTemp.toFixed(1) : state.actualTemp) + "°C";
         }
-        // Heater status
+        const on = (state.cald == 1 || state.cald === "1" || state.cald === true);
         if (statusEl) {
-          const on = (state.cald == 1 || state.cald === "1" || state.cald === true);
           statusEl.textContent = on ? "Heat: ON" : "Heat: OFF";
           statusEl.classList.toggle("on", on);
           statusEl.classList.toggle("off", !on);
         }
-        // Setpoint
+        if (imgEl) {
+          const file = on ? "caldaiaon.png" : "caldaiaoff.png";
+          if (imgEl.dataset.last !== file) {
+            imgEl.src = file + "?cb=" + Date.now();
+            imgEl.dataset.last = file;
+          }
+        }
         if (spInput) {
-          // If it's a jQuery-knob input, set its value and trigger change to redraw
           if (typeof jQuery !== "undefined" && jQuery.fn && jQuery.fn.trigger && jQuery(spInput).trigger) {
             jQuery(spInput).val(state.setPoint).trigger("change");
           } else {
@@ -194,14 +197,28 @@ include('../connessione.php');
           .catch(console.warn);
       }
 
-      // Save setpoint when changed
       function hookSetpointChange() {
         if (!spInput) return;
+
+        // If earlier code attached old handlers (set_ajax etc.), remove them to avoid conflicts.
+        if (window.jQuery) {
+          try { jQuery('#plus,#minus,.preset').off('click'); } catch (e) { }
+        }
+
         let lastSent = null;
         function send(sp) {
-          // Avoid spamming identical values
+          sp = clamp(sp, 5, 35);                // same range as PHP
           if (lastSent !== null && Number(lastSent) === Number(sp)) return;
           lastSent = sp;
+
+          // Reflect in UI ASAP
+          if (typeof jQuery !== "undefined" && jQuery(spInput).trigger) {
+            jQuery(spInput).val(sp).trigger("change");
+          } else {
+            spInput.value = sp;
+          }
+
+          // Persist to state.json
           postForm(location.pathname, { setPoint: sp })
             .then(resp => {
               if (resp && resp.state) renderState(resp.state);
@@ -209,45 +226,54 @@ include('../connessione.php');
             .catch(console.warn);
         }
 
+        // Save when the input changes (knob/slider/manual)
         spInput.addEventListener("change", () => send(spInput.value));
         spInput.addEventListener("input", () => {
-          // If the control is a knob or slider, we also send on input (debounced)
           clearTimeout(spInput._deb);
-          spInput._deb = setTimeout(() => send(spInput.value), 400);
+          spInput._deb = setTimeout(() => send(spInput.value), 300);
         });
 
-        // If page uses +/- preset buttons with data attributes, wire them up
-        document.querySelectorAll(".preset,[data-setpoint]").forEach(el => {
-          el.addEventListener("click", () => {
-            const v = el.getAttribute("set") || el.dataset.setpoint;
-            if (v != null) {
-              if (spInput) {
-                if (typeof jQuery !== "undefined" && jQuery(spInput).trigger) {
-                  jQuery(spInput).val(v).trigger("change");
-                } else {
-                  spInput.value = v;
-                  spInput.dispatchEvent(new Event("change", { bubbles: true }));
-                }
-              }
-              send(v);
-            }
+        // Wire + / − buttons to save immediately
+        const plus = document.getElementById('plus');
+        const minus = document.getElementById('minus');
+
+        if (plus) {
+          plus.addEventListener('click', () => {
+            const cur = parseFloat(spInput.value) || 0;
+            send(cur + 1);   // change step if you prefer 0.5
+          });
+        }
+        if (minus) {
+          minus.addEventListener('click', () => {
+            const cur = parseFloat(spInput.value) || 0;
+            send(cur - 1);
+          });
+        }
+
+        // Wire preset buttons (use attribute set="..")
+        document.querySelectorAll('.preset,[data-setpoint]').forEach(el => {
+          el.addEventListener('click', () => {
+            const v = el.getAttribute('set') ?? el.dataset.setpoint;
+            if (v != null) send(v);
           });
         });
       }
 
-      // Replace the original polling with our local state polling
       function startPolling() {
-        loadState();
-        setInterval(loadState, 10000); // every 10 seconds
+        loadState();                  // immediate read on page load
+        setInterval(loadState, 10000);
       }
 
-      // Boot
       document.addEventListener("DOMContentLoaded", function () {
         startPolling();
         hookSetpointChange();
       });
     })();
   </script>
+
+
+
+
 </body>
 
 </html>
