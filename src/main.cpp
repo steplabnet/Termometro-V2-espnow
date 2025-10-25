@@ -1445,7 +1445,7 @@ void loop()
     float freshC;
     bool gotFresh = ds_poll(freshC);
     if (gotFresh)
-      g_lastTempC = freshC;
+      g_lastTempC = freshC - 3.0f;
 
     // Decide action with strict hysteresis if we have any valid temperature
     const bool haveTemp = isfinite(g_lastTempC);
