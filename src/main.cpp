@@ -1,12 +1,13 @@
 // src/main.cpp — Wemos D1 mini (ESP8266)
-// Fixed setpoint thermostat + mobile-friendly light theme
-// - Thermostat UI at "/" (blue/green theme) with presets and +/-
-// - Wi-Fi setup at "/wifi": scans nearby SSIDs, allows selection + password
-// - Credentials stored in LittleFS (/wifi.json). After saving, device reboots.
-// - Control logic: temp < setpoint => action=1
-// - UX: Light theme only; no manual mode; preset click saves immediately;
-//        +/- adjusts and auto-saves as "custom" without preset in payload;
-//        polling does not override the setpoint display.
+// Fixed setpoint thermostat + mobile-friendly light theme + 0.5°C hysteresis
+// - Thermostat UI at "/" with presets and +/-
+// - Wi-Fi setup at "/wifi": scan, select, save (LittleFS /wifi.json); device reboots after saving
+// - Control logic: 0.5°C hysteresis to prevent rapid on/off:
+//     ON  when temp <= setpoint - 0.25
+//     OFF when temp >= setpoint + 0.25
+//     otherwise keep previous action
+// - UI: Light theme only, polling does not override setpoint edits,
+//       preset click saves immediately; +/- saves setpoint as "custom" (no preset in payload)
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -59,6 +60,9 @@ static bool g_fixedEnabled = true;    // always use fixed setpoint for control
 // ===== Live telemetry for web UI =====
 volatile float g_lastTempC = NAN;
 volatile uint8_t g_lastAction = 0; // 1=heat ON, 0=OFF
+
+// ===== Hysteresis (°C, total band) =====
+static const float HYST_BAND_C = 0.5f; // +/- 0.25°C around setpoint
 
 // ===== Remote "cesana" reporting (HTTPS GET) =====
 static uint32_t g_lastHttpMs = 0;
@@ -226,8 +230,7 @@ body{
 </div>
 
 <script>
-// Do NOT let polling overwrite the setpoint being edited.
-// We poll only Actual/Heat/time. Setpoint in UI changes only from your actions.
+// Poll only Actual/Heat/time; never overwrite setpoint shown while editing.
 
 let sp = 19.0;
 let preset = 'on';
@@ -242,7 +245,6 @@ function setActivePreset(name){
 }
 function showState(msg){ document.getElementById('state').textContent = msg; }
 
-// Load initial fixed state once
 async function loadFixed(){
   try{
     const r = await fetch('/api/fixed');
@@ -261,15 +263,10 @@ async function loadFixed(){
   }
 }
 
-// Save helpers
 async function savePreset(name){
   try{
     showState('Saving preset…');
-    const r = await fetch('/api/fixed',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({preset:name})
-    });
+    const r = await fetch('/api/fixed',{ method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({preset:name}) });
     if (!r.ok){ showState('Save failed'); return; }
     const j = await r.json();
     if (typeof j.setpoint === 'number'){
@@ -277,20 +274,13 @@ async function savePreset(name){
       document.getElementById('sp').textContent = fmt(sp);
       setActivePreset(preset);
       showState('Saved · Preset: ' + preset);
-    }else{
-      showState('Save failed');
-    }
+    }else{ showState('Save failed'); }
   }catch(e){ showState('Save failed'); }
 }
 
 async function saveCustomNow(){
   try{
-    const r = await fetch('/api/fixed',{
-      method:'POST',
-      headers:{'Content-Type':'application/json'},
-      // IMPORTANT: send only setpoint; backend will mark as "custom"
-      body:JSON.stringify({ setpoint: sp })
-    });
+    const r = await fetch('/api/fixed',{ method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ setpoint: sp }) });
     if (!r.ok){ showState('Save failed'); return; }
     const j = await r.json();
     if (typeof j.setpoint === 'number'){
@@ -298,19 +288,16 @@ async function saveCustomNow(){
       document.getElementById('sp').textContent = fmt(sp);
       setActivePreset(preset);
       showState('Saved · Preset: ' + preset);
-    }else{
-      showState('Save failed');
-    }
+    }else{ showState('Save failed'); }
   }catch(e){ showState('Save failed'); }
 }
-
 function queueSaveCustom(){
   if (saveTimer) clearTimeout(saveTimer);
   showState('Saving…');
   saveTimer = setTimeout(saveCustomNow, SAVE_DEBOUNCE_MS);
 }
 
-// Poll status BUT DO NOT TOUCH setpoint/preset in UI
+// Poll status (do not touch setpoint/preset display)
 async function tick(){
   try{
     const r = await fetch('/api/status');
@@ -328,28 +315,25 @@ async function tick(){
 }
 
 document.getElementById('minus').onclick = ()=>{
-  if (!Number.isFinite(sp)) sp = 19.0; // guard against NaN
+  if (!Number.isFinite(sp)) sp = 19.0;
   sp = Math.max(5, Math.round((sp - 0.5) * 10) / 10);
   document.getElementById('sp').textContent = fmt(sp);
   setActivePreset('custom');
   queueSaveCustom();
 };
 document.getElementById('plus').onclick  = ()=>{
-  if (!Number.isFinite(sp)) sp = 19.0; // guard against NaN
+  if (!Number.isFinite(sp)) sp = 19.0;
   sp = Math.min(35, Math.round((sp + 0.5) * 10) / 10);
   document.getElementById('sp').textContent = fmt(sp);
   setActivePreset('custom');
   queueSaveCustom();
 };
 document.getElementById('save').onclick  = ()=> saveCustomNow();
-
-document.querySelectorAll('.preset').forEach(b=>{
-  b.onclick = ()=> savePreset(b.dataset.name);
-});
+document.querySelectorAll('.preset').forEach(b=> b.onclick = ()=> savePreset(b.dataset.name));
 
 loadFixed();
 tick();
-setInterval(tick, 1500); // modest polling; does not override setpoint UI
+setInterval(tick, 1500);
 </script>
 </body></html>
 )HTML";
@@ -394,7 +378,7 @@ body{
 @media (min-width:560px){ .row{ grid-template-columns:180px 1fr } }
 select,input{
   border:1px solid var(--border); border-radius:12px; padding:12px; background:#fbffff; min-height:var(--tap); width:100%;
-  font-size:16px; /* prevents iOS zoom */
+  font-size:16px;
 }
 .btn{
   border:1px solid var(--border); background:linear-gradient(180deg,#faffff,#e9fffb);
@@ -784,9 +768,10 @@ void handleStatus()
     doc["temp"] = nullptr;
   else
     doc["temp"] = g_lastTempC;
-  doc["setpoint"] = sp;          // UI ignores this for setpoint display to avoid disturbance
-  doc["preset"] = g_fixedPreset; // kept for API completeness
+  doc["setpoint"] = sp;
+  doc["preset"] = g_fixedPreset;
   doc["action"] = g_lastAction;
+  doc["hysteresis"] = HYST_BAND_C; // expose hysteresis band
 
   if (isnan(g_remoteSetpoint))
     doc["remoteSetpoint"] = nullptr;
@@ -1141,20 +1126,44 @@ void loop()
     bool valid = !isnan(tempC);
 
     float sp = getActiveSetpoint();
-    uint8_t action = 0;
-    if (valid)
-      action = (tempC < sp) ? 1 : 0;
+    uint8_t action = g_lastAction; // default: keep current state
 
+    // ===== Hysteresis control (0.5°C total band) =====
+    if (valid)
+    {
+      const float half = HYST_BAND_C * 0.5f; // 0.25°C
+      const float low = sp - half;
+      const float high = sp + half;
+
+      if (g_lastAction == 0)
+      { // currently OFF -> allow turning ON only below 'low'
+        if (tempC <= low)
+          action = 1;
+      }
+      else
+      { // currently ON  -> allow turning OFF only above 'high'
+        if (tempC >= high)
+          action = 0;
+      }
+    }
+    else
+    {
+      action = 0; // no valid reading -> safe state OFF
+    }
+
+    // Keep latest for web UI
     if (valid)
       g_lastTempC = tempC;
     g_lastAction = action;
 
+    // Report to remote (rate-limited) if we have valid temp
     if (valid && (millis() - g_lastHttpMs >= HTTP_MIN_INTERVAL_MS))
     {
       cesanaReportAndFetch(tempC, action == 1);
       g_lastHttpMs = millis();
     }
 
+    // ESP-NOW telemetry (every ~1s)
     JsonDocument doc;
     doc["type"] = "telemetry";
     doc["count"] = counter++;
@@ -1165,7 +1174,9 @@ void loop()
     doc["setpoint"] = sp;
     doc["action"] = action;
     doc["preset"] = g_fixedPreset;
+    doc["hysteresis"] = HYST_BAND_C;
     doc["note"] = "d1mini-ds18b20@D4";
+
     char buf[256];
     size_t n = serializeJson(doc, buf, sizeof(buf));
     uint8_t rc = esp_now_send(TARGET, (uint8_t *)buf, (int)n);
