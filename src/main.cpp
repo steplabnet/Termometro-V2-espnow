@@ -29,8 +29,8 @@ extern "C"
 }
 
 // ===== Default Wi-Fi credentials (fallback only) =====
-static const char *WIFI_SSID_DEFAULT = "NETGEAR11";
-static const char *WIFI_PASS_DEFAULT = "breezypiano838";
+static const char *WIFI_SSID_DEFAULT = "zelja_RPT";
+static const char *WIFI_PASS_DEFAULT = "pikolejla";
 static const char *HOSTNAME = "esp-thermo";
 
 // OPTIONAL: OTA password (set to non-empty to require it for uploads)
@@ -790,7 +790,7 @@ static bool cesanaReportAndFetch(float tempC, bool heatingFromAck /* true=ON, fa
   } */
 
   // *** Use ACK for cald
-  String url = "https://cesana.steplab.net/get_setpoint.php?temp=";
+  String url = "https://cesana.steplab.net/thermo/get_setpoint.php?temp=";
   url += String(tempC, 1);
   url += "&cald=";
   url += (heatingFromAck ? "1" : "0");
@@ -1440,7 +1440,7 @@ void loop()
     {
       JsonDocument jtx;
       jtx["heater"] = (action == 1) ? "ON" : "OFF";
-      jtx["id"] = 12;
+      jtx["id"] = 15;
       char buf[32];
       size_t n = serializeJson(jtx, buf, sizeof(buf));
       int rc = esp_now_send(TARGET, (uint8_t *)buf, (int)n); // note: SDK wants non-const u8*
