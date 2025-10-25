@@ -151,7 +151,7 @@ static void onDataRecv(uint8_t *mac, uint8_t *data, uint8_t len)
   Serial.printf("[RX] ACK parsed -> relay=%d (%s)\n", relay, g_ackRelayOn ? "ON" : "OFF");
 }
 
-// ======== Thermostat HTML (unchanged except UI already reads /api/status.action) ========
+// ======== Thermostat HTML (UI) ========
 const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"/>
@@ -386,8 +386,148 @@ setInterval(tick, 1500);
 </body></html>
 )HTML";
 
-// ======== Wi-Fi Setup HTML (unchanged) ========
-const char WIFI_HTML[] PROGMEM = R"HTML( /* ... unchanged from your version ... */ )HTML";
+// ======== Wi-Fi Setup HTML ========
+const char WIFI_HTML[] PROGMEM = R"HTML(
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"/>
+<title>Wi-Fi Setup</title>
+<style>
+:root{
+  --bg:#f4fbfd; --card:#ffffff; --ink:#0b3440; --muted:#4d7580;
+  --accent:#1aa6b7; --accent-2:#36d1b1; --border:#d7eef2; --ok:#1b9e77; --err:#c1121f;
+  --radius:16px; --pad:clamp(12px,2.5vw,18px); --tap:48px;
+  --font:16px ui-sans-serif,system-ui,"Segoe UI",Roboto,Arial;
+}
+*{box-sizing:border-box; -webkit-tap-highlight-color:transparent}
+body{
+  margin:0;background:linear-gradient(180deg,#f4fbfd 0%,#e8f7fa 100%);color:var(--ink);
+  font:var(--font);display:grid;place-items:start;min-height:100vh;padding:0;
+}
+.app{width:min(840px,100%); margin:0 auto}
+.header{
+  position:sticky; top:0; z-index:10; padding:var(--pad);
+  display:flex;justify-content:space-between;align-items:center;
+  background:linear-gradient(180deg,#e9fbff,#d9f5f7);
+  border-bottom:1px solid var(--border)
+}
+.title{font-weight:800; font-size:clamp(16px,2.8vw,20px)}
+.nav a{
+  color:#055968;text-decoration:none;font-weight:800;padding:10px 12px;border:1px solid var(--border);
+  border-radius:12px;background:#f1fdff; min-height:var(--tap); display:inline-flex; align-items:center
+}
+.content{padding:var(--pad); display:grid; gap:12px}
+.card{
+  border:1px solid var(--border); border-radius:var(--radius); padding:var(--pad);
+  background:linear-gradient(180deg,#ffffff,#f7fffe);
+  box-shadow:0 8px 26px rgba(26,166,183,.12)
+}
+.row{display:grid; grid-template-columns:1fr; gap:10px; align-items:center}
+@media (min-width:560px){ .row{ grid-template-columns:180px 1fr } }
+select,input{
+  border:1px solid var(--border); border-radius:12px; padding:12px; background:#fbffff; min-height:var(--tap); width:100%;
+  font-size:16px;
+}
+.btn{
+  border:1px solid var(--border); background:linear-gradient(180deg,#faffff,#e9fffb);
+  color:var(--ink); padding:12px 18px; border-radius:12px; cursor:pointer; font-weight:800; min-height:var(--tap)
+}
+.btn.primary{background:linear-gradient(180deg,#bff6ec,#8df0dc); border-color:#8de9d8}
+.kv{display:flex; gap:8px; flex-wrap:wrap; color:var(--muted); font-size:14px}
+.badge{border:1px solid var(--border); border-radius:999px; padding:8px 10px; background:#eefbfd; min-height:var(--tap); display:inline-flex; align-items:center}
+.msg{font-size:14px}
+.ok{color:var(--ok)} .err{color:var(--err)}
+</style>
+</head><body>
+<div class="app">
+  <div class="header">
+    <div class="title">Wi-Fi Setup</div>
+    <div class="nav">
+      <a href="/">Thermostat</a>
+      <a href="/wifi">Wi-Fi</a>
+    </div>
+  </div>
+  <div class="content">
+    <div class="card">
+      <div class="row">
+        <label for="ssid">Available Wi-Fi</label>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <select id="ssid" style="min-width:min(260px,100%)"></select>
+          <button class="btn" id="refresh">Refresh</button>
+        </div>
+      </div>
+      <div class="row">
+        <label for="pass">Password</label>
+        <input id="pass" type="password" inputmode="text" autocomplete="current-password" placeholder="Enter Wi-Fi password"/>
+      </div>
+      <div class="row">
+        <div></div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="btn primary" id="save">Save & Reboot</button>
+          <span class="msg" id="msg" role="status" aria-live="polite"></span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
+        <div class="kv">
+          <span class="badge" id="curSsid">SSID: --</span>
+          <span class="badge" id="curIp">IP: --</span>
+          <span class="badge" id="curRssi">RSSI: --</span>
+        </div>
+        <button class="btn" id="reloadCur">Reload</button>
+      </div>
+    </div>
+  </div>
+</div>
+<script>
+function securityLabel(enc){
+  const map={ "7":"WPA3","5":"WEP","4":"AUTO","3":"WPA/WPA2","2":"WPA2","1":"WPA","0":"OPEN" };
+  return map[String(enc)]||("ENC"+enc);
+}
+async function loadScan(){
+  const sel = document.getElementById('ssid');
+  sel.innerHTML = '<option>Scanning…</option>';
+  try{
+    const r = await fetch('/api/wifi/scan'); const j = await r.json();
+    sel.innerHTML='';
+    j.networks.forEach(n=>{
+      const o=document.createElement('option');
+      o.value=n.ssid; o.textContent = `${n.ssid}  ·  ${n.rssi} dBm  ·  ${securityLabel(n.enc)}  ·  ch${n.ch}`;
+      sel.appendChild(o);
+    });
+    if (j.networks.length===0) sel.innerHTML='<option>No networks found</option>';
+  }catch(e){ sel.innerHTML='<option>Scan failed</option>'; }
+}
+async function loadCurrent(){
+  try{
+    const r = await fetch('/api/wifi/current'); const j = await r.json();
+    document.getElementById('curSsid').textContent = 'SSID: ' + (j.ssid||'--');
+    document.getElementById('curIp').textContent   = 'IP: ' + (j.ip||'--');
+    document.getElementById('curRssi').textContent = 'RSSI: ' + ((j.rssi!=null)?(j.rssi+' dBm'):'--');
+  }catch(e){}
+}
+async function saveCreds(){
+  const ssid = document.getElementById('ssid').value;
+  const pass = document.getElementById('pass').value;
+  const m = document.getElementById('msg');
+  if (!ssid){ m.textContent='Select a network'; m.className='msg err'; return; }
+  m.textContent='Saving…'; m.className='msg';
+  try{
+    const r = await fetch('/api/wifi/save',{method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ssid,pass})});
+    if (!r.ok){ m.textContent='Save failed'; m.className='msg err'; return; }
+    m.textContent='Saved. Rebooting…'; m.className='msg ok';
+    setTimeout(()=>location.href='/', 7000);
+  }catch(e){ m.textContent='Save failed'; m.className='msg err'; }
+}
+document.getElementById('refresh').onclick = loadScan;
+document.getElementById('reloadCur').onclick = loadCurrent;
+document.getElementById('save').onclick = saveCreds;
+loadScan(); loadCurrent();
+</script>
+</body></html>
+)HTML";
 
 // ====== Persistence for fixed setpoint ======
 static const char *FIXED_PATH = "/fixed_setpoint.json";
@@ -767,7 +907,7 @@ void handleOwBus()
   server.send(200, "application/json", out);
 }
 
-// ===== Wi-Fi API handlers (unchanged) =====
+// ===== Wi-Fi API handlers =====
 void handleWifiScan()
 {
   int n = WiFi.scanNetworks(false, true);
@@ -1141,7 +1281,7 @@ void loop()
       jtx["heater"] = (action == 1) ? "ON" : "OFF";
       char buf[32];
       size_t n = serializeJson(jtx, buf, sizeof(buf));
-      int rc = esp_now_send(TARGET, (uint8_t *)buf, (int)n);
+      int rc = esp_now_send(TARGET, (uint8_t *)buf, (int)n); // note: SDK wants non-const u8*
       Serial.print("[TX] send -> ");
       Serial.println(rc == 0 ? "OK" : String(rc));
     }
