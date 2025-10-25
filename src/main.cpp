@@ -1376,12 +1376,50 @@ void loop()
     yield();
   }
 
+  // ===== Connectivity management (AP fallback + 2-minute STA retries) =====
+  static bool prevSta = false;
+  static uint32_t lastStaRetryMs = 0;
+
+  bool sta = (WiFi.status() == WL_CONNECTED);
+
+  // If STA just came up, (re)enable mDNS/OTA and mark AP inactive flag
+  if (sta && !prevSta)
+  {
+    Serial.println("[WiFi] STA connected — re-initializing mDNS/OTA");
+    setupMDNS();
+    setupOTA();
+    g_apActive = false; // flag only; you can WiFi.softAPdisconnect(true) if you want to shut AP
+  }
+
+  // If STA is down, ensure AP is available and retry STA every 120s (non-blocking)
+  if (!sta)
+  {
+    if (!g_apActive)
+    {
+      Serial.println("[WiFi] STA down & AP not active -> starting AP fallback");
+      startApFallback();
+    }
+    if (millis() - lastStaRetryMs >= 120000UL)
+    { // every 2 minutes
+      lastStaRetryMs = millis();
+      Serial.println("[WiFi] STA down — retrying connection with saved credentials");
+      WiFi.mode(WIFI_STA);
+      wifi_set_sleep_type(NONE_SLEEP_T);
+      WiFi.persistent(false);
+      WiFi.disconnect(true); // clear old state
+      delay(50);
+      WiFi.hostname(HOSTNAME);
+      WiFi.begin(g_wifiSsid.c_str(), g_wifiPass.c_str()); // async; no blocking wait
+    }
+  }
+
   // OTA & mDNS only when STA is up
-  if (WiFi.status() == WL_CONNECTED)
+  if (sta)
   {
     MDNS.update();
     ArduinoOTA.handle();
   }
+  prevSta = sta;
 
   // Handle deferred reboot after saving Wi-Fi
   if (g_pendingRestart && (int32_t)(millis() - g_restartAtMs) >= 0)
@@ -1440,19 +1478,19 @@ void loop()
     if (haveTemp && (millis() - g_lastHttpMs >= HTTP_MIN_INTERVAL_MS))
     {
       bool heatingForReport = g_haveAck ? g_ackRelayOn : (action == 1);
-      (void)cesanaReportAndFetch(g_lastTempC, heatingForReport); // guarded inside for STA only
+      (void)cesanaReportAndFetch(g_lastTempC, heatingForReport); // internally guarded to STA-only
       g_lastHttpMs = millis();
     }
   }
 
-  // Ensure AP exists whenever STA is down
+  // Keep doing AP-availability check (cheap; pairs well with 2-min retry)
   static uint32_t lastApChk = 0;
   if (millis() - lastApChk > 2000)
   {
     lastApChk = millis();
-    if (WiFi.status() != WL_CONNECTED && !g_apActive)
+    if (!sta && !g_apActive)
     {
-      Serial.println("[WiFi] STA down & AP not active -> starting AP fallback");
+      Serial.println("[WiFi] STA down & AP not active -> starting AP fallback (periodic check)");
       startApFallback();
     }
   }
