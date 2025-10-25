@@ -96,6 +96,16 @@ static uint32_t g_lastFsWriteMs = 0;
 static const uint32_t FS_WRITE_MIN_GAP_MS = 30000; // 30s between FS writes
 static const float SP_EPS = 0.05f;                 // consider same within ±0.05°C
 
+static void startApFallback()
+{
+  WiFi.mode(WIFI_AP_STA);
+  const char *apSsid = "Termometro";
+  const char *apPass = "12345678"; // or ""
+  bool ok = WiFi.softAP(apSsid, apPass, /*channel*/ 1);
+  Serial.printf("[WiFi] AP fallback %s (ch=%d)\n", ok ? "started" : "FAILED", 1);
+  // Keep ESPNOW on the same channel as AP so sender/receiver match
+  wifi_set_channel(1);
+}
 // ===== Utils =====
 static void printMac(const uint8_t *mac)
 {
@@ -653,8 +663,11 @@ static bool cesanaReportAndFetch(float tempC, bool heatingFromAck /* true=ON, fa
 {
   if (WiFi.status() != WL_CONNECTED)
   {
-    Serial.println("[HTTP] Skipped: WiFi not connected");
-    return false;
+    if (WiFi.status() != WL_CONNECTED)
+    {
+      Serial.println("[TX] Wi-Fi timeout; UI unreachable until connected.");
+      startApFallback(); // <— enables http://192.168.4.1/ for /wifi
+    }
   }
 
   // *** Use ACK for cald
