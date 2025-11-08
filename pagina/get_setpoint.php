@@ -3,21 +3,21 @@
 // - Optional ?temp= updates state.json.actualTemp (rounded to 1 decimal)
 // - Optional ?cald=0|1 updates state.json.cald (relay status)
 // - Reads/Writes state.json from the same directory as this script
+// - Also logs temperature to temp_history.csv if last modification > 10 minutes
 // - Returns JSON: { ok, mode, setpoint, actualTemp, actualTemp_str, cald, date, time, timezone }
 
 header('Content-Type: application/json; charset=utf-8');
 header('Access-Control-Allow-Origin: *'); // allow microcontrollers / other origins
 
-// Keep floats sane when json_encode() prints them
 @ini_set('precision', 14);
 @ini_set('serialize_precision', 10);
 
-// ---------- timezone ----------
 date_default_timezone_set('Europe/Rome');
 
 // Disk paths (same folder as this file)
 $stateFile = __DIR__ . '/state.json';
 $scheduleFile = __DIR__ . '/schedule.json';
+$historyFile = __DIR__ . '/temp_history.csv';   // <= CSV log here
 
 // ---------- helpers ----------
 function read_json($file)
@@ -39,7 +39,6 @@ function write_json_atomic($file, $data)
     $fp = @fopen($tmp, 'wb');
     if (!$fp)
         return false;
-
     @flock($fp, LOCK_EX);
     $ok = fwrite($fp, $json) !== false;
     @flock($fp, LOCK_UN);
@@ -83,34 +82,79 @@ function one_decimal_str($n)
     return number_format((float) $n, 1, '.', '');
 }
 
+/**
+ * Append "unix_ts,temperature" to $historyFile if its last modification
+ * was more than $minDelta seconds ago. Also prunes rows older than $keepSec.
+ */
+function history_append_if_due(string $historyFile, float $temp, int $minDelta = 600, int $keepSec = 172800): void
+{
+    $now = time();
+    $due = true;
+    $mtime = @filemtime($historyFile);
+    if ($mtime !== false && ($now - $mtime) < $minDelta) {
+        $due = false;
+    }
+
+    if ($due) {
+        // Append new sample
+        @file_put_contents($historyFile, $now . ',' . number_format($temp, 2, '.', '') . "\n", FILE_APPEND);
+
+        // Prune > keepSec old
+        $cutoff = $now - $keepSec;
+        $rows = @file($historyFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        if ($rows !== false) {
+            $kept = [];
+            foreach ($rows as $r) {
+                $parts = explode(',', $r, 2);
+                if (!count($parts))
+                    continue;
+                $ts = (int) $parts[0];
+                if ($ts >= $cutoff)
+                    $kept[] = $r;
+            }
+            // Atomic-ish rewrite
+            $tmp = $historyFile . '.tmp';
+            if (@file_put_contents($tmp, implode("\n", $kept) . (count($kept) ? "\n" : '')) !== false) {
+                @rename($tmp, $historyFile);
+            }
+        }
+    }
+}
+
 // ---------- load state & schedule ----------
 $state = read_json($stateFile);
 $scheduleWrap = read_json($scheduleFile);
 $schedule = isset($scheduleWrap['schedule']) && is_array($scheduleWrap['schedule'])
     ? $scheduleWrap['schedule'] : [];
 
-$mode = isset($state['mode']) ? $state['mode'] : 'AUTO';
+$mode = $state['mode'] ?? 'AUTO';
 $manualSetpoint = isset($state['manualSetpoint']) ? (float) $state['manualSetpoint'] : 20.0;
 $actualTemp = isset($state['actualTemp']) ? round((float) $state['actualTemp'], 1) : null;
 $cald = isset($state['cald']) ? (int) $state['cald'] : 0;
 
 // ---------- optional updates from parameters ----------
 $tempParam = $_GET['temp'] ?? $_POST['temp'] ?? null;
+$caldParam = $_GET['cald'] ?? $_POST['cald'] ?? null;
+
+$updated = false;
 if ($tempParam !== null) {
     $newTemp = round((float) $tempParam, 1); // store with 1 decimal
     $state['actualTemp'] = $newTemp;
     $actualTemp = $newTemp;
-}
+    $updated = true;
 
-$caldParam = $_GET['cald'] ?? $_POST['cald'] ?? null;
+    // --- NEW: log to history only if last modification > 10 minutes ---
+    history_append_if_due($historyFile, (float) $newTemp, 600, 172800);
+}
 if ($caldParam !== null) {
-    $newCald = ((int) $caldParam === 1) ? 1 : 0; // force 0 or 1
+    $newCald = ((int) $caldParam === 1) ? 1 : 0;
     $state['cald'] = $newCald;
     $cald = $newCald;
+    $updated = true;
 }
 
 // Save back if we updated anything
-if ($tempParam !== null || $caldParam !== null) {
+if ($updated) {
     $okDisk = write_json_atomic($stateFile, $state);
     if (!$okDisk) {
         echo json_encode(['ok' => false, 'error' => 'Failed to write state.json (permissions?)']);
@@ -128,12 +172,11 @@ if ($mode === 'OFF') {
 }
 
 // ---------- normalize numbers for output ----------
-$actualTemp_num = ($actualTemp !== null) ? (float) one_decimal_str($actualTemp) : null; // numeric 1-decimal
-$actualTemp_str = ($actualTemp !== null) ? one_decimal_str($actualTemp) : null;         // string  1-decimal
+$actualTemp_num = ($actualTemp !== null) ? (float) one_decimal_str($actualTemp) : null;
+$actualTemp_str = ($actualTemp !== null) ? one_decimal_str($actualTemp) : null;
 
 // ---------- respond ----------
 $now = new DateTime();
-
 echo json_encode([
     'ok' => true,
     'mode' => $mode,

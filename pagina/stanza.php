@@ -11,6 +11,107 @@ $action = $_GET['action'] ?? '';
 $RAM_DIR = '/dev/shm';
 $STATE_FILENAME = 'state.json'; // change to 'state.json' if you prefer that spelling
 
+/** ---------- temperature history (CSV in /dev/shm) ---------- */
+$HISTORY_FILENAME = 'temp_history.csv';
+$HISTORY_FILE = resolve_state_path($RAM_DIR, $HISTORY_FILENAME);
+
+/**
+ * Append one row "unix_ts,temperature" if last sample is older than $minDeltaSec.
+ * Also prunes rows older than $keepSec.
+ */
+function history_maybe_append(string $path, float $temp, int $minDeltaSec = 1200, int $keepSec = 172800): void
+{
+    $now = time();
+    // Ensure directory exists
+    @mkdir(dirname($path), 0775, true);
+
+    $lastTs = null;
+    if (is_readable($path)) {
+        // Read last line efficiently
+        $fh = @fopen($path, 'r');
+        if ($fh) {
+            fseek($fh, -1, SEEK_END);
+            $pos = ftell($fh);
+            while ($pos > 0) {
+                $c = fgetc($fh);
+                if ($c === "\n")
+                    break;
+                fseek($fh, --$pos, SEEK_SET);
+            }
+            $lastLine = fgets($fh);
+            fclose($fh);
+            if ($lastLine) {
+                [$tsStr] = array_map('trim', explode(',', $lastLine, 2));
+                if (is_numeric($tsStr))
+                    $lastTs = (int) $tsStr;
+            }
+        }
+    }
+
+    // Append if needed
+    if ($lastTs === null || ($now - $lastTs) >= $minDeltaSec) {
+        @file_put_contents($path, $now . ',' . number_format($temp, 2, '.', '') . "\n", FILE_APPEND);
+    }
+
+    // Best-effort prune (> keepSec old)
+    if (is_readable($path)) {
+        $cutoff = $now - $keepSec;
+        $rows = @file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        if ($rows !== false) {
+            $kept = [];
+            foreach ($rows as $r) {
+                $parts = explode(',', $r, 2);
+                if (!count($parts))
+                    continue;
+                $ts = (int) $parts[0];
+                if ($ts >= $cutoff)
+                    $kept[] = $r;
+            }
+            if (!empty($kept)) {
+                // Atomic-ish rewrite
+                $tmp = $path . '.tmp';
+                if (@file_put_contents($tmp, implode("\n", $kept) . "\n") !== false) {
+                    @rename($tmp, $path);
+                }
+            }
+        }
+    }
+}
+
+/** Return last 24h as array of [ [t_iso, temp], ... ]  */
+function history_load_last24(string $path): array
+{
+    $now = time();
+    $cutoff = $now - 86400; // 24h
+    $out = [];
+    if (!is_readable($path))
+        return $out;
+    $rows = @file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    if ($rows === false)
+        return $out;
+
+    // Optional: compress to ~20-minute buckets (floor to 1200s)
+    $bucket = 1200;
+    $seen = [];
+    foreach ($rows as $r) {
+        [$tsStr, $tempStr] = array_map('trim', explode(',', $r, 2) + ['', '']);
+        if (!is_numeric($tsStr) || !is_numeric($tempStr))
+            continue;
+        $ts = (int) $tsStr;
+        if ($ts < $cutoff)
+            continue;
+        $b = intdiv($ts, $bucket) * $bucket;
+        // keep the latest value in the bucket (looks nicer)
+        $seen[$b] = floatval($tempStr);
+    }
+    ksort($seen);
+    foreach ($seen as $ts => $temp) {
+        $out[] = [gmdate('c', $ts), $temp]; // ISO 8601 UTC
+    }
+    return $out;
+}
+
+
 function resolve_state_path(string $ramDir, string $filename): string
 {
     // Prefer /dev/shm, fallback to script dir if not usable
@@ -42,6 +143,25 @@ function write_json_atomic(string $path, array $data): bool
 $STATE_FILE = resolve_state_path($RAM_DIR, $STATE_FILENAME);
 
 /** ---------- API: Load schedule (now returns version) ---------- */
+/** ---------- API: Load 24h history ---------- */
+/** ---------- API: Load 24h history (READ-ONLY) ---------- */
+if ($action === 'load_history') {
+    header('Content-Type: application/json; charset=utf-8');
+
+    // Prefer the CSV produced by get_setpoint.php in this folder.
+    $csv = __DIR__ . '/temp_history.csv';
+    if (!is_readable($csv)) {
+        // Optional fallback if you ever move logging to RAM
+        $csv = $GLOBALS['HISTORY_FILE']; // /dev/shm/temp_history.csv
+    }
+
+    // Reuse the existing helper to parse & bucket
+    $points = history_load_last24($csv);
+    echo json_encode(['ok' => true, 'points' => $points], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+
 if ($action === 'load_schedule') {
     // Tell browsers and proxies: do NOT cache
     header('Content-Type: application/json; charset=utf-8');
@@ -493,7 +613,14 @@ if ($action === 'load_state') {
             justify-content: flex-end;
             margin-top: 10px
         }
+
+        #tempChart {
+            height: 100px !important;
+        }
     </style>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+
+
 </head>
 
 <body>
@@ -536,6 +663,12 @@ if ($action === 'load_state') {
                 </div>
                 <div class="subtitle" id="setpointHint">Manual setpoint</div>
             </div>
+            <div class="card pad span12">
+                <div class="subtitle">Temperature (last 24h)</div>
+                <canvas id="tempChart" style="height:100px"></canvas>
+            </div>
+
+
 
             <div class="card pad span12">
                 <div class="toolbar">
@@ -662,6 +795,79 @@ if ($action === 'load_state') {
             const MANUAL_SP_KEY = 'chrono.manual_sp.v1';
             const SERVER_STATE_URL_SAVE = '?action=save_state';
             const SERVER_STATE_URL_LOAD = '?action=load_state';
+            // ---- Chart: last 24h temperature ----
+            const tempChartCanvas = document.getElementById('tempChart');
+            let tempChart;
+
+            function buildTempChart(labels, data) {
+                if (tempChart) {
+                    tempChart.data.labels = labels;
+                    tempChart.data.datasets[0].data = data;
+                    tempChart.update();
+                    return;
+                }
+                tempChart = new Chart(tempChartCanvas.getContext('2d'), {
+                    type: 'line',
+                    data: {
+                        labels,
+                        datasets: [{
+                            label: '°C',
+                            data,
+                            tension: 0.25,
+                            pointRadius: 0,
+                            borderWidth: 2
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        interaction: { mode: 'index', intersect: false },
+                        plugins: {
+                            legend: { display: false },
+                            tooltip: {
+                                callbacks: {
+                                    label: (ctx) => `${ctx.parsed.y.toFixed(1)} °C`
+                                }
+                            }
+                        },
+                        scales: {
+                            x: {
+                                ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 12 },
+                                grid: { display: false }
+                            },
+                            y: {
+                                beginAtZero: false,
+                                ticks: { callback: v => v.toFixed ? v.toFixed(0) + '°' : v + '°' }
+                            }
+                        }
+                    }
+                });
+            }
+
+            async function fetchHistoryAndRender() {
+                try {
+                    const res = await fetch('?action=load_history&_=' + Date.now());
+                    if (!res.ok) throw new Error('HTTP ' + res.status);
+                    const j = await res.json();
+                    if (!j.ok || !Array.isArray(j.points)) return;
+
+                    // j.points: [ [iso, temp], ... ]
+                    const labels = [];
+                    const values = [];
+                    for (const [iso, t] of j.points) {
+                        const dt = new Date(iso);
+                        // Show local HH:MM for readability
+                        const hh = String(dt.getHours()).padStart(2, '0');
+                        const mm = String(dt.getMinutes()).padStart(2, '0');
+                        labels.push(`${hh}:${mm}`);
+                        values.push(Number(t));
+                    }
+                    buildTempChart(labels, values);
+                } catch (e) {
+                    // no-op; chart will remain as is
+                }
+            }
+
 
             let state = {
                 mode: localStorage.getItem(MODE_KEY) || 'AUTO',
@@ -1023,6 +1229,10 @@ if ($action === 'load_state') {
 
             setInterval(fetchActualTemp, 10000);
             fetchActualTemp();
+            // History: draw now and refresh every 5 minutes
+            fetchHistoryAndRender();
+            setInterval(fetchHistoryAndRender, 60000); // 5 min
+
 
             // Periodically refresh AUTO setpoint display and active highlight
             setInterval(() => {

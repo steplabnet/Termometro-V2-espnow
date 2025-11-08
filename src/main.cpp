@@ -1360,10 +1360,13 @@ static inline uint8_t apply_hysteresis(float temp, float sp, uint8_t prev)
   const float half = HYST_BAND_C * 0.5f; // 0.25
   const float on_th = sp - half;         // below => ON
   const float off_th = sp + half;        // above => OFF
+  if (temp >= 19.8)
+    return 0;
   if (temp < on_th)
     return 1; // strictly less
   if (temp > off_th)
-    return 0;  // strictly greater
+    return 0; // strictly greater
+
   return prev; // inside band -> hold
 }
 
@@ -1445,7 +1448,7 @@ void loop()
     float freshC;
     bool gotFresh = ds_poll(freshC);
     if (gotFresh)
-      g_lastTempC = freshC;// - 3.0f;
+      g_lastTempC = freshC; // - 3.0f;
 
     // Decide action with strict hysteresis if we have any valid temperature
     const bool haveTemp = isfinite(g_lastTempC);
@@ -1463,9 +1466,17 @@ void loop()
     g_lastAction = action;
 
     // === ESP-NOW TX to relay: {"heater":"ON"/"OFF"} ===
+    static long timerAction = millis();
+
     {
+      static String azione = "OFF";
+      if (millis() - timerAction > 60000) // previene oscilalzioni perché il cambio avviene solo ogni minuto
+      {
+        azione = (action == 1) ? "ON" : "OFF";
+        timerAction = millis();
+      }
       JsonDocument jtx;
-      jtx["heater"] = (action == 1) ? "ON" : "OFF";
+      jtx["heater"] = azione;
       jtx["id"] = 12; // indirizzo della caldaia
       char buf[32];
       size_t n = serializeJson(jtx, buf, sizeof(buf));
