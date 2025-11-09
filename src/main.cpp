@@ -1470,11 +1470,50 @@ void loop()
 
     {
       static String azione = "OFF";
-      if (millis() - timerAction > 60000) // previene oscilalzioni perché il cambio avviene solo ogni minuto
-      {
-        azione = (action == 1) ? "ON" : "OFF";
+      static uint32_t onStartMs = 0;
+      static bool forcedOff = false;
+      static uint32_t forcedOffUntil = 0;
+
+      if (millis() - timerAction > 60000)
+      { // update every minute
+        // --- Safety logic: auto OFF after 1 hour ON, cool down 30 minutes ---
+        if (azione == "ON")
+        {
+          if (onStartMs == 0)
+            onStartMs = millis(); // mark when ON started
+          if (!forcedOff && millis() - onStartMs >= 3600000UL)
+          { // 1 hour
+            forcedOff = true;
+            forcedOffUntil = millis() + 1800000UL; // 30 minutes OFF
+            Serial.println("[SAFETY] Heater forced OFF for 30 minutes");
+          }
+        }
+        else
+        {
+          onStartMs = 0; // reset ON timer when OFF
+        }
+
+        // If currently under forced OFF period
+        if (forcedOff)
+        {
+          if (millis() >= forcedOffUntil)
+          {
+            forcedOff = false;
+            Serial.println("[SAFETY] Forced OFF period ended, normal control resumed");
+          }
+          else
+          {
+            azione = "OFF"; // keep OFF during safety period
+          }
+        }
+        else
+        {
+          azione = (action == 1) ? "ON" : "OFF";
+        }
+
         timerAction = millis();
       }
+
       JsonDocument jtx;
       jtx["heater"] = azione;
       jtx["id"] = 12; // indirizzo della caldaia
