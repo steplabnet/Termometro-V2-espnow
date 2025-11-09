@@ -34,6 +34,10 @@ static const char *WIFI_SSID_DEFAULT = "zelja_RPT";
 static const char *WIFI_PASS_DEFAULT = "pikolejla";
 static const char *HOSTNAME = "esp-thermo";
 
+// ===== Power-saving (sleep mode) =====
+static bool sleepModeActive = false;    // we're in "setpoint <= 10" mode
+static bool sleepWaitingRemote = false; // we are waiting for a successful remote reply
+
 // OPTIONAL: OTA password (set to non-empty to require it for uploads)
 static const char *OTA_PASS = ""; // e.g. "mySecret123"
 
@@ -1528,20 +1532,52 @@ void loop()
     if (haveTemp && (millis() - g_lastHttpMs >= HTTP_MIN_INTERVAL_MS))
     {
       bool heatingForReport = g_haveAck ? g_ackRelayOn : (action == 1);
-      (void)cesanaReportAndFetch(g_lastTempC, heatingForReport); // internally guarded to STA-only
+      bool ok = cesanaReportAndFetch(g_lastTempC, heatingForReport); // <- capture result
       g_lastHttpMs = millis();
-    }
-  }
 
-  // Keep doing AP-availability check (cheap; pairs well with 2-min retry)
-  static uint32_t lastApChk = 0;
-  if (millis() - lastApChk > 2000)
-  {
-    lastApChk = millis();
-    if (!sta && !g_apActive)
+      // If we're in sleep mode and we were waiting for the remote -> we can sleep now
+      if (sleepModeActive && sleepWaitingRemote && ok)
+      {
+        Serial.println("[SLEEP] Remote answered OK, going to deep sleep for 10 minutes...");
+        ESP.deepSleep(10ULL * 60ULL * 1000000ULL); // 10 minutes
+        delay(100);
+      }
+    }
+
+    // Keep doing AP-availability check (cheap; pairs well with 2-min retry)
+    static uint32_t lastApChk = 0;
+    if (millis() - lastApChk > 2000)
     {
-      Serial.println("[WiFi] STA down & AP not active -> starting AP fallback (periodic check)");
-      startApFallback();
+      lastApChk = millis();
+      if (!sta && !g_apActive)
+      {
+        Serial.println("[WiFi] STA down & AP not active -> starting AP fallback (periodic check)");
+        startApFallback();
+      }
+    }
+
+    // ===== Power-saving mode based on setpoint =====
+    float spNow = getActiveSetpoint();
+
+    if (spNow <= 10.0f)
+    {
+      // enter / stay in sleep mode
+      if (!sleepModeActive)
+      {
+        sleepModeActive = true;
+        sleepWaitingRemote = true; // on this wake, wait for a good remote reply
+        Serial.println("[SLEEP] Low setpoint -> wait for remote, then sleep 10 minutes");
+      }
+    }
+    else
+    {
+      // leave sleep mode
+      if (sleepModeActive)
+      {
+        Serial.println("[SLEEP] Setpoint > 10 -> staying active");
+      }
+      sleepModeActive = false;
+      sleepWaitingRemote = false;
     }
   }
 }
