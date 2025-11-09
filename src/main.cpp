@@ -1539,7 +1539,7 @@ void loop()
       if (sleepModeActive && sleepWaitingRemote && ok)
       {
         Serial.println("[SLEEP] Remote answered OK, going to deep sleep for 10 minutes...");
-        ESP.deepSleep(10ULL * 60ULL * 1000000ULL); // 10 minutes
+        ESP.deepSleep(1ULL * 60ULL * 1000000ULL); // 1 minutes
         delay(100);
       }
     }
