@@ -1,6 +1,7 @@
 <?php
 // stanza.php — single-file PHP dashboard for a chronothermostat
 // Backend endpoints: load/save schedule + load/save state (mode, manualSetpoint, actualTemp)
+// NOW also: load/save presets (OFF/LOW/NORMAL/HIGH...) in presets.json
 // Frontend: modern light UI, OFF/ON/AUTO, weekly chrono table, active setpoint highlight,
 // polling actual temperature from state.json every 10s.
 
@@ -9,11 +10,14 @@ $action = $_GET['action'] ?? '';
 
 /** ---------- helpers for state in /dev/shm ---------- */
 $RAM_DIR = '/dev/shm';
-$STATE_FILENAME = 'state.json'; // change to 'state.json' if you prefer that spelling
+$STATE_FILENAME = 'state.json';
 
 /** ---------- temperature history (CSV in /dev/shm) ---------- */
 $HISTORY_FILENAME = 'temp_history.csv';
 $HISTORY_FILE = resolve_state_path($RAM_DIR, $HISTORY_FILENAME);
+
+/** ---------- presets file (in script dir) ---------- */
+$PRESETS_FILE = __DIR__ . '/presets.json';
 
 /**
  * Append one row "unix_ts,temperature" if last sample is older than $minDeltaSec.
@@ -22,12 +26,10 @@ $HISTORY_FILE = resolve_state_path($RAM_DIR, $HISTORY_FILENAME);
 function history_maybe_append(string $path, float $temp, int $minDeltaSec = 1200, int $keepSec = 172800): void
 {
     $now = time();
-    // Ensure directory exists
     @mkdir(dirname($path), 0775, true);
 
     $lastTs = null;
     if (is_readable($path)) {
-        // Read last line efficiently
         $fh = @fopen($path, 'r');
         if ($fh) {
             fseek($fh, -1, SEEK_END);
@@ -48,12 +50,10 @@ function history_maybe_append(string $path, float $temp, int $minDeltaSec = 1200
         }
     }
 
-    // Append if needed
     if ($lastTs === null || ($now - $lastTs) >= $minDeltaSec) {
         @file_put_contents($path, $now . ',' . number_format($temp, 2, '.', '') . "\n", FILE_APPEND);
     }
 
-    // Best-effort prune (> keepSec old)
     if (is_readable($path)) {
         $cutoff = $now - $keepSec;
         $rows = @file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
@@ -68,7 +68,6 @@ function history_maybe_append(string $path, float $temp, int $minDeltaSec = 1200
                     $kept[] = $r;
             }
             if (!empty($kept)) {
-                // Atomic-ish rewrite
                 $tmp = $path . '.tmp';
                 if (@file_put_contents($tmp, implode("\n", $kept) . "\n") !== false) {
                     @rename($tmp, $path);
@@ -82,7 +81,7 @@ function history_maybe_append(string $path, float $temp, int $minDeltaSec = 1200
 function history_load_last24(string $path): array
 {
     $now = time();
-    $cutoff = $now - 86400; // 24h
+    $cutoff = $now - 86400;
     $out = [];
     if (!is_readable($path))
         return $out;
@@ -90,7 +89,6 @@ function history_load_last24(string $path): array
     if ($rows === false)
         return $out;
 
-    // Optional: compress to ~20-minute buckets (floor to 1200s)
     $bucket = 1200;
     $seen = [];
     foreach ($rows as $r) {
@@ -101,12 +99,11 @@ function history_load_last24(string $path): array
         if ($ts < $cutoff)
             continue;
         $b = intdiv($ts, $bucket) * $bucket;
-        // keep the latest value in the bucket (looks nicer)
         $seen[$b] = floatval($tempStr);
     }
     ksort($seen);
     foreach ($seen as $ts => $temp) {
-        $out[] = [gmdate('c', $ts), $temp]; // ISO 8601 UTC
+        $out[] = [gmdate('c', $ts), $temp];
     }
     return $out;
 }
@@ -114,7 +111,6 @@ function history_load_last24(string $path): array
 
 function resolve_state_path(string $ramDir, string $filename): string
 {
-    // Prefer /dev/shm, fallback to script dir if not usable
     if (is_dir($ramDir) && is_writable($ramDir)) {
         return rtrim($ramDir, '/') . '/' . $filename;
     }
@@ -131,50 +127,38 @@ function write_json_atomic(string $path, array $data): bool
     if ($json === false)
         return false;
 
-    // Use LOCK_EX to reduce races in case rename isn’t truly atomic on the FS
     if (@file_put_contents($tmp, $json, LOCK_EX) === false)
         return false;
-    // Best-effort chmod (so other processes can read it)
     @chmod($tmp, 0664);
-    // Atomic replace
     return @rename($tmp, $path);
 }
 
 $STATE_FILE = resolve_state_path($RAM_DIR, $STATE_FILENAME);
 
-/** ---------- API: Load schedule (now returns version) ---------- */
-/** ---------- API: Load 24h history ---------- */
 /** ---------- API: Load 24h history (READ-ONLY) ---------- */
 if ($action === 'load_history') {
     header('Content-Type: application/json; charset=utf-8');
-
-    // Prefer the CSV produced by get_setpoint.php in this folder.
     $csv = __DIR__ . '/temp_history.csv';
     if (!is_readable($csv)) {
-        // Optional fallback if you ever move logging to RAM
-        $csv = $GLOBALS['HISTORY_FILE']; // /dev/shm/temp_history.csv
+        $csv = $GLOBALS['HISTORY_FILE'];
     }
-
-    // Reuse the existing helper to parse & bucket
     $points = history_load_last24($csv);
     echo json_encode(['ok' => true, 'points' => $points], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     exit;
 }
 
-
+/** ---------- API: Load schedule ---------- */
 if ($action === 'load_schedule') {
-    // Tell browsers and proxies: do NOT cache
     header('Content-Type: application/json; charset=utf-8');
     header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
-    header('Pragma: no-cache');   // for older HTTP/1.0 proxies
-    header('Expires: 0');         // set expiry in the past
+    header('Pragma: no-cache');
+    header('Expires: 0');
 
     $file = __DIR__ . '/schedule.json';
     if (is_readable($file)) {
         $raw = file_get_contents($file);
         $j = json_decode($raw, true);
         if (is_array($j)) {
-            // Ensure keys exist
             $out = [
                 "ok" => true,
                 "version" => isset($j['version']) ? (int) $j['version'] : null,
@@ -183,18 +167,7 @@ if ($action === 'load_schedule') {
             ];
             echo json_encode($out, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
         } else {
-            // Legacy/plain file: try to interpret as schedule-only content
-            $maybe = json_decode($raw, true);
-            if (is_array($maybe) && isset($maybe['schedule'])) {
-                echo json_encode([
-                    "ok" => true,
-                    "version" => null,
-                    "saved_at" => null,
-                    "schedule" => $maybe['schedule']
-                ], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
-            } else {
-                echo json_encode(["ok" => true, "version" => null, "saved_at" => null, "schedule" => null]);
-            }
+            echo json_encode(["ok" => true, "version" => null, "saved_at" => null, "schedule" => null]);
         }
     } else {
         echo json_encode(["ok" => true, "version" => null, "saved_at" => null, "schedule" => null]);
@@ -202,7 +175,7 @@ if ($action === 'load_schedule') {
     exit;
 }
 
-/** ---------- API: Save schedule (now versions) ---------- */
+/** ---------- API: Save schedule ---------- */
 if ($action === 'save_schedule' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     header('Content-Type: application/json; charset=utf-8');
     $file = __DIR__ . '/schedule.json';
@@ -214,7 +187,6 @@ if ($action === 'save_schedule' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         exit;
     }
 
-    // Read previous version if present
     $prevVersion = 0;
     if (is_readable($file)) {
         $prev = json_decode(@file_get_contents($file), true);
@@ -224,7 +196,7 @@ if ($action === 'save_schedule' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     $version = $prevVersion + 1;
-    $saved_at = gmdate('c'); // ISO 8601 in UTC
+    $saved_at = gmdate('c');
 
     $payloadToSave = [
         "version" => $version,
@@ -232,14 +204,12 @@ if ($action === 'save_schedule' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         "schedule" => $decoded['schedule'],
     ];
 
-    // Try to write atomically where possible; fall back to file_put_contents if write_json_atomic fails for schedule file location
     $wrote = false;
-    $schedule_path = $file;
-    if (is_writable(dirname($schedule_path))) {
-        $wrote = write_json_atomic($schedule_path, $payloadToSave);
+    if (is_writable(dirname($file))) {
+        $wrote = write_json_atomic($file, $payloadToSave);
     }
     if (!$wrote) {
-        $ok = @file_put_contents($schedule_path, json_encode($payloadToSave, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+        $ok = @file_put_contents($file, json_encode($payloadToSave, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
         $wrote = $ok !== false;
     }
 
@@ -251,7 +221,7 @@ if ($action === 'save_schedule' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     exit;
 }
 
-/** ---------- API: Save state (NOW writes to /dev/shm) ---------- */
+/** ---------- API: Save state ---------- */
 if ($action === 'save_state' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     header('Content-Type: application/json; charset=utf-8');
     $body = file_get_contents('php://input');
@@ -265,11 +235,10 @@ if ($action === 'save_state' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     $manual = floatval($decoded['manualSetpoint']);
     $state = ['mode' => $mode, 'manualSetpoint' => $manual];
 
-    // optional passthroughs
     if (isset($decoded['actualTemp'])) {
         $state['actualTemp'] = floatval($decoded['actualTemp']);
     }
-    if (isset($decoded['cald'])) { // allow writer to set heater status too
+    if (isset($decoded['cald'])) {
         $state['cald'] = (int) $decoded['cald'];
     }
 
@@ -284,7 +253,7 @@ if ($action === 'save_state' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     exit;
 }
 
-/** ---------- API: Load state (NOW reads from /dev/shm) ---------- */
+/** ---------- API: Load state ---------- */
 if ($action === 'load_state') {
     header('Content-Type: application/json; charset=utf-8');
     $file = $GLOBALS['STATE_FILE'];
@@ -302,6 +271,71 @@ if ($action === 'load_state') {
         ]);
     } else {
         echo json_encode(['ok' => true, 'mode' => null, 'manualSetpoint' => null, 'actualTemp' => null, 'cald' => 0]);
+    }
+    exit;
+}
+
+/** ---------- API: Load presets (new) ---------- */
+if ($action === 'load_presets') {
+    header('Content-Type: application/json; charset=utf-8');
+
+    // default presets if file missing/corrupt
+    $default = [
+        "ok" => true,
+        "presets" => [
+            "order" => ["OFF", "LOW", "NORMAL", "HIGH"],
+            "map" => ["OFF" => 10, "LOW" => 15, "NORMAL" => 19, "HIGH" => 20]
+        ]
+    ];
+
+    if (!is_readable($PRESETS_FILE)) {
+        echo json_encode($default, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        exit;
+    }
+
+    $raw = file_get_contents($PRESETS_FILE);
+    $j = json_decode($raw, true);
+    if (!is_array($j) || !isset($j['order']) || !isset($j['map'])) {
+        echo json_encode($default, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+        exit;
+    }
+
+    echo json_encode(["ok" => true, "presets" => $j], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
+    exit;
+}
+
+/** ---------- API: Save presets (new) ---------- */
+if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
+    header('Content-Type: application/json; charset=utf-8');
+    $body = file_get_contents('php://input');
+    $decoded = json_decode($body, true);
+    if (!is_array($decoded) || !isset($decoded['order']) || !isset($decoded['map'])) {
+        http_response_code(400);
+        echo json_encode(["ok" => false, "error" => "Invalid presets payload"]);
+        exit;
+    }
+
+    // sanitize a bit
+    $order = array_values(array_filter($decoded['order'], 'is_string'));
+    $map = [];
+    foreach ($decoded['map'] as $k => $v) {
+        $map[$k] = (float) $v;
+    }
+    $payload = ["order" => $order, "map" => $map];
+
+    $wrote = false;
+    if (is_writable(dirname($PRESETS_FILE))) {
+        $wrote = write_json_atomic($PRESETS_FILE, $payload);
+    }
+    if (!$wrote) {
+        $ok = @file_put_contents($PRESETS_FILE, json_encode($payload, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+        $wrote = $ok !== false;
+    }
+
+    if (!$wrote) {
+        echo json_encode(["ok" => false, "error" => "Could not write presets.json. Check file permissions."]);
+    } else {
+        echo json_encode(["ok" => true]);
     }
     exit;
 }
@@ -711,38 +745,23 @@ if ($action === 'load_state') {
     </div>
 
     <script>
-        let isEditing = false; // prevent auto re-render while editing an inline chip
+        let isEditing = false;
 
-        // ------- Presets (editable, persisted in localStorage) -------
-        const PRESETS_KEY = 'chrono.presets.v1';
+        // -------- presets now come from server, not localStorage --------
+        const PRESETS_URL_LOAD = '?action=load_presets';
+        const PRESETS_URL_SAVE = '?action=save_presets';
 
         function defaultPresets() {
             return { order: ["OFF", "LOW", "NORMAL", "HIGH"], map: { OFF: 10, LOW: 15, NORMAL: 19, HIGH: 20 } };
         }
-        function loadPresets() {
-            try {
-                const raw = localStorage.getItem(PRESETS_KEY);
-                if (!raw) return defaultPresets();
-                const j = JSON.parse(raw);
-                if (!j || !Array.isArray(j.order) || !j.order.length || typeof j.map !== 'object') throw 0;
-                const seen = new Set();
-                const order = j.order.filter(n => typeof n === 'string' && n in j.map && !seen.has(n) && seen.add(n));
-                if (!order.length) throw 0;
-                for (const k of Object.keys(j.map)) j.map[k] = Number(j.map[k]);
-                return { order, map: j.map };
-            } catch { return defaultPresets(); }
-        }
-        function savePresets(p) {
-            localStorage.setItem(PRESETS_KEY, JSON.stringify(p));
-        }
 
-        let PRESETS_OBJ = loadPresets();
+        let PRESETS_OBJ = defaultPresets();
 
         function presetNameForValue(v) {
             for (const k of PRESETS_OBJ.order) {
                 if (Math.abs(PRESETS_OBJ.map[k] - v) < 0.01) return k;
             }
-            return null; // value wasn't one of the standard presets
+            return null;
         }
 
         function makePresetSelect(currentValue, onChange) {
@@ -756,7 +775,7 @@ if ($action === 'load_state') {
             PRESETS_OBJ.order.forEach(k => {
                 const opt = document.createElement('option');
                 opt.value = k;
-                opt.textContent = k;   // only name, no degrees
+                opt.textContent = k;
                 sel.appendChild(opt);
             });
 
@@ -767,7 +786,7 @@ if ($action === 'load_state') {
             return sel;
         }
 
-        (function () {
+        (async function () {
             const days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
             const byId = id => document.getElementById(id);
             const actualTempEl = byId('actualTemp');
@@ -795,9 +814,21 @@ if ($action === 'load_state') {
             const MANUAL_SP_KEY = 'chrono.manual_sp.v1';
             const SERVER_STATE_URL_SAVE = '?action=save_state';
             const SERVER_STATE_URL_LOAD = '?action=load_state';
-            // ---- Chart: last 24h temperature ----
             const tempChartCanvas = document.getElementById('tempChart');
             let tempChart;
+
+            // ---- load presets from server BEFORE rendering UI ----
+            try {
+                const res = await fetch(PRESETS_URL_LOAD + '&_=' + Date.now());
+                if (res.ok) {
+                    const j = await res.json();
+                    if (j && j.ok && j.presets && Array.isArray(j.presets.order) && typeof j.presets.map === 'object') {
+                        PRESETS_OBJ = j.presets;
+                    }
+                }
+            } catch (e) {
+                // stick to defaultPresets()
+            }
 
             function buildTempChart(labels, data) {
                 if (tempChart) {
@@ -851,12 +882,10 @@ if ($action === 'load_state') {
                     const j = await res.json();
                     if (!j.ok || !Array.isArray(j.points)) return;
 
-                    // j.points: [ [iso, temp], ... ]
                     const labels = [];
                     const values = [];
                     for (const [iso, t] of j.points) {
                         const dt = new Date(iso);
-                        // Show local HH:MM for readability
                         const hh = String(dt.getHours()).padStart(2, '0');
                         const mm = String(dt.getMinutes()).padStart(2, '0');
                         labels.push(`${hh}:${mm}`);
@@ -864,10 +893,8 @@ if ($action === 'load_state') {
                     }
                     buildTempChart(labels, values);
                 } catch (e) {
-                    // no-op; chart will remain as is
                 }
             }
-
 
             let state = {
                 mode: localStorage.getItem(MODE_KEY) || 'AUTO',
@@ -892,79 +919,15 @@ if ($action === 'load_state') {
             function saveMode() { localStorage.setItem(MODE_KEY, state.mode); }
             function saveManual() { localStorage.setItem(MANUAL_SP_KEY, String(state.manualSetpoint)); }
 
-            function makeAddChip(dayObj) {
-                const chip = document.createElement('div');
-                chip.className = 'chip';
-                chip.style.cursor = 'pointer';
-
-                const plus = document.createElement('strong');
-                plus.textContent = '+ Add';
-                chip.appendChild(plus);
-
-                // When clicked, expand into small form
-                chip.addEventListener('click', function handleOpen() {
-                    chip.removeEventListener('click', handleOpen);
-                    chip.innerHTML = ''; // clear
-
-                    // time input
-                    const time = document.createElement('input');
-                    time.type = 'time';
-                    time.value = '06:00';
-                    time.style.padding = '6px 10px';
-                    time.style.borderRadius = '999px';
-                    time.style.border = '1px solid var(--border)';
-                    time.style.background = '#fff';
-                    time.style.font = 'inherit';
-
-                    // preset select (names only)
-                    const presetSel = makePresetSelect(19, () => { }); // default NORMAL
-
-                    // buttons
-                    const addBtn = document.createElement('button');
-                    addBtn.className = 'btn';
-                    addBtn.textContent = 'Add';
-                    addBtn.style.padding = '6px 10px';
-
-                    const cancelBtn = document.createElement('button');
-                    cancelBtn.className = 'x';
-                    cancelBtn.title = 'Cancel';
-                    cancelBtn.textContent = '×';
-
-                    addBtn.addEventListener('click', () => {
-                        const t = time.value || '00:00';
-                        const chosen = presetSel.value || (PRESETS_OBJ.order[0] || 'NORMAL');
-                        dayObj.slots.push({ time: t, setpoint: PRESETS_OBJ.map[chosen] });
-                        saveLocalSchedule();
-                        renderDays();
-                        updateSetpointFromMode();
-                    });
-
-                    cancelBtn.addEventListener('click', (ev) => {
-                        ev.stopPropagation();
-                        renderDays(); // reset chip back to "+ Add"
-                    });
-
-                    chip.appendChild(time);
-                    chip.appendChild(presetSel);
-                    chip.appendChild(addBtn);
-                    chip.appendChild(cancelBtn);
-                });
-
-                return chip;
-            }
-
-
-            // UI build for days
+            // UI build for days (rebuilt after presets change)
             function renderDays() {
                 daysGrid.innerHTML = '';
 
-                // helper to HH:MM -> minutes since midnight
                 const toMin = (hm) => {
                     const [h, m] = hm.split(':').map(n => parseInt(n, 10));
                     return h * 60 + m;
                 };
 
-                // inline “+ Add” chip (names-only UI)
                 function createAddChip(dayObj) {
                     const chip = document.createElement('div');
                     chip.className = 'chip';
@@ -976,7 +939,7 @@ if ($action === 'load_state') {
 
                     function openEditor(ev) {
                         ev && ev.stopPropagation();
-                        isEditing = true; // block auto refresh while editing
+                        isEditing = true;
                         chip.innerHTML = '';
 
                         const time = document.createElement('input');
@@ -988,7 +951,7 @@ if ($action === 'load_state') {
                         time.style.background = '#fff';
                         time.style.font = 'inherit';
 
-                        const presetSel = makePresetSelect(19, () => { }); // default NORMAL (names only)
+                        const presetSel = makePresetSelect(19, () => { });
 
                         const addBtn = document.createElement('button');
                         addBtn.className = 'btn';
@@ -1000,7 +963,6 @@ if ($action === 'load_state') {
                         cancelBtn.title = 'Cancel';
                         cancelBtn.textContent = '×';
 
-                        // keep clicks inside editor from bubbling
                         [time, presetSel, addBtn, cancelBtn].forEach(el => {
                             el.addEventListener('click', e => e.stopPropagation());
                         });
@@ -1018,7 +980,7 @@ if ($action === 'load_state') {
                         cancelBtn.addEventListener('click', (ev) => {
                             ev.stopPropagation();
                             isEditing = false;
-                            renderDays(); // restore "+ Add"
+                            renderDays();
                         });
 
                         chip.appendChild(time);
@@ -1026,7 +988,6 @@ if ($action === 'load_state') {
                         chip.appendChild(addBtn);
                         chip.appendChild(cancelBtn);
 
-                        // make hour immediately editable
                         setTimeout(() => {
                             try { time.focus(); time.showPicker && time.showPicker(); } catch { }
                         }, 0);
@@ -1037,11 +998,9 @@ if ($action === 'load_state') {
                 }
 
                 state.schedule.forEach((dayObj, idx) => {
-                    // container for the day
                     const wrap = document.createElement('div');
                     wrap.className = 'day';
 
-                    // header row with title + Duplicate button
                     const headerRow = document.createElement('div');
                     headerRow.className = 'row';
                     headerRow.style.justifyContent = 'space-between';
@@ -1064,7 +1023,7 @@ if ($action === 'load_state') {
                             alert("No such day: " + targetName);
                             return;
                         }
-                        target.slots = JSON.parse(JSON.stringify(dayObj.slots)); // deep copy
+                        target.slots = JSON.parse(JSON.stringify(dayObj.slots));
                         saveLocalSchedule();
                         renderDays();
                         updateSetpointFromMode();
@@ -1074,16 +1033,13 @@ if ($action === 'load_state') {
                     headerRow.appendChild(dupBtn);
                     wrap.appendChild(headerRow);
 
-                    // chip row
                     const slots = document.createElement('div');
                     slots.className = 'slots';
 
-                    // ensure slots are time-ordered
                     dayObj.slots.sort((a, b) => a.time.localeCompare(b.time));
 
-                    // compute active chip for today in AUTO mode
                     const now = new Date();
-                    const todayIndex = (now.getDay() + 6) % 7; // Monday=0
+                    const todayIndex = (now.getDay() + 6) % 7;
                     const nowMinutes = now.getHours() * 60 + now.getMinutes();
                     let activeIdx = -1;
                     if (state.mode === 'AUTO' && idx === todayIndex && dayObj.slots.length) {
@@ -1092,7 +1048,6 @@ if ($action === 'load_state') {
                         activeIdx = chosen >= 0 ? chosen : 0;
                     }
 
-                    // render each slot as a chip with a names-only preset selector
                     dayObj.slots.forEach((s, sidx) => {
                         const chip = document.createElement('div');
                         chip.className = 'chip';
@@ -1107,11 +1062,10 @@ if ($action === 'load_state') {
                         chip.appendChild(arrowEl);
 
                         const presetSel = makePresetSelect(s.setpoint, (newPreset) => {
-                            s.setpoint = PRESETS_OBJ.map[newPreset]; // store numeric value, UI shows only names
+                            s.setpoint = PRESETS_OBJ.map[newPreset];
                             saveLocalSchedule();
                             updateSetpointFromMode();
                         });
-                        // keep select interactions from bubbling so the chip doesn't close/open
                         presetSel.addEventListener('click', e => e.stopPropagation());
                         chip.appendChild(presetSel);
 
@@ -1131,7 +1085,6 @@ if ($action === 'load_state') {
                         slots.appendChild(chip);
                     });
 
-                    // append inline "+ Add" chip at the end
                     slots.appendChild(createAddChip(dayObj));
 
                     wrap.appendChild(slots);
@@ -1139,8 +1092,6 @@ if ($action === 'load_state') {
                 });
             }
 
-
-            // Mode handling
             function setMode(mode) {
                 state.mode = mode; saveMode();
                 [btnOff, btnOn, btnAuto].forEach(b => b.classList.remove('active'));
@@ -1151,14 +1102,13 @@ if ($action === 'load_state') {
                 setpointHint.textContent = mode === 'ON' ? 'Manual setpoint' : (mode === 'AUTO' ? 'AUTO from chrono table' : 'System is OFF');
                 renderDays();
                 updateSetpointFromMode();
-                // sync to server
                 saveStateServer().catch(() => { });
             }
 
             function parseHM(hm) { const [h, m] = hm.split(':').map(n => parseInt(n, 10)); return h * 60 + m; }
 
             function computeAutoSetpoint(now = new Date()) {
-                const dayIndex = (now.getDay() + 6) % 7; // Monday=0
+                const dayIndex = (now.getDay() + 6) % 7;
                 const day = state.schedule[dayIndex];
                 if (!day || !day.slots.length) return state.manualSetpoint;
                 const minutes = now.getHours() * 60 + now.getMinutes();
@@ -1182,7 +1132,6 @@ if ($action === 'load_state') {
                 }
             }
 
-            // Events
             btnOff.addEventListener('click', () => setMode('OFF'));
             btnOn.addEventListener('click', () => setMode('ON'));
             btnAuto.addEventListener('click', () => setMode('AUTO'));
@@ -1193,7 +1142,6 @@ if ($action === 'load_state') {
                 }
             });
 
-            // --- fetch actual temperature from server instead of simulating ---
             const heaterStatusEl = document.getElementById('heaterStatus');
 
             async function fetchActualTemp() {
@@ -1211,10 +1159,10 @@ if ($action === 'load_state') {
                     if (j && typeof j.cald === 'number') {
                         if (j.cald === 1) {
                             heaterStatusEl.textContent = 'Heater active';
-                            heaterStatusEl.style.color = '#16a34a'; // green
+                            heaterStatusEl.style.color = '#16a34a';
                         } else {
                             heaterStatusEl.textContent = 'Heater inactive';
-                            heaterStatusEl.style.color = '#ef4444'; // red
+                            heaterStatusEl.style.color = '#ef4444';
                         }
                     } else {
                         heaterStatusEl.textContent = '--';
@@ -1229,28 +1177,22 @@ if ($action === 'load_state') {
 
             setInterval(fetchActualTemp, 10000);
             fetchActualTemp();
-            // History: draw now and refresh every 5 minutes
             fetchHistoryAndRender();
-            setInterval(fetchHistoryAndRender, 60000); // 5 min
+            setInterval(fetchHistoryAndRender, 60000);
 
-
-            // Periodically refresh AUTO setpoint display and active highlight
             setInterval(() => {
                 if (state.mode === 'AUTO' && !isEditing) {
                     updateSetpointFromMode();
                     renderDays();
                 }
-            }, 30_000);
+            }, 30000);
 
-
-            // Save/Load to server (schedule + state)
             async function postJSON(url, data) {
                 const res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(data) });
                 if (!res.ok) throw new Error('HTTP ' + res.status);
                 return res.json();
             }
 
-            // --- server state helpers ---
             async function saveStateServer() {
                 const payload = { mode: state.mode, manualSetpoint: state.manualSetpoint };
                 try {
@@ -1260,7 +1202,6 @@ if ($action === 'load_state') {
                 } catch (e) { flashStatus('State sync failed', true); }
             }
 
-            // Toolbar: Save/Load schedule
             document.getElementById('btnSaveServer').addEventListener('click', async () => {
                 try {
                     const payload = { schedule: state.schedule };
@@ -1310,7 +1251,6 @@ if ($action === 'load_state') {
                 setTimeout(() => { statusText.textContent = 'Running'; statusDot.style.background = 'var(--ok)'; }, 2500);
             }
 
-            // Export/Import JSON (client-side)
             document.getElementById('btnExport').addEventListener('click', () => {
                 const data = { schedule: state.schedule };
                 const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -1336,7 +1276,6 @@ if ($action === 'load_state') {
 
             // -------- Presets editor modal logic --------
             function openPresetsEditor() {
-                // build rows from PRESETS_OBJ
                 presetRows.innerHTML = '';
                 PRESETS_OBJ.order.forEach((name, idx) => addPresetRow(name, PRESETS_OBJ.map[name], idx));
                 presetsModal.style.display = 'flex';
@@ -1366,7 +1305,6 @@ if ($action === 'load_state') {
                 delBtn.className = 'btn danger';
                 delBtn.textContent = '×';
 
-                // Up/Down reordering with keyboard
                 nameInput.addEventListener('keydown', (e) => {
                     if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
                         e.preventDefault();
@@ -1397,7 +1335,7 @@ if ($action === 'load_state') {
                     const val = parseFloat(r.querySelector('input[type="number"]').value);
                     if (!name) continue;
                     if (isNaN(val)) continue;
-                    if (order.includes(name)) continue; // enforce unique
+                    if (order.includes(name)) continue;
                     order.push(name);
                     map[name] = Math.max(5, Math.min(35, val));
                 }
@@ -1408,19 +1346,32 @@ if ($action === 'load_state') {
             btnClosePresets.addEventListener('click', closePresetsEditor);
             presetsModal.addEventListener('click', (e) => { if (e.target === presetsModal) closePresetsEditor(); });
             btnAddPreset.addEventListener('click', () => addPresetRow('', 19));
-            btnSavePresets.addEventListener('click', () => {
+            btnSavePresets.addEventListener('click', async () => {
                 const next = collectPresetsFromUI();
                 if (!next.order.length) { flashStatus('Need at least one preset', true); return; }
-                PRESETS_OBJ = next;
-                savePresets(PRESETS_OBJ);
-                closePresetsEditor();
-                // Re-render selects & active highlights
-                renderDays();
-                updateSetpointFromMode();
-                flashStatus('Presets saved');
+                // save to server
+                try {
+                    const resp = await fetch(PRESETS_URL_SAVE, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(next)
+                    });
+                    const jr = await resp.json();
+                    if (!resp.ok || !jr.ok) {
+                        flashStatus('Preset save failed', true);
+                        return;
+                    }
+                    PRESETS_OBJ = next;
+                    closePresetsEditor();
+                    renderDays();
+                    updateSetpointFromMode();
+                    flashStatus('Presets saved to server');
+                } catch (e) {
+                    flashStatus('Preset save failed', true);
+                }
             });
 
-            // Initial render
+            // Initial render with server presets
             renderDays();
             setMode(state.mode);
         })();
