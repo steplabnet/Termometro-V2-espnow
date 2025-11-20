@@ -698,7 +698,13 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 <div class="subtitle" id="setpointHint">Manual setpoint</div>
             </div>
             <div class="card pad span12">
-                <div class="subtitle">Temperature (last 24h)</div>
+                <div class="row" style="justify-content: space-between; align-items: flex-end; margin-bottom: 8px;">
+                    <div class="subtitle">Temperature (last 24h)</div>
+                    <div id="trendDisplay" class="pill"
+                        style="display:none; font-size:13px; font-weight:600; color:var(--text);">
+                        <!-- JS will inject: ↗ +0.5 °C/h -->
+                    </div>
+                </div>
                 <canvas id="tempChart" style="height:100px"></canvas>
             </div>
 
@@ -830,24 +836,83 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 // stick to defaultPresets()
             }
 
-            function buildTempChart(labels, data) {
+
+
+            // --- INSERT THIS HELPER FUNCTION ---
+            function calculateLinearRegression(points) {
+                // points format: [{ t: timestamp_ms, y: value }, ...]
+                const n = points.length;
+                if (n < 2) return null;
+
+                let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+                // Normalize X to start from 0 to avoid huge numbers causing float precision issues
+                const startX = points[0].t;
+
+                for (let i = 0; i < n; i++) {
+                    const x = (points[i].t - startX) / 1000; // Convert to seconds for easier slope calc
+                    const y = points[i].y;
+                    sumX += x;
+                    sumY += y;
+                    sumXY += (x * y);
+                    sumXX += (x * x);
+                }
+
+                const slope = (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX);
+                const intercept = (sumY - slope * sumX) / n;
+
+                return {
+                    slopePerSec: slope,
+                    intercept: intercept,
+                    startX: startX
+                };
+            }
+
+            // --- REPLACE buildTempChart WITH THIS ---
+            function buildTempChart(labels, dataHistory, dataTrend) {
                 if (tempChart) {
                     tempChart.data.labels = labels;
-                    tempChart.data.datasets[0].data = data;
+                    tempChart.data.datasets[0].data = dataHistory;
+                    // Update trend dataset if it exists, or add it
+                    if (tempChart.data.datasets[1]) {
+                        tempChart.data.datasets[1].data = dataTrend;
+                    } else {
+                        tempChart.data.datasets.push({
+                            label: 'Trend (1h)',
+                            data: dataTrend,
+                            borderColor: '#ef4444', // Red color for trend
+                            borderWidth: 2,
+                            borderDash: [4, 4],
+                            pointRadius: 0,
+                            tension: 0
+                        });
+                    }
                     tempChart.update();
                     return;
                 }
+
                 tempChart = new Chart(tempChartCanvas.getContext('2d'), {
                     type: 'line',
                     data: {
                         labels,
-                        datasets: [{
-                            label: '°C',
-                            data,
-                            tension: 0.25,
-                            pointRadius: 0,
-                            borderWidth: 2
-                        }]
+                        datasets: [
+                            {
+                                label: 'Actual',
+                                data: dataHistory,
+                                borderColor: '#2563eb', // Brand color
+                                tension: 0.25,
+                                pointRadius: 0,
+                                borderWidth: 2
+                            },
+                            {
+                                label: 'Trend (1h)',
+                                data: dataTrend,
+                                borderColor: '#ef4444',
+                                borderWidth: 2,
+                                borderDash: [4, 4],
+                                pointRadius: 0,
+                                tension: 0
+                            }
+                        ]
                     },
                     options: {
                         responsive: true,
@@ -857,7 +922,11 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
                             legend: { display: false },
                             tooltip: {
                                 callbacks: {
-                                    label: (ctx) => `${ctx.parsed.y.toFixed(1)} °C`
+                                    label: (ctx) => {
+                                        let label = ctx.dataset.label || '';
+                                        if (label) label += ': ';
+                                        return label + ctx.parsed.y.toFixed(2) + ' °C';
+                                    }
                                 }
                             }
                         },
@@ -875,6 +944,7 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 });
             }
 
+            // --- REPLACE fetchHistoryAndRender WITH THIS ---
             async function fetchHistoryAndRender() {
                 try {
                     const res = await fetch('?action=load_history&_=' + Date.now());
@@ -884,17 +954,65 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
 
                     const labels = [];
                     const values = [];
-                    for (const [iso, t] of j.points) {
+                    const rawPoints = []; // Needed for regression math
+
+                    for (const [iso, tStr] of j.points) {
+                        const val = Number(tStr);
                         const dt = new Date(iso);
                         const hh = String(dt.getHours()).padStart(2, '0');
                         const mm = String(dt.getMinutes()).padStart(2, '0');
+
                         labels.push(`${hh}:${mm}`);
-                        values.push(Number(t));
+                        values.push(val);
+                        rawPoints.push({ t: dt.getTime(), y: val });
                     }
-                    buildTempChart(labels, values);
+
+                    // --- Trend Calculation Logic ---
+                    const trendDisplay = document.getElementById('trendDisplay');
+                    const trendData = new Array(values.length).fill(null); // Blank dataset for chart
+
+                    if (rawPoints.length > 1) {
+                        const nowMs = rawPoints[rawPoints.length - 1].t; // Use last data point time as "now" reference
+                        const oneHourMs = 3600 * 1000;
+
+                        // Filter points within the last hour relative to the latest data
+                        const recentPoints = rawPoints.filter(p => p.t >= (nowMs - oneHourMs));
+
+                        if (recentPoints.length >= 2) {
+                            const reg = calculateLinearRegression(recentPoints);
+
+                            if (reg) {
+                                // 1. Update UI Text
+                                const slopePerHour = reg.slopePerSec * 3600; // Convert slope/sec to slope/hour
+                                const symbol = slopePerHour > 0 ? '↗' : (slopePerHour < 0 ? '↘' : '→');
+                                const color = slopePerHour > 0 ? '#ef4444' : (slopePerHour < 0 ? '#2563eb' : '#6b7280'); // Red if rising, Blue if falling
+
+                                trendDisplay.innerHTML = `<span style="color:${color}; font-size:16px; margin-right:4px;">${symbol}</span> ${Math.abs(slopePerHour).toFixed(1)} °C/h`;
+                                trendDisplay.style.display = 'inline-flex';
+
+                                // 2. Generate Trend Line for Chart
+                                // We map the regression line back to the array indices of the recent points
+                                const startIndex = rawPoints.indexOf(recentPoints[0]);
+
+                                for (let i = startIndex; i < rawPoints.length; i++) {
+                                    const p = rawPoints[i];
+                                    const secondsFromStart = (p.t - reg.startX) / 1000;
+                                    const trendVal = reg.intercept + (reg.slopePerSec * secondsFromStart);
+                                    trendData[i] = trendVal;
+                                }
+                            }
+                        } else {
+                            trendDisplay.style.display = 'none';
+                        }
+                    }
+
+                    buildTempChart(labels, values, trendData);
                 } catch (e) {
+                    console.error("History load failed", e);
                 }
             }
+
+
 
             let state = {
                 mode: localStorage.getItem(MODE_KEY) || 'AUTO',
