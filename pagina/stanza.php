@@ -728,8 +728,10 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 </div>
                 <div class="divider"></div>
                 <div class="grid" id="daysGrid"></div>
-                <div class="footer">Tip: In AUTO, the active setpoint is the last time point ≤ current time for that
-                    day. If none exists, the first point of the day is used.</div>
+                <div class="footer">
+                    <strong>New:</strong> Click any two points on the graph to measure the slope between them.<br>
+                    Tip: In AUTO, the active setpoint is the last time point...
+                </div>
             </div>
         </div>
     </div>
@@ -837,60 +839,139 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
 
+            // --- STATE FOR SELECTION ---
+            let rawHistoryPoints = []; // Store full objects {t: ms, y: val} globally for the chart
+            let selection = { p1: null, p2: null }; // Store indices of clicked points
+            let lastAutoTrendHtml = ''; // To restore if selection is cleared
 
-            // --- INSERT THIS HELPER FUNCTION ---
+            // --- HELPER: Linear Regression ---
             function calculateLinearRegression(points) {
-                // points format: [{ t: timestamp_ms, y: value }, ...]
                 const n = points.length;
                 if (n < 2) return null;
-
                 let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
-                // Normalize X to start from 0 to avoid huge numbers causing float precision issues
                 const startX = points[0].t;
-
                 for (let i = 0; i < n; i++) {
-                    const x = (points[i].t - startX) / 1000; // Convert to seconds for easier slope calc
+                    const x = (points[i].t - startX) / 1000;
                     const y = points[i].y;
-                    sumX += x;
-                    sumY += y;
-                    sumXY += (x * y);
-                    sumXX += (x * x);
+                    sumX += x; sumY += y; sumXY += (x * y); sumXX += (x * x);
                 }
-
                 const slope = (n * sumXY - sumX * sumY) / (n * sumXX - sumX * sumX);
                 const intercept = (sumY - slope * sumX) / n;
-
-                return {
-                    slopePerSec: slope,
-                    intercept: intercept,
-                    startX: startX
-                };
+                return { slopePerSec: slope, intercept: intercept, startX: startX };
             }
 
-            // --- REPLACE buildTempChart WITH THIS ---
+            // --- HELPER: Handle Chart Click ---
+            function handleChartClick(e, elements, chart) {
+                // Use elements[0] because with mode: 'index', elements contains all points at that x-axis index
+                if (!elements || !elements.length) return;
+
+                const index = elements[0].index;
+
+                if (selection.p1 !== null && selection.p2 !== null) {
+                    // Was full, now reset to start new selection
+                    selection.p1 = index;
+                    selection.p2 = null;
+                } else if (selection.p1 === null) {
+                    // Was empty, start selection
+                    selection.p1 = index;
+                } else {
+                    // Has one point
+                    if (selection.p1 === index) {
+                        // Clicked same point -> deselect
+                        selection.p1 = null;
+                    } else {
+                        // Second point
+                        // Ensure p1 is chronologically before p2
+                        if (index < selection.p1) {
+                            selection.p2 = selection.p1;
+                            selection.p1 = index;
+                        } else {
+                            selection.p2 = index;
+                        }
+                    }
+                }
+                updateChartSelection(chart);
+            }
+
+            // --- HELPER: Update Visuals & Calculate Slope ---
+            function updateChartSelection(chart) {
+                const trendDisplay = document.getElementById('trendDisplay');
+                const datasetSelection = chart.data.datasets[2];
+
+                // 1. Clear previous selection line
+                datasetSelection.data = new Array(rawHistoryPoints.length).fill(null);
+
+                if (selection.p1 !== null && selection.p2 !== null) {
+                    // TWO POINTS SELECTED
+                    const point1 = rawHistoryPoints[selection.p1];
+                    const point2 = rawHistoryPoints[selection.p2];
+
+                    const deltaTemp = point2.y - point1.y;
+                    const deltaMs = point2.t - point1.t;
+
+                    if (deltaMs > 0) {
+                        const hours = deltaMs / 3600000;
+                        const slope = deltaTemp / hours;
+                        const symbol = slope > 0 ? '↗' : (slope < 0 ? '↘' : '→');
+                        const color = '#8b5cf6'; // Purple
+
+                        trendDisplay.innerHTML = `
+                            <span style="color:${color}; font-size:14px; margin-right:5px;">Selected:</span> 
+                            <span style="color:${color}; font-weight:700">${symbol} ${Math.abs(slope).toFixed(2)} °C/h</span>
+                            <span style="color:#9ca3af; font-size:11px; margin-left:6px">(${hours.toFixed(1)}h)</span>
+                        `;
+                        trendDisplay.style.display = 'inline-flex';
+                        trendDisplay.style.borderColor = color;
+
+                        // Draw interpolated line
+                        for (let i = selection.p1; i <= selection.p2; i++) {
+                            const currentP = rawHistoryPoints[i];
+                            const progress = (currentP.t - point1.t) / deltaMs;
+                            datasetSelection.data[i] = point1.y + (deltaTemp * progress);
+                        }
+                    }
+                } else if (selection.p1 !== null) {
+                    // ONE POINT SELECTED
+                    trendDisplay.innerHTML = `<span style="color:#6b7280;">Select 2nd point...</span>`;
+                    trendDisplay.style.display = 'inline-flex';
+                    trendDisplay.style.borderColor = 'var(--border)';
+                } else {
+                    // NO SELECTION -> Restore Auto Trend if exists
+                    if (lastAutoTrendHtml) {
+                        trendDisplay.innerHTML = lastAutoTrendHtml;
+                        trendDisplay.style.display = 'inline-flex';
+                        trendDisplay.style.borderColor = 'transparent';
+                    } else {
+                        trendDisplay.style.display = 'none';
+                    }
+                }
+                chart.update();
+            }
+
             function buildTempChart(labels, dataHistory, dataTrend) {
                 if (tempChart) {
                     tempChart.data.labels = labels;
                     tempChart.data.datasets[0].data = dataHistory;
-                    // Update trend dataset if it exists, or add it
-                    if (tempChart.data.datasets[1]) {
-                        tempChart.data.datasets[1].data = dataTrend;
-                    } else {
-                        tempChart.data.datasets.push({
-                            label: 'Trend (1h)',
-                            data: dataTrend,
-                            borderColor: '#ef4444', // Red color for trend
-                            borderWidth: 2,
-                            borderDash: [4, 4],
-                            pointRadius: 0,
-                            tension: 0
-                        });
+                    tempChart.data.datasets[1].data = dataTrend;
+                    // Reset selection on data reload to avoid index mismatch
+                    selection = { p1: null, p2: null };
+                    tempChart.data.datasets[2].data = new Array(dataHistory.length).fill(null);
+
+                    // Restore auto trend text since selection is cleared
+                    const trendDisplay = document.getElementById('trendDisplay');
+                    if (lastAutoTrendHtml) {
+                        trendDisplay.innerHTML = lastAutoTrendHtml;
+                        trendDisplay.style.display = 'inline-flex';
+                        trendDisplay.style.borderColor = 'transparent';
                     }
+
                     tempChart.update();
                     return;
                 }
 
-                tempChart = new Chart(tempChartCanvas.getContext('2d'), {
+                const ctx = tempChartCanvas.getContext('2d');
+
+                tempChart = new Chart(ctx, {
                     type: 'line',
                     data: {
                         labels,
@@ -898,10 +979,22 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
                             {
                                 label: 'Actual',
                                 data: dataHistory,
-                                borderColor: '#2563eb', // Brand color
+                                borderColor: '#2563eb',
                                 tension: 0.25,
-                                pointRadius: 0,
-                                borderWidth: 2
+                                borderWidth: 2,
+                                // Show dot only if selected
+                                pointRadius: (ctx) => {
+                                    const i = ctx.dataIndex;
+                                    if (i === selection.p1 || i === selection.p2) return 6;
+                                    return 0;
+                                },
+                                pointBackgroundColor: (ctx) => {
+                                    const i = ctx.dataIndex;
+                                    if (i === selection.p1 || i === selection.p2) return '#8b5cf6';
+                                    return '#2563eb';
+                                },
+                                pointHoverRadius: 6,
+                                pointHitRadius: 20 // Make it easier to click
                             },
                             {
                                 label: 'Trend (1h)',
@@ -911,13 +1004,24 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
                                 borderDash: [4, 4],
                                 pointRadius: 0,
                                 tension: 0
+                            },
+                            {
+                                label: 'Selection',
+                                data: new Array(dataHistory.length).fill(null),
+                                borderColor: '#8b5cf6',
+                                borderWidth: 2,
+                                borderDash: [2, 2],
+                                pointRadius: 0,
+                                tension: 0
                             }
                         ]
                     },
                     options: {
                         responsive: true,
                         maintainAspectRatio: false,
+                        // CRITICAL CHANGE: mode index + intersect false makes clicking the "column" works
                         interaction: { mode: 'index', intersect: false },
+                        onClick: (e, elements, chart) => handleChartClick(e, elements, chart),
                         plugins: {
                             legend: { display: false },
                             tooltip: {
@@ -925,6 +1029,7 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
                                     label: (ctx) => {
                                         let label = ctx.dataset.label || '';
                                         if (label) label += ': ';
+                                        if (ctx.parsed.y === null) return null;
                                         return label + ctx.parsed.y.toFixed(2) + ' °C';
                                     }
                                 }
@@ -944,7 +1049,6 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 });
             }
 
-            // --- REPLACE fetchHistoryAndRender WITH THIS ---
             async function fetchHistoryAndRender() {
                 try {
                     const res = await fetch('?action=load_history&_=' + Date.now());
@@ -954,7 +1058,7 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
 
                     const labels = [];
                     const values = [];
-                    const rawPoints = []; // Needed for regression math
+                    rawHistoryPoints = [];
 
                     for (const [iso, tStr] of j.points) {
                         const val = Number(tStr);
@@ -964,54 +1068,50 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
 
                         labels.push(`${hh}:${mm}`);
                         values.push(val);
-                        rawPoints.push({ t: dt.getTime(), y: val });
+                        rawHistoryPoints.push({ t: dt.getTime(), y: val });
                     }
 
-                    // --- Trend Calculation Logic ---
+                    // --- Auto 1h Trend Logic ---
                     const trendDisplay = document.getElementById('trendDisplay');
-                    const trendData = new Array(values.length).fill(null); // Blank dataset for chart
+                    const trendData = new Array(values.length).fill(null);
+                    lastAutoTrendHtml = ''; // Reset global auto string
 
-                    if (rawPoints.length > 1) {
-                        const nowMs = rawPoints[rawPoints.length - 1].t; // Use last data point time as "now" reference
-                        const oneHourMs = 3600 * 1000;
-
-                        // Filter points within the last hour relative to the latest data
-                        const recentPoints = rawPoints.filter(p => p.t >= (nowMs - oneHourMs));
+                    if (rawHistoryPoints.length > 1) {
+                        const nowMs = rawHistoryPoints[rawHistoryPoints.length - 1].t;
+                        const recentPoints = rawHistoryPoints.filter(p => p.t >= (nowMs - 3600000));
 
                         if (recentPoints.length >= 2) {
                             const reg = calculateLinearRegression(recentPoints);
-
                             if (reg) {
-                                // 1. Update UI Text
-                                const slopePerHour = reg.slopePerSec * 3600; // Convert slope/sec to slope/hour
+                                const slopePerHour = reg.slopePerSec * 3600;
                                 const symbol = slopePerHour > 0 ? '↗' : (slopePerHour < 0 ? '↘' : '→');
-                                const color = slopePerHour > 0 ? '#ef4444' : (slopePerHour < 0 ? '#2563eb' : '#6b7280'); // Red if rising, Blue if falling
+                                const color = slopePerHour > 0 ? '#ef4444' : (slopePerHour < 0 ? '#2563eb' : '#6b7280');
 
-                                trendDisplay.innerHTML = `<span style="color:${color}; font-size:16px; margin-right:4px;">${symbol}</span> ${Math.abs(slopePerHour).toFixed(1)} °C/h`;
-                                trendDisplay.style.display = 'inline-flex';
+                                lastAutoTrendHtml = `<span style="color:${color}; font-size:16px; margin-right:4px;">${symbol}</span> ${Math.abs(slopePerHour).toFixed(1)} °C/h`;
 
-                                // 2. Generate Trend Line for Chart
-                                // We map the regression line back to the array indices of the recent points
-                                const startIndex = rawPoints.indexOf(recentPoints[0]);
+                                // If user hasn't selected anything, show auto trend
+                                if (selection.p1 === null) {
+                                    trendDisplay.innerHTML = lastAutoTrendHtml;
+                                    trendDisplay.style.display = 'inline-flex';
+                                    trendDisplay.style.borderColor = 'transparent';
+                                }
 
-                                for (let i = startIndex; i < rawPoints.length; i++) {
-                                    const p = rawPoints[i];
-                                    const secondsFromStart = (p.t - reg.startX) / 1000;
-                                    const trendVal = reg.intercept + (reg.slopePerSec * secondsFromStart);
-                                    trendData[i] = trendVal;
+                                const startIndex = rawHistoryPoints.indexOf(recentPoints[0]);
+                                for (let i = startIndex; i < rawHistoryPoints.length; i++) {
+                                    const p = rawHistoryPoints[i];
+                                    const secs = (p.t - reg.startX) / 1000;
+                                    trendData[i] = reg.intercept + (reg.slopePerSec * secs);
                                 }
                             }
-                        } else {
-                            trendDisplay.style.display = 'none';
                         }
+                    }
+                    if (!lastAutoTrendHtml && selection.p1 === null) {
+                        trendDisplay.style.display = 'none';
                     }
 
                     buildTempChart(labels, values, trendData);
-                } catch (e) {
-                    console.error("History load failed", e);
-                }
+                } catch (e) { console.error(e); }
             }
-
 
 
             let state = {
