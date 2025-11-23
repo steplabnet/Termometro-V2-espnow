@@ -1,13 +1,6 @@
 // src/main.cpp — Wemos D1 mini (ESP8266)
-// Thermostat + Mobile UI + Wi-Fi setup + 0.5°C hysteresis + Arduino OTA (PlatformIO espota)
-// - UI at "/": presets & +/- (polling never overwrites editing)
-// - Wi-Fi setup at "/wifi": scan/select/save (LittleFS /wifi.json). Reboots after saving.
-// - Control logic: 0.5°C hysteresis (ON <= sp-0.25, OFF >= sp+0.25)
-// - OTA: Upload via PlatformIO using mDNS (esp-thermo.local) or device IP.
-// - Remote setpoint: fetch via get_setpoint.php; adopt & persist only if changed.
-// - ESP-NOW payload: only {"heater":"ON"} or {"heater":"OFF"}
-// - Use ACK from relay to show Heat ON/OFF in UI and to set cald=0/1 in HTTP
-// - *** Performance: non-blocking DS18B20, skip HTTPS in AP mode, tight timeouts, AP keeps radio awake.
+// Thermostat + Mobile UI + Wi-Fi setup + 0.5°C hysteresis + Arduino OTA
+// + WATCHDOG ADDED
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -23,6 +16,7 @@
 #include <ESP8266HTTPClient.h>
 #include <WiFiClientSecureBearSSL.h>
 #include <math.h>
+#include <Ticker.h> // <--- NEW: Required for Watchdog
 
 extern "C"
 {
@@ -38,14 +32,14 @@ static const char *HOSTNAME = "esp-thermo";
 static bool sleepModeActive = false;    // we're in "setpoint <= 10" mode
 static bool sleepWaitingRemote = false; // we are waiting for a successful remote reply
 
-// OPTIONAL: OTA password (set to non-empty to require it for uploads)
-static const char *OTA_PASS = ""; // e.g. "mySecret123"
+// OPTIONAL: OTA password
+static const char *OTA_PASS = "";
 
-// Mutable Wi-Fi creds (loaded from /wifi.json or default)
+// Mutable Wi-Fi creds
 static String g_wifiSsid;
 static String g_wifiPass;
 
-// ===== Timezone / NTP (Europe/Rome) =====
+// ===== Timezone / NTP =====
 static const char *TZ_INFO = "CET-1CEST,M3.5.0,M10.5.0/3";
 static const char *NTP_1 = "pool.ntp.org";
 static const char *NTP_2 = "time.google.com";
@@ -55,34 +49,34 @@ static const char *NTP_2 = "time.google.com";
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 DeviceAddress g_dsAddr{};
-bool g_haveSensor = false;  // any device present
-bool g_haveAddress = false; // address for index 0 resolved
+bool g_haveSensor = false;
+bool g_haveAddress = false;
 
-// --- DS18B20 async conversion state (non-blocking) ---
+// --- DS18B20 async conversion state ---
 static uint32_t g_dsReqAt = 0;
 static bool g_dsPending = false;
 
-// ===== ESP-NOW target (broadcast by default) =====
+// ===== ESP-NOW target =====
 static uint8_t TARGET[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
-// ===== Fixed setpoint state (persisted) =====
-static float g_fixedSetpoint = 19.0f; // default: "on" preset
-static String g_fixedPreset = "on";   // "off" | "on" | "away" | "custom" | "remote"
-static bool g_fixedEnabled = true;    // always use fixed setpoint for control
+// ===== Fixed setpoint state =====
+static float g_fixedSetpoint = 19.0f;
+static String g_fixedPreset = "on";
+static bool g_fixedEnabled = true;
 
-// ===== Live telemetry for web UI =====
+// ===== Live telemetry =====
 volatile float g_lastTempC = NAN;
-volatile uint8_t g_lastAction = 0; // local decision: 1=heat ON, 0=OFF
+volatile uint8_t g_lastAction = 0;
 
-// ===== ACK state from relay (drives UI + HTTP cald) =====
+// ===== ACK state =====
 static bool g_haveAck = false;
 static bool g_ackRelayOn = false;
 static uint32_t g_ackLastMs = 0;
 
-// ===== Hysteresis (°C, total band) =====
-static const float HYST_BAND_C = 0.5f; // +/- 0.25°C around setpoint
+// ===== Hysteresis =====
+static const float HYST_BAND_C = 0.5f;
 
-// ===== Remote "cesana" reporting (HTTPS GET) =====
+// ===== Remote "cesana" reporting =====
 static uint32_t g_lastHttpMs = 0;
 static const uint32_t HTTP_MIN_INTERVAL_MS = 1500;
 static bool g_remoteOk = false;
@@ -96,29 +90,53 @@ static bool g_apActive = false;
 // ===== Web server =====
 ESP8266WebServer server(80);
 
-// Pending reboot after saving Wi-Fi
+// Pending reboot
 static bool g_pendingRestart = false;
 static uint32_t g_restartAtMs = 0;
 
-// ===== Persist/write minimization for fixed setpoint =====
+// ===== Persist/write minimization =====
 static float g_lastSavedSetpoint = NAN;
 static uint32_t g_lastFsWriteMs = 0;
-static const uint32_t FS_WRITE_MIN_GAP_MS = 30000; // 30s between FS writes
-static const float SP_EPS = 0.05f;                 // consider same within ±0.05°C
+static const uint32_t FS_WRITE_MIN_GAP_MS = 30000;
+static const float SP_EPS = 0.05f;
+
+// ===== WATCHDOG VARIABLES =====
+Ticker g_wdtTicker;
+volatile bool g_wdtFed = false;
+
+// This callback runs via Ticker interrupt. If the main loop hasn't
+// set g_wdtFed to true since the last check, we force a hardware reset.
+void IRAM_ATTR wdtCallback()
+{
+  if (g_wdtFed)
+  {
+    g_wdtFed = false; // Reset flag, wait for next feed from loop()
+  }
+  else
+  {
+    // Main loop is stuck (e.g., BearSSL hang, Infinite loop).
+    // Force a Hardware Watchdog Reset by disabling interrupts and spinning.
+    // This is more reliable than ESP.restart() in a hung state.
+    ets_printf("\n[WDT] Watchdog bite! System hung. Resetting...\n");
+    ESP.wdtDisable();
+    while (1)
+    {
+    };
+  }
+}
 
 static void startApFallback()
 {
   if (g_apActive)
-    return; // already running
+    return;
   WiFi.mode(WIFI_AP_STA);
-  wifi_set_sleep_type(NONE_SLEEP_T); // keep AP responsive
+  wifi_set_sleep_type(NONE_SLEEP_T);
   const char *apSsid = "Termometro";
   const char *apPass = "12345678";
-  bool ok = WiFi.softAP(apSsid, apPass, /*channel*/ 1);
+  bool ok = WiFi.softAP(apSsid, apPass, 1);
   g_apActive = ok;
   Serial.printf("[WiFi] AP fallback %s (SSID=%s, ch=%d, IP=%s)\n",
                 ok ? "started" : "FAILED", apSsid, 1, WiFi.softAPIP().toString().c_str());
-  // Keep ESP-NOW on the same channel as AP
   wifi_set_channel(1);
 }
 
@@ -143,7 +161,6 @@ static void onDataSent(uint8_t *mac, uint8_t status)
   Serial.println(status == 0 ? "OK" : "ERR");
 }
 
-// receive ACKs from relay
 static void onDataRecv(uint8_t *mac, uint8_t *data, uint8_t len)
 {
   Serial.print("[RX] from ");
@@ -156,26 +173,17 @@ static void onDataRecv(uint8_t *mac, uint8_t *data, uint8_t len)
   JsonDocument doc;
   DeserializationError e = deserializeJson(doc, data, len);
   if (e)
-  {
-    Serial.printf("[RX] JSON error: %s\n", e.c_str());
     return;
-  }
 
-  // Expected: {"ack":"ON"|"OFF","relay":0|1,"ok":true}
   const char *ack = doc["ack"] | nullptr;
   int relay = doc["relay"] | -1;
   bool ok = doc["ok"] | false;
   if (!ok || relay < 0)
-  {
-    Serial.println("[RX] Missing ok/relay in ACK");
     return;
-  }
 
   g_haveAck = true;
   g_ackRelayOn = (relay == 1) || (ack && strcmp(ack, "ON") == 0);
   g_ackLastMs = millis();
-
-  Serial.printf("[RX] ACK parsed -> relay=%d (%s)\n", relay, g_ackRelayOn ? "ON" : "OFF");
 }
 
 // ======== Thermostat HTML (UI) ========
@@ -218,7 +226,6 @@ body{
   border:1px solid var(--border); padding:8px 10px; border-radius:999px; min-height:var(--tap);
   display:inline-flex; align-items:center; gap:8px;
 }
-
 .content{ padding:var(--pad); display:grid; gap:12px }
 .card{
   border:1px solid var(--border); border-radius:var(--radius); padding:var(--pad);
@@ -226,11 +233,9 @@ body{
   box-shadow:0 8px 26px rgba(26,166,183,.12);
 }
 .row{display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap}
-
 .kpi{display:flex; align-items:baseline; gap:10px; min-height:var(--tap)}
 .kpi .label{color:var(--muted); font-size:clamp(13px,2.2vw,14px)}
 .kpi .value{font-size:clamp(28px,9vw,44px); font-weight:900}
-
 .controls{display:flex; align-items:center; gap:10px; flex-wrap:wrap}
 .btn{
   border:1px solid var(--border); background:linear-gradient(180deg,#faffff,#e9fffb);
@@ -242,7 +247,6 @@ body{
 .btn:active{transform:translateY(1px)}
 .btn.primary{background:linear-gradient(180deg,#bff6ec,#8df0dc); border-color:#8de9d8}
 .btn.pill{border-radius:999px}
-
 .presetbar{
   display:flex; gap:10px; flex-wrap:nowrap; overflow-x:auto; padding-bottom:2px; margin:0 -4px;
   scrollbar-width:thin;
@@ -255,18 +259,14 @@ body{
 }
 .preset.active{outline:2px solid var(--accent); box-shadow:0 0 0 3px rgba(26,166,183,.15) inset}
 .hint{font-size:clamp(12px,2.4vw,13px); color:var(--muted); min-height:var(--tap); display:flex; align-items:center}
-
 .dot{width:10px;height:10px;border-radius:50%;display:inline-block;margin-right:6px; vertical-align:middle}
 .on{background:var(--ok)} .off{background:#9aaeb5}
-
-/* Responsive stack for small screens */
 @media (max-width: 480px){
   .row{flex-direction:column; align-items:stretch}
   .controls{justify-content:space-between}
   .badges{width:100%; justify-content:flex-end}
   .nav{flex-wrap:wrap}
 }
-  /* --- Mobile optimizations ------------------------------------ */
 .header, .content { padding-left: calc(var(--pad) + env(safe-area-inset-left)); padding-right: calc(var(--pad) + env(safe-area-inset-right)); }
 .badges { flex: 1; justify-content: flex-end }
 .btn.pill#minus, .btn.pill#plus { width: var(--tap); height: var(--tap); padding: 0; font-size: 24px; display: inline-flex; align-items: center; justify-content: center; }
@@ -301,7 +301,6 @@ body{
       <div class="kpi"><div class="label">Actual</div><div class="value" id="actual">--.-°C</div></div>
       <div class="kpi"><div class="label">Setpoint</div><div class="value" id="sp">--.-°C</div></div>
     </div>
-
     <div class="card">
       <div class="row" style="gap:14px">
         <div class="controls">
@@ -319,18 +318,14 @@ body{
     </div>
   </div>
 </div>
-
 <script>
-// Poll only Actual/Heat/time; never overwrite setpoint/preset while editing.
 let sp = 19.0;
 let preset = 'on';
 let saveTimer = null;
 const SAVE_DEBOUNCE_MS = 350;
-
 function fmt(v){ return Number(v).toFixed(1) + '°C'; }
 function setActivePreset(name){ document.querySelectorAll('.preset').forEach(b=> b.classList.toggle('active', b.dataset.name===name)); }
 function showState(msg){ document.getElementById('state').textContent = msg; }
-
 async function loadFixed(){
   try{
     const r = await fetch('/api/fixed'); if (!r.ok) throw new Error('http');
@@ -347,7 +342,6 @@ async function loadFixed(){
     showState('Preset: custom');
   }
 }
-
 async function savePreset(name){
   try{
     showState('Saving preset…');
@@ -362,7 +356,6 @@ async function savePreset(name){
     }else{ showState('Save failed'); }
   }catch(e){ showState('Save failed'); }
 }
-
 async function saveCustomNow(){
   try{
     const r = await fetch('/api/fixed',{ method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({ setpoint: sp }) });
@@ -381,8 +374,6 @@ function queueSaveCustom(){
   showState('Saving…');
   saveTimer = setTimeout(saveCustomNow, SAVE_DEBOUNCE_MS);
 }
-
-// Poll status (uses j.action which is ACK-based when available)
 async function tick(){
   try{
     const r = await fetch('/api/status'); if (!r.ok) return;
@@ -395,7 +386,6 @@ async function tick(){
       const d=new Date(j.epoch*1000);
       document.getElementById('time').textContent=d.toLocaleString();
     }
-    // Caldaia badge
     const hasAck = !!j.ackAvailable;
     let ackFresh = false;
     if (hasAck) {
@@ -404,8 +394,6 @@ async function tick(){
     }
     document.getElementById('calDot').className = 'dot ' + (ackFresh ? 'on' : 'off');
     document.getElementById('calText').textContent = ackFresh ? 'Caldaia: OK' : (hasAck ? 'Caldaia: stale' : 'Caldaia: —');
-
-    // Wi-Fi badge
     const wb = j.wifi || {};
     const wifiOn = !!wb.connected;
     const apOn   = !!wb.ap;
@@ -422,7 +410,6 @@ async function tick(){
     document.getElementById('wifiText').textContent = wifiLabel;
   }catch(e){}
 }
-
 document.getElementById('minus').onclick = ()=>{
   if (!Number.isFinite(sp)) sp = 19.0;
   sp = Math.max(5, Math.round((sp - 0.5) * 10) / 10);
@@ -439,7 +426,6 @@ document.getElementById('plus').onclick  = ()=>{
 };
 document.getElementById('save').onclick  = ()=> saveCustomNow();
 document.querySelectorAll('.preset').forEach(b=> b.onclick = ()=> savePreset(b.dataset.name));
-
 loadFixed();
 tick();
 setInterval(tick, 1500);
@@ -447,7 +433,6 @@ setInterval(tick, 1500);
 </body></html>
 )HTML";
 
-// ======== Wi-Fi Setup HTML ========
 const char WIFI_HTML[] PROGMEM = R"HTML(
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"/>
@@ -535,7 +520,6 @@ select, input { font-size: 16px; min-height: calc(var(--tap) + 6px) }
         </div>
       </div>
     </div>
-
     <div class="card">
       <div style="display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap">
         <div class="kv">
@@ -596,7 +580,6 @@ loadScan(); loadCurrent();
 </body></html>
 )HTML";
 
-// ====== Persistence for fixed setpoint ======
 static const char *FIXED_PATH = "/fixed_setpoint.json";
 static const char *WIFI_PATH = "/wifi.json";
 
@@ -706,23 +689,11 @@ static bool saveWifiCreds(const String &ssid, const String &pass)
   return ok;
 }
 
-// ====== (Legacy) 7×24 schedule kept but unused ======
-float setpoints[7][24];
-static void initLegacySchedule()
-{
-  for (int d = 0; d < 7; ++d)
-    for (int h = 0; h < 24; ++h)
-      setpoints[d][h] = g_fixedSetpoint;
-}
-
 // ===== HTTPS GET to cesana.steplab.net =====
-static bool cesanaReportAndFetch(float tempC, bool heatingFromAck /* true=ON, false=OFF */)
+static bool cesanaReportAndFetch(float tempC, bool heatingFromAck)
 {
-  // Only report in STA mode, not in AP
   if (WiFi.status() != WL_CONNECTED || g_apActive)
-  {
     return false;
-  }
 
   String url = "https://cesana.steplab.net/get_setpoint.php?temp=";
   url += String(tempC, 1);
@@ -731,10 +702,10 @@ static bool cesanaReportAndFetch(float tempC, bool heatingFromAck /* true=ON, fa
 
   std::unique_ptr<BearSSL::WiFiClientSecure> client(new BearSSL::WiFiClientSecure);
   client->setInsecure();
-  client->setTimeout(600); // tight socket timeout (ms)
+  client->setTimeout(600);
 
   HTTPClient https;
-  https.setTimeout(800); // total request timeout (ms)
+  https.setTimeout(800);
   https.setReuse(false);
 
   Serial.printf("[HTTP] GET %s\n", url.c_str());
@@ -762,12 +733,8 @@ static bool cesanaReportAndFetch(float tempC, bool heatingFromAck /* true=ON, fa
   JsonDocument doc;
   DeserializationError err = deserializeJson(doc, payload);
   if (err)
-  {
-    Serial.printf("[JSON-HTTP] Parse error: %s\n", err.c_str());
-    Serial.print("[JSON-HTTP] Raw: ");
-    Serial.println(payload);
     return false;
-  }
+
   g_remoteOk = doc["ok"] | false;
   g_remoteMode = (const char *)(doc["mode"] | "");
   g_remoteSetpoint = doc["setpoint"] | NAN;
@@ -786,7 +753,6 @@ static bool cesanaReportAndFetch(float tempC, bool heatingFromAck /* true=ON, fa
                 g_remoteOk ? "true" : "false", g_remoteMode.c_str(), g_remoteSetpoint, g_remoteActual,
                 g_remoteHeating ? "ON" : "OFF", (isnan(g_remoteDelta) ? NAN : g_remoteDelta));
 
-  // Apply remote setpoint if provided
   if (g_remoteOk && !isnan(g_remoteSetpoint) && g_remoteSetpoint >= 5.0f && g_remoteSetpoint <= 35.0f)
   {
     if (fabsf(g_remoteSetpoint - g_fixedSetpoint) >= SP_EPS)
@@ -813,7 +779,6 @@ void handleWifiPage()
   server.send_P(200, "text/html", WIFI_HTML);
 }
 
-// Fixed setpoint APIs (unchanged)
 void handleGetFixed()
 {
   JsonDocument doc;
@@ -920,8 +885,6 @@ void handleStatus()
 {
   time_t now = time(nullptr);
   float sp = g_fixedEnabled ? g_fixedSetpoint : 19.0f;
-
-  // UI action: prefer ACK relay state when available, else local decision
   uint8_t actionForUi = g_haveAck ? (g_ackRelayOn ? 1 : 0) : g_lastAction;
 
   JsonDocument doc;
@@ -932,15 +895,12 @@ void handleStatus()
     doc["temp"] = g_lastTempC;
   doc["setpoint"] = sp;
   doc["preset"] = g_fixedPreset;
-  doc["action"] = actionForUi; // drives Heat ON/OFF badge
+  doc["action"] = actionForUi;
   doc["hysteresis"] = HYST_BAND_C;
-
-  // ACK/Caldaia info
   doc["ackAvailable"] = g_haveAck;
   if (g_haveAck)
     doc["ackAgeMs"] = (uint32_t)(millis() - g_ackLastMs);
 
-  // Remote (unchanged)
   if (isnan(g_remoteSetpoint))
     doc["remoteSetpoint"] = nullptr;
   else
@@ -957,11 +917,10 @@ void handleStatus()
   else
     doc["remoteDelta"] = g_remoteDelta;
 
-  // Wi-Fi status + AP info
   JsonObject w = doc["wifi"].to<JsonObject>();
   bool staUp = (WiFi.status() == WL_CONNECTED);
   w["connected"] = staUp;
-  w["ap"] = g_apActive; // true if AP is running
+  w["ap"] = g_apActive;
   if (staUp)
   {
     w["ssid"] = WiFi.SSID();
@@ -982,7 +941,6 @@ void handleStatus()
   server.send(200, "application/json", out);
 }
 
-// Quick 1-Wire bus inspection (debug)
 void handleOwBus()
 {
   sensors.requestTemperatures();
@@ -1010,7 +968,6 @@ void handleOwBus()
   server.send(200, "application/json", out);
 }
 
-// ===== Wi-Fi API handlers =====
 void handleWifiScan()
 {
   int n = WiFi.scanNetworks(false, true);
@@ -1092,7 +1049,7 @@ static void connectWiFi()
 {
   Serial.printf("[TX] Connecting to SSID='%s' ...\n", g_wifiSsid.c_str());
   WiFi.mode(WIFI_STA);
-  wifi_set_sleep_type(NONE_SLEEP_T); // keep radio responsive
+  wifi_set_sleep_type(NONE_SLEEP_T);
   WiFi.persistent(false);
   WiFi.disconnect(true);
   delay(100);
@@ -1109,14 +1066,14 @@ static void connectWiFi()
 
   if (WiFi.status() == WL_CONNECTED)
   {
-    g_apActive = false; // we’re on STA now
+    g_apActive = false;
     Serial.printf("[TX] Wi-Fi OK. IP=%s  RSSI=%d dBm  CH=%d\n",
                   WiFi.localIP().toString().c_str(), WiFi.RSSI(), WiFi.channel());
   }
   else
   {
     Serial.println("[TX] Wi-Fi timeout; starting AP fallback so UI is reachable.");
-    startApFallback(); // start AP right away
+    startApFallback();
   }
 }
 
@@ -1179,10 +1136,9 @@ static void setupOTA()
   Serial.printf("[OTA] Ready: %s.local:8266 (auth:%s)\n", HOSTNAME, (OTA_PASS && OTA_PASS[0] ? "yes" : "no"));
 }
 
-// ===== Control helper =====
 static float getActiveSetpoint() { return g_fixedEnabled ? g_fixedSetpoint : 19.0f; }
 
-// ======== DS18B20 Robust Bring-Up (BEFORE Wi-Fi) ========
+// ======== DS18B20 ========
 static uint8_t rom[8];
 static bool onewire_find_any()
 {
@@ -1194,7 +1150,6 @@ static bool onewire_find_any()
 
 static uint16_t ds_tconv_ms()
 {
-  // 9/10/11/12-bit => ~94/188/375/750 ms
   uint8_t res = g_haveAddress ? sensors.getResolution(g_dsAddr) : sensors.getResolution();
   switch (res)
   {
@@ -1214,8 +1169,8 @@ static void ds_init_bus_and_probe_pre_wifi()
   pinMode(ONE_WIRE_BUS, INPUT_PULLUP);
   delay(200);
   sensors.begin();
-  sensors.setWaitForConversion(false); // <<< async conversions
-  sensors.setResolution(12);           // (optional: 10 for faster)
+  sensors.setWaitForConversion(false);
+  sensors.setResolution(12);
   sensors.requestTemperatures();
   delay(10);
   bool found = onewire_find_any();
@@ -1240,14 +1195,10 @@ static void ds_init_bus_and_probe_pre_wifi()
       sensors.setResolution(g_dsAddr, 12);
     }
     else
-    {
       Serial.println("[DS18B20] Using by-index mode until address resolves.");
-    }
   }
   else
-  {
     Serial.println("[DS18B20] No sensor found on D4. Will keep scanning in loop().");
-  }
 }
 
 static bool ds_try_hotplug()
@@ -1273,17 +1224,16 @@ static bool ds_poll(float &outC)
 
   if (!g_dsPending)
   {
-    sensors.requestTemperatures(); // start conversion
+    sensors.requestTemperatures();
     g_dsReqAt = millis();
     g_dsPending = true;
     return false;
   }
   if ((uint32_t)(millis() - g_dsReqAt) < ds_tconv_ms())
-    return false; // still converting (non-blocking)
+    return false;
 
-  // ready to read without starting a new conversion
   float t = g_haveAddress ? sensors.getTempC(g_dsAddr) : sensors.getTempCByIndex(0);
-  g_dsPending = false; // allow next kick
+  g_dsPending = false;
   if (t == DEVICE_DISCONNECTED_C || t < -55 || t > 125)
     return false;
   outC = t;
@@ -1304,15 +1254,13 @@ void setup()
   loadFixedSetpoint();
   g_lastSavedSetpoint = g_fixedSetpoint;
   loadWifiCreds();
-  initLegacySchedule();
   ds_init_bus_and_probe_pre_wifi();
 
   connectWiFi();
   setupTimeNTP();
   setupMDNS();
-  setupOTA(); // enable OTA when Wi-Fi is ready
+  setupOTA();
 
-  // Web routes
   server.on("/", HTTP_GET, handleIndex);
   server.on("/wifi", HTTP_GET, handleWifiPage);
   server.on("/api/fixed", HTTP_GET, handleGetFixed);
@@ -1326,7 +1274,6 @@ void setup()
   server.begin();
   Serial.println("[WEB] HTTP server started on port 80");
 
-  // ESPNOW on AP channel
   int channel = WiFi.channel();
   if (channel <= 0)
   {
@@ -1336,7 +1283,6 @@ void setup()
   wifi_set_channel(channel);
   Serial.printf("[TX] Locked radio to channel %d\n", channel);
   int rc = esp_now_init();
-  Serial.printf("[TX] esp_now_init -> %d\n", rc);
   if (rc != 0)
   {
     Serial.println("[TX] ESPNOW init failed; rebooting...");
@@ -1348,57 +1294,52 @@ void setup()
   esp_now_register_recv_cb(onDataRecv);
 
   rc = esp_now_add_peer(TARGET, ESP_NOW_ROLE_COMBO, channel, NULL, 0);
-  Serial.print("[TX] add_peer(");
-  printMac(TARGET);
-  Serial.print(") -> ");
-  Serial.println(rc);
-
-  Serial.printf("[TX] STA MAC: %s\n", WiFi.macAddress().c_str());
   Serial.printf("[TX] Ready. Open http://%s.local or http://%s\n", HOSTNAME, WiFi.localIP().toString().c_str());
+
+  // === ENABLE WATCHDOG ===
+  // 20s timeout to allow for slow HTTPS/BearSSL without triggering falsely
+  g_wdtTicker.attach(20.0, wdtCallback);
+  Serial.println("[WDT] OS Watchdog enabled (20s timeout)");
 }
 
 // ===================== LOOP =====================
-// --- Strict 0.5 °C hysteresis (±0.25 °C): ON when temp < sp-0.25, OFF when temp > sp+0.25
 static inline uint8_t apply_hysteresis(float temp, float sp, uint8_t prev)
 {
-  const float half = HYST_BAND_C * 0.5f; // 0.25
-  const float on_th = sp - half;         // below => ON
-  const float off_th = sp + half;        // above => OFF
+  const float half = HYST_BAND_C * 0.5f;
+  const float on_th = sp - half;
+  const float off_th = sp + half;
   if (temp >= 19.8)
     return 0;
   if (temp < on_th)
-    return 1; // strictly less
+    return 1;
   if (temp > off_th)
-    return 0; // strictly greater
-
-  return prev; // inside band -> hold
+    return 0;
+  return prev;
 }
 
 void loop()
 {
-  // Service web server aggressively for snappy UI
+  // FEED WATCHDOG: Signal that the loop is alive
+  g_wdtFed = true;
+
   for (uint8_t i = 0; i < 3; ++i)
   {
     server.handleClient();
     yield();
   }
 
-  // ===== Connectivity management (AP fallback + 2-minute STA retries) =====
   static bool prevSta = false;
   static uint32_t lastStaRetryMs = 0;
-
   bool sta = (WiFi.status() == WL_CONNECTED);
 
-  // If STA just came up, (re)enable mDNS/OTA and mark AP inactive flag
   if (sta && !prevSta)
   {
     Serial.println("[WiFi] STA connected — re-initializing mDNS/OTA");
     setupMDNS();
     setupOTA();
-    g_apActive = false; // flag only; you can WiFi.softAPdisconnect(true) if you want to shut AP
+    g_apActive = false;
   }
 
-  // If STA is down, ensure AP is available and retry STA every 120s (non-blocking)
   if (!sta)
   {
     if (!g_apActive)
@@ -1407,20 +1348,19 @@ void loop()
       startApFallback();
     }
     if (millis() - lastStaRetryMs >= 120000UL)
-    { // every 2 minutes
+    {
       lastStaRetryMs = millis();
       Serial.println("[WiFi] STA down — retrying connection with saved credentials");
       WiFi.mode(WIFI_STA);
       wifi_set_sleep_type(NONE_SLEEP_T);
       WiFi.persistent(false);
-      WiFi.disconnect(true); // clear old state
+      WiFi.disconnect(true);
       delay(50);
       WiFi.hostname(HOSTNAME);
-      WiFi.begin(g_wifiSsid.c_str(), g_wifiPass.c_str()); // async; no blocking wait
+      WiFi.begin(g_wifiSsid.c_str(), g_wifiPass.c_str());
     }
   }
 
-  // OTA & mDNS only when STA is up
   if (sta)
   {
     MDNS.update();
@@ -1428,7 +1368,6 @@ void loop()
   }
   prevSta = sta;
 
-  // Handle deferred reboot after saving Wi-Fi
   if (g_pendingRestart && (int32_t)(millis() - g_restartAtMs) >= 0)
   {
     Serial.println("[SYS] Rebooting to apply new Wi-Fi credentials...");
@@ -1436,42 +1375,30 @@ void loop()
     ESP.restart();
   }
 
-  // ===== Sensor / Control / Reporting (non-blocking cadence) =====
   static uint32_t tCtl = 0;
   if (millis() - tCtl > 200)
-  { // ~5 Hz
+  {
     tCtl = millis();
 
-    // Hot-plug check
     if (!g_haveSensor)
-    {
       (void)ds_try_hotplug();
-    }
 
-    // Non-blocking DS18B20 poll
     float freshC;
     bool gotFresh = ds_poll(freshC);
     if (gotFresh)
-      g_lastTempC = freshC; // - 3.0f;
+      g_lastTempC = freshC;
 
-    // Decide action with strict hysteresis if we have any valid temperature
     const bool haveTemp = isfinite(g_lastTempC);
     float sp = getActiveSetpoint();
     uint8_t action = g_lastAction;
 
     if (haveTemp)
-    {
       action = apply_hysteresis(g_lastTempC, sp, g_lastAction);
-    }
     else
-    {
-      action = 0; // sensor invalid -> safe OFF
-    }
+      action = 0;
     g_lastAction = action;
 
-    // === ESP-NOW TX to relay: {"heater":"ON"/"OFF"} ===
     static long timerAction = millis();
-
     {
       static String azione = "OFF";
       static uint32_t onStartMs = 0;
@@ -1479,25 +1406,21 @@ void loop()
       static uint32_t forcedOffUntil = 0;
 
       if (millis() - timerAction > 60000)
-      { // update every minute
-        // --- Safety logic: auto OFF after 1 hour ON, cool down 30 minutes ---
+      {
         if (azione == "ON")
         {
           if (onStartMs == 0)
-            onStartMs = millis(); // mark when ON started
+            onStartMs = millis();
           if (!forcedOff && millis() - onStartMs >= 3600000UL)
-          { // 1 hour
+          {
             forcedOff = true;
-            forcedOffUntil = millis() + 1800000UL; // 30 minutes OFF
+            forcedOffUntil = millis() + 1800000UL;
             Serial.println("[SAFETY] Heater forced OFF for 30 minutes");
           }
         }
         else
-        {
-          onStartMs = 0; // reset ON timer when OFF
-        }
+          onStartMs = 0;
 
-        // If currently under forced OFF period
         if (forcedOff)
         {
           if (millis() >= forcedOffUntil)
@@ -1506,21 +1429,17 @@ void loop()
             Serial.println("[SAFETY] Forced OFF period ended, normal control resumed");
           }
           else
-          {
-            azione = "OFF"; // keep OFF during safety period
-          }
+            azione = "OFF";
         }
         else
-        {
           azione = (action == 1) ? "ON" : "OFF";
-        }
 
         timerAction = millis();
       }
 
       JsonDocument jtx;
       jtx["heater"] = azione;
-      jtx["id"] = 12; // indirizzo della caldaia
+      jtx["id"] = 12;
       char buf[32];
       size_t n = serializeJson(jtx, buf, sizeof(buf));
       int rc = esp_now_send(TARGET, (uint8_t *)buf, (int)n);
@@ -1528,23 +1447,20 @@ void loop()
       Serial.println(rc == 0 ? "OK" : String(rc));
     }
 
-    // === HTTPS report every 1.5s (min), use ACK if available ===
     if (haveTemp && (millis() - g_lastHttpMs >= HTTP_MIN_INTERVAL_MS))
     {
       bool heatingForReport = g_haveAck ? g_ackRelayOn : (action == 1);
-      bool ok = cesanaReportAndFetch(g_lastTempC, heatingForReport); // <- capture result
+      bool ok = cesanaReportAndFetch(g_lastTempC, heatingForReport);
       g_lastHttpMs = millis();
 
-      // If we're in sleep mode and we were waiting for the remote -> we can sleep now
       if (sleepModeActive && sleepWaitingRemote && ok)
       {
         Serial.println("[SLEEP] Remote answered OK, going to deep sleep for 10 minutes...");
-        ESP.deepSleep(1ULL * 60ULL * 1000000ULL); // 1 minutes
+        ESP.deepSleep(1ULL * 60ULL * 1000000ULL);
         delay(100);
       }
     }
 
-    // Keep doing AP-availability check (cheap; pairs well with 2-min retry)
     static uint32_t lastApChk = 0;
     if (millis() - lastApChk > 2000)
     {
@@ -1556,26 +1472,20 @@ void loop()
       }
     }
 
-    // ===== Power-saving mode based on setpoint =====
     float spNow = getActiveSetpoint();
-
     if (spNow <= 10.0f)
     {
-      // enter / stay in sleep mode
       if (!sleepModeActive)
       {
         sleepModeActive = true;
-        sleepWaitingRemote = true; // on this wake, wait for a good remote reply
+        sleepWaitingRemote = true;
         Serial.println("[SLEEP] Low setpoint -> wait for remote, then sleep 10 minutes");
       }
     }
     else
     {
-      // leave sleep mode
       if (sleepModeActive)
-      {
         Serial.println("[SLEEP] Setpoint > 10 -> staying active");
-      }
       sleepModeActive = false;
       sleepWaitingRemote = false;
     }
