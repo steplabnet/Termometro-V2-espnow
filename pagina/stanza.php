@@ -848,7 +848,7 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
             function calculateLinearRegression(points) {
                 const n = points.length;
                 if (n < 2) return null;
-                let sumX = 0, sumY = 0, sumXY = 0, sumXX = 0;
+                let sumX = 0, sumY = 0, sumXY = 0, sumXY2 = 0, sumXX = 0;
                 const startX = points[0].t;
                 for (let i = 0; i < n; i++) {
                     const x = (points[i].t - startX) / 1000;
@@ -1162,7 +1162,12 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
 
                         const time = document.createElement('input');
                         time.type = 'time';
-                        time.value = '06:00';
+                        // PRESELECT ACTUAL TIME
+                        const nowDt = new Date();
+                        const hh = String(nowDt.getHours()).padStart(2, '0');
+                        const mm = String(nowDt.getMinutes()).padStart(2, '0');
+                        time.value = `${hh}:${mm}`;
+
                         time.style.padding = '6px 10px';
                         time.style.borderRadius = '999px';
                         time.style.border = '1px solid var(--border)';
