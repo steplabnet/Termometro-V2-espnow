@@ -1,3 +1,44 @@
+/*
+ * ======================================================================================
+ * PROJECT: ESP32-C3 Smart Office Thermostat
+ * ======================================================================================
+ *
+ * DESCRIPTION:
+ * This sketch controls a heating system based on temperature readings (DS18B20),
+ * manual user input (Web Interface), and automatic presence detection (BLE).
+ *
+ * AUTOMATION LOGIC & PRIORITIES:
+ * The thermostat automatically adjusts the target temperature (Setpoint) based on
+ * the presence of a specific smartphone (detected via Bluetooth Low Energy RSSI).
+ *
+ * 1. PRIORITY 1: COMFORT MODE (Presence Detected)
+ *    - Condition: If the phone has been seen within the LAST 5 MINUTES.
+ *    - Action:    The Setpoint is forced to a MINIMUM of 18.0°C.
+ *                 (If the user set it to 10°C, it automatically raises to 18°C.
+ *                  If it was already 20°C, it stays at 20°C).
+ *
+ * 2. PRIORITY 2: ECO MODE (Absence Detected)
+ *    - Condition: If the phone has NOT been seen for more than 10 MINUTES
+ *                 AND the current time is after 10:00 AM.
+ *    - Action:    The Setpoint is capped at a MAXIMUM of 15.0°C.
+ *                 (If the setpoint was 19°C, it drops to 15°C to save energy).
+ *
+ * 3. PRIORITY 3: MANUAL / REMOTE SETTING
+ *    - If neither of the above automatic overrides are triggered, the system
+ *      uses the last setpoint defined by the user via the Web UI or HTTP Remote.
+ *
+ * CONNECTIVITY:
+ * - WiFi (Station + AP): Connects to local network for NTP time and Remote Logging.
+ * - ESP-NOW: Broadcasts status to local displays/peers.
+ * - BLE: Scans for nearby devices to detect presence.
+ * - HTTP: Reports telemetry to a remote server and fetches remote overrides.
+ *
+ * HARDWARE:
+ * - MCU: ESP32-C3 SuperMini
+ * - Sensor: DS18B20 (OneWire) on GPIO 3
+ * - Feedback: Onboard LED (GPIO 8)
+ * ======================================================================================
+ */
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
@@ -10,6 +51,7 @@
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <Ticker.h>
+#include <time.h>
 
 // BLE Headers
 #include <BLEDevice.h>
@@ -30,6 +72,11 @@ static const char *AP_SSID = "termometroUff";
 static const char *AP_PASS = "12345678";
 
 static const char *HOSTNAME = "esp32-thermo";
+
+// NTP Server Settings
+const char *ntpServer = "pool.ntp.org";
+const long gmtOffset_sec = 3600;     // GMT+1 (Italy/CET)
+const int daylightOffset_sec = 3600; // +1 hour for DST
 
 // Hardware Pins (ESP32-C3 SuperMini)
 #define ONE_WIRE_BUS 3 // GPIO 3 (D3) - Requires 4.7k Resistor to 3.3V!
@@ -52,7 +99,7 @@ WebServer server(80);
 BLEScan *pBLEScan;
 Ticker g_wdtTicker;
 
-// ESP-NOW Broadcast Address (FF:FF:FF:FF:FF:FF sends to everyone)
+// ESP-NOW Broadcast Address
 uint8_t TARGET[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 esp_now_peer_info_t peerInfo;
 
@@ -71,13 +118,13 @@ static const float HYST_BAND_C = 0.5f;
 
 // Timer for Phone Presence
 static uint32_t g_lastPhoneSeenMs = 0;
-const uint32_t PHONE_TIMEOUT_MS = 300000; // 5 Minutes
+const uint32_t PHONE_ABSENCE_TIMEOUT_MS = 600000; // 10 Minutes (For Eco Mode)
+const uint32_t PHONE_PRESENCE_WINDOW_MS = 300000; // 5 Minutes (For Comfort Mode)
 
 // ======================================================================================
 // HELPERS
 // ======================================================================================
 
-// Watchdog Callback (Restarts ESP if loop hangs)
 void IRAM_ATTR wdtCallback()
 {
   if (g_wdtFed)
@@ -91,7 +138,6 @@ void IRAM_ATTR wdtCallback()
   }
 }
 
-// Save Settings to Flash
 static bool saveFixedSetpoint()
 {
   JsonDocument doc;
@@ -103,7 +149,6 @@ static bool saveFixedSetpoint()
   return true;
 }
 
-// Load Settings from Flash
 static void loadFixedSetpoint()
 {
   if (!LittleFS.exists("/fixed.json"))
@@ -118,7 +163,6 @@ static void loadFixedSetpoint()
   f.close();
 }
 
-// BLE Scanner Logic
 void runBleScan()
 {
   BLEScanResults *foundDevices = pBLEScan->start(BLE_SCAN_TIME, false);
@@ -142,29 +186,22 @@ void runBleScan()
   g_phoneDetected = (nearbyCount > 0);
   g_maxRssi = strongest;
 
-  // Update timer if phone is seen
   if (g_phoneDetected)
   {
     g_lastPhoneSeenMs = millis();
   }
 
-  // LED Feedback (Active Low: LOW is ON)
   digitalWrite(LED_PIN, g_phoneDetected ? LOW : HIGH);
-
   pBLEScan->clearResults();
 }
 
-// HTTPS Telemetry
 static bool cesanaReportAndFetch(float tempC, bool heating)
 {
   if (WiFi.status() != WL_CONNECTED)
-  {
-    Serial.println(">>> [HTTP] No WiFi. Skipping upload.");
     return false;
-  }
 
   WiFiClientSecure client;
-  client.setInsecure(); // Skip certificate validation
+  client.setInsecure();
   client.setTimeout(5000);
 
   HTTPClient https;
@@ -189,6 +226,7 @@ static bool cesanaReportAndFetch(float tempC, bool heating)
       if (!deserializeJson(doc, payload))
       {
         float remoteSp = doc["setpoint"] | -1.0;
+        // Only accept remote if reasonable
         if (remoteSp > 5.0 && remoteSp < 35.0 && abs(remoteSp - g_fixedSetpoint) > 0.1)
         {
           g_fixedSetpoint = remoteSp;
@@ -255,6 +293,7 @@ body{ margin:0; background:var(--bg); color:var(--ink); font:var(--font); paddin
   <div class="row"><div class="badge"><span class="dot" id="heatDot"></span>Heat</div> <div id="heatText">--</div></div>
   <div class="row"><div class="badge"><span class="dot" id="phoneDot"></span>Phone</div> <div id="phoneText">--</div></div>
   <div class="row"><div class="badge"><span class="dot" id="wifiDot"></span>WiFi</div> <div id="wifiText">--</div></div>
+  <div class="row"><div class="badge"><span class="dot" id="timeDot"></span>Time</div> <div id="timeText">--:--</div></div>
 </div>
 <script>
 let sp=19.0;
@@ -276,6 +315,7 @@ async function tick(){
         el('wifiDot').className = 'dot warn';
         el('wifiText').textContent = "AP: " + j.wifi.ap_ssid;
     }
+    if(j.time) el('timeText').textContent = j.time;
     if(document.activeElement.tagName !== 'BUTTON') { 
        el('sp').textContent = fmt(j.setpoint);
        sp = j.setpoint;
@@ -307,6 +347,18 @@ void handleStatus()
   doc["action"] = g_lastAction;
   doc["phone"] = g_phoneDetected;
   doc["rssi"] = g_maxRssi;
+
+  struct tm timeinfo;
+  if (getLocalTime(&timeinfo))
+  {
+    char timeStr[6];
+    strftime(timeStr, sizeof(timeStr), "%H:%M", &timeinfo);
+    doc["time"] = timeStr;
+  }
+  else
+  {
+    doc["time"] = "--:--";
+  }
 
   JsonObject w = doc["wifi"].to<JsonObject>();
   bool connected = (WiFi.status() == WL_CONNECTED);
@@ -376,7 +428,6 @@ void setup()
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH); // Off
 
-  // Initialize Timer with current time
   g_lastPhoneSeenMs = millis();
 
   // 1. Setup Sensors
@@ -411,6 +462,8 @@ void setup()
   {
     Serial.print(">>> SUCCESS! IP: ");
     Serial.println(WiFi.localIP());
+    configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+    Serial.println(">>> NTP Configured");
   }
   else
   {
@@ -429,7 +482,7 @@ void setup()
   esp_now_register_recv_cb(OnDataRecv);
 
   memcpy(peerInfo.peer_addr, TARGET, 6);
-  peerInfo.channel = 0; // Follow Router Channel
+  peerInfo.channel = 0;
   peerInfo.encrypt = false;
   if (esp_now_add_peer(&peerInfo) != ESP_OK)
     Serial.println("Add Peer Fail");
@@ -466,21 +519,42 @@ void loop()
     }
 
     // 2. BLE Scan (Blocking)
-    // Updates g_lastPhoneSeenMs if phone found
     runBleScan();
 
-    // 3. AUTO-REDUCTION LOGIC
-    // If phone unseen for > 5 mins AND setpoint > 17, force to 17.
-    if (!g_phoneDetected && (millis() - g_lastPhoneSeenMs > PHONE_TIMEOUT_MS))
+    // 3. LOGIC CONTROLLER
+    // ====================================================================
+    uint32_t msSincePhone = millis() - g_lastPhoneSeenMs;
+    struct tm timeinfo;
+    bool timeKnown = getLocalTime(&timeinfo);
+
+    // RULE A: PRESENCE (PRIORITY HIGH)
+    // If phone seen within last 5 minutes, force Minimum Setpoint = 18.0
+    if (msSincePhone < PHONE_PRESENCE_WINDOW_MS)
     {
-      if (g_fixedSetpoint > 17.0)
+      if (g_fixedSetpoint < 18.0)
       {
-        Serial.println(">>> [LOGIC] Phone absent > 5min. Capping setpoint to 17.0 C");
-        g_fixedSetpoint = 17.0;
-        g_fixedPreset = "auto_eco";
+        Serial.println(">>> [LOGIC] Phone Present (<5min). Forcing Min 18.0 C");
+        g_fixedSetpoint = 18.0;
+        g_fixedPreset = "auto_comfort";
         saveFixedSetpoint();
       }
     }
+    // RULE B: ABSENCE / NIGHT (PRIORITY LOW)
+    // Only if Rule A didn't apply (because msSincePhone > 5 min implies this check is valid)
+    // If Time > 10:00 AND Phone missing > 10 mins -> Cap at 15.0
+    else if (timeKnown &&
+             timeinfo.tm_hour > 10 &&
+             msSincePhone > PHONE_ABSENCE_TIMEOUT_MS)
+    {
+      if (g_fixedSetpoint > 15.0)
+      {
+        Serial.println(">>> [LOGIC] Time > 10 & Phone absent > 10min. Capping at 15.0 C");
+        g_fixedSetpoint = 15.0;
+        g_fixedPreset = "auto_eco_15";
+        saveFixedSetpoint();
+      }
+    }
+    // ====================================================================
 
     // 4. Hysteresis
     float sp = g_fixedEnabled ? g_fixedSetpoint : 19.0;
@@ -494,13 +568,14 @@ void loop()
     jtx["heater"] = (g_lastAction == 1) ? "ON" : "OFF";
     jtx["temp"] = g_lastTempC;
     jtx["phone"] = g_phoneDetected;
+    jtx["id"] = 12;
     char buf[128];
     serializeJson(jtx, buf);
     esp_now_send(TARGET, (uint8_t *)buf, strlen(buf));
 
     // 6. Serial Debug
     Serial.printf("[STATUS] Temp: %.2f | Set: %.1f | Heat: %s | Phone: %s | LastSeen: %ds ago\n",
-                  g_lastTempC, sp, (g_lastAction == 1) ? "ON" : "OFF", g_phoneDetected ? "YES" : "NO", (millis() - g_lastPhoneSeenMs) / 1000);
+                  g_lastTempC, sp, (g_lastAction == 1) ? "ON" : "OFF", g_phoneDetected ? "YES" : "NO", msSincePhone / 1000);
 
     // 7. HTTPS Telemetry
     if (WiFi.status() == WL_CONNECTED)
