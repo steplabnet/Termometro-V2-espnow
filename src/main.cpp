@@ -378,18 +378,17 @@ static bool cesanaReportAndFetch(float tempC, bool heating) {
 }
 
 // ===== SETUP =====
-void setup()
-{
+// ===== SETUP =====
+void setup() {
   Serial.begin(115200);
-  delay(3000);
-  Serial.println("Starting ESP32-C3 Thermostat...");
+  delay(3000); 
+  Serial.println("\n--- Starting ESP32-C3 Thermostat ---");
 
-  if (!LittleFS.begin(true))
-    Serial.println("LittleFS Fail");
+  if(!LittleFS.begin(true)) Serial.println("LittleFS Fail"); 
   loadFixedSetpoint();
 
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH);
+  digitalWrite(LED_PIN, HIGH); 
 
   // 1. Setup Sensors
   oneWire.begin(ONE_WIRE_BUS);
@@ -405,32 +404,59 @@ void setup()
 
   // 3. Setup WiFi (DUAL MODE)
   WiFi.mode(WIFI_AP_STA);
-
-  // Setup AP
-  WiFi.softAP(AP_SSID, AP_PASS);
-  Serial.print("AP Started. IP: ");
+  
+  // A. Start Access Point
+  WiFi.softAP(AP_SSID, AP_PASS, 1); 
+  Serial.print("[AP] Started 'termometroUff'. IP: "); 
   Serial.println(WiFi.softAPIP());
-
-  // Connect to Router
+  
+  // B. Connect to Router
   WiFi.hostname(HOSTNAME);
   WiFi.begin(WIFI_SSID_DEFAULT, WIFI_PASS_DEFAULT);
+  
+  // ============================================================
+  // ADDED: Wait up to 10 seconds for connection and Print IP
+  // ============================================================
+  Serial.print("[WiFi] Connecting to ");
+  Serial.print(WIFI_SSID_DEFAULT);
+  
+  unsigned long startAttempt = millis();
+  while(WiFi.status() != WL_CONNECTED && millis() - startAttempt < 10000) {
+      delay(500);
+      Serial.print(".");
+  }
+  Serial.println();
 
+  if(WiFi.status() == WL_CONNECTED) {
+      Serial.println("------------------------------------------------");
+      Serial.print(">>> SUCCESS! WiFi Connected.\n");
+      Serial.print(">>> IP Address: ");
+      Serial.println(WiFi.localIP());
+      Serial.print(">>> Signal Strength: ");
+      Serial.print(WiFi.RSSI());
+      Serial.println(" dBm");
+      Serial.println("------------------------------------------------");
+  } else {
+      Serial.println("------------------------------------------------");
+      Serial.println(">>> TIMEOUT: Could not connect to Router.");
+      Serial.println(">>> Device running in AP Mode only.");
+      Serial.println("------------------------------------------------");
+  }
+  // ============================================================
+  
   // 4. Setup ESP-NOW
-  if (esp_now_init() != ESP_OK)
-  {
+  if (esp_now_init() != ESP_OK) {
     Serial.println("ESP-NOW Init Failed");
     ESP.restart();
   }
   esp_now_register_send_cb(OnDataSent);
   esp_now_register_recv_cb(OnDataRecv);
-
-  // FIX: Set channel to 0 so it follows the Router's channel
+  
   memcpy(peerInfo.peer_addr, TARGET, 6);
-  peerInfo.channel = 0; // <--- FIX: 0 = "Use current WiFi channel"
+  peerInfo.channel = 0; // Use current channel
   peerInfo.encrypt = false;
-
-  if (esp_now_add_peer(&peerInfo) != ESP_OK)
-  {
+  
+  if (esp_now_add_peer(&peerInfo) != ESP_OK){
     Serial.println("Failed to add peer");
   }
 
