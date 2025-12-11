@@ -1,6 +1,6 @@
 // src/main.cpp — Wemos D1 mini (ESP8266)
 // Thermostat + Mobile UI + Wi-Fi setup + 0.5°C hysteresis + Arduino OTA
-// + WATCHDOG ADDED
+// + WATCHDOG SECURED + DEEP SLEEP REMOVED (Replaced with Logic Timer)
 
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
@@ -16,7 +16,7 @@
 #include <ESP8266HTTPClient.h>
 #include <WiFiClientSecureBearSSL.h>
 #include <math.h>
-#include <Ticker.h> // <--- NEW: Required for Watchdog
+#include <Ticker.h>
 
 extern "C"
 {
@@ -28,9 +28,11 @@ static const char *WIFI_SSID_DEFAULT = "zelja_RPT";
 static const char *WIFI_PASS_DEFAULT = "pikolejla";
 static const char *HOSTNAME = "esp-thermo";
 
-// ===== Power-saving (sleep mode) =====
-static bool sleepModeActive = false;    // we're in "setpoint <= 10" mode
-static bool sleepWaitingRemote = false; // we are waiting for a successful remote reply
+// ===== Telemetry Intervals (Logic Sleep) =====
+// If setpoint > 10, we report every 1.5s.
+// If setpoint <= 10, we report every 10 minutes (600s).
+static const uint32_t INTERVAL_ACTIVE_MS = 1500;
+static const uint32_t INTERVAL_IDLE_MS = 600000;
 
 // OPTIONAL: OTA password
 static const char *OTA_PASS = "";
@@ -78,7 +80,6 @@ static const float HYST_BAND_C = 0.5f;
 
 // ===== Remote "cesana" reporting =====
 static uint32_t g_lastHttpMs = 0;
-static const uint32_t HTTP_MIN_INTERVAL_MS = 1500;
 static bool g_remoteOk = false;
 static float g_remoteSetpoint = NAN;
 static String g_remoteMode = "";
@@ -116,7 +117,6 @@ void IRAM_ATTR wdtCallback()
   {
     // Main loop is stuck (e.g., BearSSL hang, Infinite loop).
     // Force a Hardware Watchdog Reset by disabling interrupts and spinning.
-    // This is more reliable than ESP.restart() in a hung state.
     ets_printf("\n[WDT] Watchdog bite! System hung. Resetting...\n");
     ESP.wdtDisable();
     while (1)
@@ -155,21 +155,13 @@ static void printMac(const uint8_t *mac)
 
 static void onDataSent(uint8_t *mac, uint8_t status)
 {
-  Serial.print("[TX] Sent to ");
-  printMac(mac);
-  Serial.print(" -> status=");
-  Serial.println(status == 0 ? "OK" : "ERR");
+  // Optional: Uncomment for debug
+  // Serial.print("[TX] Sent to "); printMac(mac);
+  // Serial.println(status == 0 ? " -> OK" : " -> ERR");
 }
 
 static void onDataRecv(uint8_t *mac, uint8_t *data, uint8_t len)
 {
-  Serial.print("[RX] from ");
-  printMac(mac);
-  Serial.printf(" len=%u: ", len);
-  for (uint8_t i = 0; i < len; i++)
-    Serial.write(data[i]);
-  Serial.println();
-
   JsonDocument doc;
   DeserializationError e = deserializeJson(doc, data, len);
   if (e)
@@ -708,7 +700,7 @@ static bool cesanaReportAndFetch(float tempC, bool heatingFromAck)
   https.setTimeout(800);
   https.setReuse(false);
 
-  Serial.printf("[HTTP] GET %s\n", url.c_str());
+  // Serial.printf("[HTTP] GET %s\n", url.c_str());
   if (!https.begin(*client, url))
   {
     Serial.println("[HTTP] begin() failed");
@@ -721,7 +713,7 @@ static bool cesanaReportAndFetch(float tempC, bool heatingFromAck)
     https.end();
     return false;
   }
-  Serial.printf("[HTTP] Status: %d\n", code);
+  // Serial.printf("[HTTP] Status: %d\n", code);
   if (code != HTTP_CODE_OK)
   {
     https.end();
@@ -749,9 +741,9 @@ static bool cesanaReportAndFetch(float tempC, bool heatingFromAck)
     g_remoteHeating = false;
     g_remoteDelta = NAN;
   }
-  Serial.printf("[HTTP] ok=%s mode=%s setpoint=%.1f actual=%.1f heat=%s Δ=%.1f\n",
-                g_remoteOk ? "true" : "false", g_remoteMode.c_str(), g_remoteSetpoint, g_remoteActual,
-                g_remoteHeating ? "ON" : "OFF", (isnan(g_remoteDelta) ? NAN : g_remoteDelta));
+  // Serial.printf("[HTTP] ok=%s mode=%s setpoint=%.1f actual=%.1f heat=%s Δ=%.1f\n",
+  //               g_remoteOk ? "true" : "false", g_remoteMode.c_str(), g_remoteSetpoint, g_remoteActual,
+  //               g_remoteHeating ? "ON" : "OFF", (isnan(g_remoteDelta) ? NAN : g_remoteDelta));
 
   if (g_remoteOk && !isnan(g_remoteSetpoint) && g_remoteSetpoint >= 5.0f && g_remoteSetpoint <= 35.0f)
   {
@@ -1398,6 +1390,7 @@ void loop()
       action = 0;
     g_lastAction = action;
 
+    // --- HEATER LOGIC ---
     static long timerAction = millis();
     {
       static String azione = "OFF";
@@ -1437,30 +1430,40 @@ void loop()
         timerAction = millis();
       }
 
+      // Send to Relay Peer
       JsonDocument jtx;
       jtx["heater"] = azione;
       jtx["id"] = 12;
       char buf[32];
       size_t n = serializeJson(jtx, buf, sizeof(buf));
       int rc = esp_now_send(TARGET, (uint8_t *)buf, (int)n);
-      Serial.print("[TX] send -> ");
-      Serial.println(rc == 0 ? "OK" : String(rc));
+      // Serial.print("[TX] send -> "); Serial.println(rc == 0 ? "OK" : String(rc));
     }
 
-    if (haveTemp && (millis() - g_lastHttpMs >= HTTP_MIN_INTERVAL_MS))
+    // --- TELEMETRY LOGIC (Replaces Deep Sleep) ---
+    // Instead of deep sleep, we vary the reporting interval.
+    // If setpoint <= 10 (idle/away), we report every 10 mins.
+    // If setpoint > 10 (active), we report every 1.5 secs.
+    uint32_t interval = (sp <= 10.0f) ? INTERVAL_IDLE_MS : INTERVAL_ACTIVE_MS;
+
+    if (haveTemp && (millis() - g_lastHttpMs >= interval))
     {
       bool heatingForReport = g_haveAck ? g_ackRelayOn : (action == 1);
       bool ok = cesanaReportAndFetch(g_lastTempC, heatingForReport);
       g_lastHttpMs = millis();
 
-      if (sleepModeActive && sleepWaitingRemote && ok)
+      if (ok)
       {
-        Serial.println("[SLEEP] Remote answered OK, going to deep sleep for 10 minutes...");
-        ESP.deepSleep(1ULL * 60ULL * 1000000ULL);
-        delay(100);
+        Serial.printf("[HTTP] Report OK. Next in %u s\n", interval / 1000);
+      }
+      else
+      {
+        // If failed, retry sooner (e.g., 30s) or stick to interval
+        Serial.println("[HTTP] Report Failed.");
       }
     }
 
+    // --- AP FALLBACK CHECK ---
     static uint32_t lastApChk = 0;
     if (millis() - lastApChk > 2000)
     {
@@ -1470,24 +1473,6 @@ void loop()
         Serial.println("[WiFi] STA down & AP not active -> starting AP fallback (periodic check)");
         startApFallback();
       }
-    }
-
-    float spNow = getActiveSetpoint();
-    if (spNow <= 10.0f)
-    {
-      if (!sleepModeActive)
-      {
-        sleepModeActive = true;
-        sleepWaitingRemote = true;
-        Serial.println("[SLEEP] Low setpoint -> wait for remote, then sleep 10 minutes");
-      }
-    }
-    else
-    {
-      if (sleepModeActive)
-        Serial.println("[SLEEP] Setpoint > 10 -> staying active");
-      sleepModeActive = false;
-      sleepWaitingRemote = false;
     }
   }
 }
