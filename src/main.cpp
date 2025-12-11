@@ -7,7 +7,6 @@
 #include <LittleFS.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
-#include <ArduinoOTA.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
 #include <Ticker.h>
@@ -18,65 +17,67 @@
 #include <BLEScan.h>
 #include <BLEAdvertisedDevice.h>
 
-// ===== CONFIGURATION =====
+// ======================================================================================
+// CONFIGURATION
+// ======================================================================================
+
+// UPDATED WI-FI CREDENTIALS
 static const char *WIFI_SSID_DEFAULT = "NETGEAR11";
 static const char *WIFI_PASS_DEFAULT = "breezypiano838";
 
-// Emergency Access Point
+// Emergency Access Point (If WiFi fails)
 static const char *AP_SSID = "termometroUff";
 static const char *AP_PASS = "12345678";
 
 static const char *HOSTNAME = "esp32-thermo";
 
-// ===== PINS (SuperMini C3) =====
-#define ONE_WIRE_BUS 3 // GPIO 3 (D3)
-#define LED_PIN 8      // GPIO 8 (Onboard LED)
+// Hardware Pins (ESP32-C3 SuperMini)
+#define ONE_WIRE_BUS 3 // GPIO 3 (D3) - Requires 4.7k Resistor to 3.3V!
+#define LED_PIN 8      // GPIO 8 (Onboard LED, Active Low)
 
-// ===== BLE CONFIG =====
-const int BLE_RSSI_THRESHOLD = -75;
-const int BLE_SCAN_TIME = 2;
-bool g_phoneDetected = false;
-int g_maxRssi = -100;
+// BLE Settings
+const int BLE_RSSI_THRESHOLD = -75; // Sensitivity (-60 close, -90 far)
+const int BLE_SCAN_TIME = 2;        // Seconds to scan per loop
 
-// ===== Telemetry Intervals =====
+// Telemetry Timing
 static const uint32_t INTERVAL_ACTIVE_MS = 2000;
-static const uint32_t INTERVAL_IDLE_MS = 2000;
+static const uint32_t INTERVAL_IDLE_MS = 600000; // 10 mins
 
-// ===== Objects =====
+// ======================================================================================
+// GLOBAL OBJECTS & VARIABLES
+// ======================================================================================
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 WebServer server(80);
 BLEScan *pBLEScan;
+Ticker g_wdtTicker;
 
-// ===== DS18B20 State =====
-DeviceAddress g_dsAddr{};
-bool g_haveSensor = false;
-
-// ===== ESP-NOW target =====
-// BROADCAST ADDRESS (Sends to everyone, ensures D1 Mini hears it if on same channel)
+// ESP-NOW Broadcast Address (FF:FF:FF:FF:FF:FF sends to everyone)
 uint8_t TARGET[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 esp_now_peer_info_t peerInfo;
 
-// ===== State Variables =====
+// State Variables
+volatile float g_lastTempC = NAN;
+volatile uint8_t g_lastAction = 0; // 1 = ON, 0 = OFF
+bool g_phoneDetected = false;
+int g_maxRssi = -100;
+volatile bool g_wdtFed = false;
+
+// Settings (Persisted)
 static float g_fixedSetpoint = 19.0f;
 static String g_fixedPreset = "on";
 static bool g_fixedEnabled = true;
-volatile float g_lastTempC = NAN;
-volatile uint8_t g_lastAction = 0;
-
-// ACK State
-static bool g_haveAck = false;
-static bool g_ackRelayOn = false;
-static uint32_t g_ackLastMs = 0;
-
-// Hysteresis
 static const float HYST_BAND_C = 0.5f;
 
-// Watchdog
-Ticker g_wdtTicker;
-volatile bool g_wdtFed = false;
+// Timer for Phone Presence
+static uint32_t g_lastPhoneSeenMs = 0;
+const uint32_t PHONE_TIMEOUT_MS = 300000; // 5 Minutes
 
-// ================= WATCHDOG =================
+// ======================================================================================
+// HELPERS
+// ======================================================================================
+
+// Watchdog Callback (Restarts ESP if loop hangs)
 void IRAM_ATTR wdtCallback()
 {
   if (g_wdtFed)
@@ -90,7 +91,34 @@ void IRAM_ATTR wdtCallback()
   }
 }
 
-// ================= BLE SCANNER =================
+// Save Settings to Flash
+static bool saveFixedSetpoint()
+{
+  JsonDocument doc;
+  doc["setpoint"] = g_fixedSetpoint;
+  doc["preset"] = g_fixedPreset;
+  File f = LittleFS.open("/fixed.json", "w");
+  serializeJson(doc, f);
+  f.close();
+  return true;
+}
+
+// Load Settings from Flash
+static void loadFixedSetpoint()
+{
+  if (!LittleFS.exists("/fixed.json"))
+    return;
+  File f = LittleFS.open("/fixed.json", "r");
+  JsonDocument doc;
+  if (!deserializeJson(doc, f))
+  {
+    g_fixedSetpoint = doc["setpoint"] | 19.0;
+    g_fixedPreset = doc["preset"] | "on";
+  }
+  f.close();
+}
+
+// BLE Scanner Logic
 void runBleScan()
 {
   BLEScanResults *foundDevices = pBLEScan->start(BLE_SCAN_TIME, false);
@@ -114,36 +142,80 @@ void runBleScan()
   g_phoneDetected = (nearbyCount > 0);
   g_maxRssi = strongest;
 
+  // Update timer if phone is seen
   if (g_phoneDetected)
-    digitalWrite(LED_PIN, LOW); // LED ON
-  else
-    digitalWrite(LED_PIN, HIGH); // LED OFF
+  {
+    g_lastPhoneSeenMs = millis();
+  }
+
+  // LED Feedback (Active Low: LOW is ON)
+  digitalWrite(LED_PIN, g_phoneDetected ? LOW : HIGH);
 
   pBLEScan->clearResults();
 }
 
-// ================= ESP-NOW CALLBACKS =================
-void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {}
-
-void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len)
+// HTTPS Telemetry
+static bool cesanaReportAndFetch(float tempC, bool heating)
 {
-  JsonDocument doc;
-  DeserializationError e = deserializeJson(doc, incomingData, len);
-  if (e)
-    return;
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    Serial.println(">>> [HTTP] No WiFi. Skipping upload.");
+    return false;
+  }
 
-  const char *ack = doc["ack"] | nullptr;
-  int relay = doc["relay"] | -1;
-  bool ok = doc["ok"] | false;
-  if (!ok || relay < 0)
-    return;
+  WiFiClientSecure client;
+  client.setInsecure(); // Skip certificate validation
+  client.setTimeout(5000);
 
-  g_haveAck = true;
-  g_ackRelayOn = (relay == 1) || (ack && strcmp(ack, "ON") == 0);
-  g_ackLastMs = millis();
+  HTTPClient https;
+
+  String url = "https://cesana.steplab.net/get_setpoint.php?temp=" + String(tempC, 1) +
+               "&cald=" + (heating ? "1" : "0") +
+               "&phone=" + (g_phoneDetected ? "1" : "0");
+
+  Serial.print(">>> [HTTP] Calling: ");
+  Serial.println(url);
+
+  if (https.begin(client, url))
+  {
+    int code = https.GET();
+    if (code == HTTP_CODE_OK)
+    {
+      String payload = https.getString();
+      Serial.print(">>> [HTTP] Reply: ");
+      Serial.println(payload);
+
+      JsonDocument doc;
+      if (!deserializeJson(doc, payload))
+      {
+        float remoteSp = doc["setpoint"] | -1.0;
+        if (remoteSp > 5.0 && remoteSp < 35.0 && abs(remoteSp - g_fixedSetpoint) > 0.1)
+        {
+          g_fixedSetpoint = remoteSp;
+          g_fixedPreset = "remote";
+          saveFixedSetpoint();
+          Serial.println(">>> [HTTP] Setpoint updated via Remote!");
+        }
+      }
+      https.end();
+      return true;
+    }
+    https.end();
+  }
+  return false;
 }
 
-// ================= HTML =================
+// ======================================================================================
+// ESP-NOW SETUP
+// ======================================================================================
+
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {}
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {}
+
+// ======================================================================================
+// WEB SERVER HANDLERS & HTML
+// ======================================================================================
+
 const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html><html lang="en"><head>
 <meta charset="utf-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -225,34 +297,8 @@ tick();
 </script></body></html>
 )HTML";
 
-// ===== FILESYSTEM HELPERS =====
-static void loadFixedSetpoint()
-{
-  if (!LittleFS.exists("/fixed.json"))
-    return;
-  File f = LittleFS.open("/fixed.json", "r");
-  JsonDocument doc;
-  if (!deserializeJson(doc, f))
-  {
-    g_fixedSetpoint = doc["setpoint"] | 19.0;
-    g_fixedPreset = doc["preset"] | "on";
-  }
-  f.close();
-}
-
-static bool saveFixedSetpoint()
-{
-  JsonDocument doc;
-  doc["setpoint"] = g_fixedSetpoint;
-  doc["preset"] = g_fixedPreset;
-  File f = LittleFS.open("/fixed.json", "w");
-  serializeJson(doc, f);
-  f.close();
-  return true;
-}
-
-// ===== WEB HANDLERS =====
 void handleIndex() { server.send(200, "text/html", INDEX_HTML); }
+
 void handleStatus()
 {
   JsonDocument doc;
@@ -275,11 +321,11 @@ void handleStatus()
     w["ap_ssid"] = AP_SSID;
     w["ap_ip"] = WiFi.softAPIP().toString();
   }
-
   String out;
   serializeJson(doc, out);
   server.send(200, "application/json", out);
 }
+
 void handlePostFixed()
 {
   if (!server.hasArg("plain"))
@@ -314,81 +360,24 @@ void handlePostFixed()
   server.send(200, "application/json", "{\"ok\":true}");
 }
 
-// ===== HTTPS TELEMETRY =====
-// ===== REPLACE YOUR OLD cesanaReportAndFetch WITH THIS =====
-static bool cesanaReportAndFetch(float tempC, bool heating) {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println(">>> [DEBUG] WiFi disconnected, cannot call URL.");
-    return false;
-  }
-  
-  WiFiClientSecure client;
-  client.setInsecure(); // Skip certificate check
-  client.setTimeout(5000); // 5s timeout
-
-  HTTPClient https;
-  
-  // 1. BUILD THE URL
-  String url = "https://cesana.steplab.net/get_setpoint.php?temp=" + String(tempC, 1) + 
-               "&cald=" + (heating?"1":"0") + 
-               "&phone=" + (g_phoneDetected?"1":"0");
-  
-  // 2. PRINT THE URL TO SERIAL
-  Serial.println("\n--------------------------------------------------");
-  Serial.print(">>> [DEBUG] CALLING URL: ");
-  Serial.println(url);
-  
-  if (https.begin(client, url)) {
-    int httpCode = https.GET();
-    
-    // 3. CHECK RESULT
-    if (httpCode > 0) {
-      Serial.printf(">>> [DEBUG] HTTP CODE: %d\n", httpCode);
-
-      if (httpCode == HTTP_CODE_OK) {
-        String payload = https.getString();
-        
-        // 4. PRINT THE SERVER ANSWER
-        Serial.print(">>> [DEBUG] SERVER ANSWER: ");
-        Serial.println(payload);
-        Serial.println("--------------------------------------------------\n");
-
-        // Process the answer
-        JsonDocument doc;
-        if (!deserializeJson(doc, payload)) {
-           float remoteSp = doc["setpoint"] | -1.0;
-           if (remoteSp > 5.0 && remoteSp < 35.0 && abs(remoteSp - g_fixedSetpoint) > 0.1) {
-              g_fixedSetpoint = remoteSp;
-              g_fixedPreset = "remote";
-              saveFixedSetpoint();
-              Serial.println(">>> [DEBUG] Setpoint updated from server!");
-           }
-           https.end();
-           return true;
-        }
-      }
-    } else {
-      Serial.printf(">>> [DEBUG] FAILED. Error: %s\n", https.errorToString(httpCode).c_str());
-    }
-    https.end();
-  } else {
-    Serial.println(">>> [DEBUG] Connection failed (Host unreachable)");
-  }
-  return false;
-}
-
-// ===== SETUP =====
-// ===== SETUP =====
-void setup() {
+// ======================================================================================
+// MAIN SETUP
+// ======================================================================================
+void setup()
+{
   Serial.begin(115200);
-  delay(3000); 
+  delay(3000);
   Serial.println("\n--- Starting ESP32-C3 Thermostat ---");
 
-  if(!LittleFS.begin(true)) Serial.println("LittleFS Fail"); 
+  if (!LittleFS.begin(true))
+    Serial.println("LittleFS Fail");
   loadFixedSetpoint();
 
   pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH); 
+  digitalWrite(LED_PIN, HIGH); // Off
+
+  // Initialize Timer with current time
+  g_lastPhoneSeenMs = millis();
 
   // 1. Setup Sensors
   oneWire.begin(ONE_WIRE_BUS);
@@ -402,63 +391,48 @@ void setup() {
   pBLEScan->setInterval(100);
   pBLEScan->setWindow(99);
 
-  // 3. Setup WiFi (DUAL MODE)
+  // 3. Setup WiFi (AP + STA)
   WiFi.mode(WIFI_AP_STA);
-  
-  // A. Start Access Point
-  WiFi.softAP(AP_SSID, AP_PASS, 1); 
-  Serial.print("[AP] Started 'termometroUff'. IP: "); 
-  Serial.println(WiFi.softAPIP());
-  
-  // B. Connect to Router
+  WiFi.softAP(AP_SSID, AP_PASS, 1);
   WiFi.hostname(HOSTNAME);
   WiFi.begin(WIFI_SSID_DEFAULT, WIFI_PASS_DEFAULT);
-  
-  // ============================================================
-  // ADDED: Wait up to 10 seconds for connection and Print IP
-  // ============================================================
+
   Serial.print("[WiFi] Connecting to ");
   Serial.print(WIFI_SSID_DEFAULT);
-  
   unsigned long startAttempt = millis();
-  while(WiFi.status() != WL_CONNECTED && millis() - startAttempt < 10000) {
-      delay(500);
-      Serial.print(".");
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 10000)
+  {
+    delay(500);
+    Serial.print(".");
   }
   Serial.println();
 
-  if(WiFi.status() == WL_CONNECTED) {
-      Serial.println("------------------------------------------------");
-      Serial.print(">>> SUCCESS! WiFi Connected.\n");
-      Serial.print(">>> IP Address: ");
-      Serial.println(WiFi.localIP());
-      Serial.print(">>> Signal Strength: ");
-      Serial.print(WiFi.RSSI());
-      Serial.println(" dBm");
-      Serial.println("------------------------------------------------");
-  } else {
-      Serial.println("------------------------------------------------");
-      Serial.println(">>> TIMEOUT: Could not connect to Router.");
-      Serial.println(">>> Device running in AP Mode only.");
-      Serial.println("------------------------------------------------");
+  if (WiFi.status() == WL_CONNECTED)
+  {
+    Serial.print(">>> SUCCESS! IP: ");
+    Serial.println(WiFi.localIP());
   }
-  // ============================================================
-  
+  else
+  {
+    Serial.println(">>> TIMEOUT: Running in AP Mode.");
+    Serial.print(">>> AP IP: ");
+    Serial.println(WiFi.softAPIP());
+  }
+
   // 4. Setup ESP-NOW
-  if (esp_now_init() != ESP_OK) {
-    Serial.println("ESP-NOW Init Failed");
+  if (esp_now_init() != ESP_OK)
+  {
+    Serial.println("ESP-NOW Fail");
     ESP.restart();
   }
   esp_now_register_send_cb(OnDataSent);
   esp_now_register_recv_cb(OnDataRecv);
-  
+
   memcpy(peerInfo.peer_addr, TARGET, 6);
-  peerInfo.channel = 0; // Use current channel
+  peerInfo.channel = 0; // Follow Router Channel
   peerInfo.encrypt = false;
-  
-  if (esp_now_add_peer(&peerInfo) != ESP_OK){
-    Serial.println("Failed to add peer");
-  }
+  if (esp_now_add_peer(&peerInfo) != ESP_OK)
+    Serial.println("Add Peer Fail");
 
   // 5. Setup Web
   server.on("/", handleIndex);
@@ -470,92 +444,80 @@ void setup() {
   g_wdtTicker.attach(20.0, wdtCallback);
 }
 
-// ===== LOOP =====
-// ===== LOOP =====
+// ======================================================================================
+// MAIN LOOP
+// ======================================================================================
 void loop()
 {
-  g_wdtFed = true;       // Feed the Watchdog
-  server.handleClient(); // Handle Web UI requests
+  g_wdtFed = true;
+  server.handleClient();
 
   static uint32_t lastLoop = 0;
-
-  // Run logic every 2 seconds
   if (millis() - lastLoop > 2000)
   {
     lastLoop = millis();
 
-    // 1. Read Temperature
+    // 1. Read Temp
     sensors.requestTemperatures();
     float t = sensors.getTempCByIndex(0);
-
-    // Validate reading (-127 is error, 85 is power-on default)
     if (t != DEVICE_DISCONNECTED_C && t > -50 && t < 100)
     {
       g_lastTempC = t;
     }
-    else
+
+    // 2. BLE Scan (Blocking)
+    // Updates g_lastPhoneSeenMs if phone found
+    runBleScan();
+
+    // 3. AUTO-REDUCTION LOGIC
+    // If phone unseen for > 5 mins AND setpoint > 17, force to 17.
+    if (!g_phoneDetected && (millis() - g_lastPhoneSeenMs > PHONE_TIMEOUT_MS))
     {
-      Serial.println("[ERR] Sensor Read Failed! Check 4.7k Resistor & Wiring.");
+      if (g_fixedSetpoint > 17.0)
+      {
+        Serial.println(">>> [LOGIC] Phone absent > 5min. Capping setpoint to 17.0 C");
+        g_fixedSetpoint = 17.0;
+        g_fixedPreset = "auto_eco";
+        saveFixedSetpoint();
+      }
     }
 
-    // 2. Hysteresis Logic
+    // 4. Hysteresis
     float sp = g_fixedEnabled ? g_fixedSetpoint : 19.0;
     if (g_lastTempC < (sp - HYST_BAND_C / 2))
       g_lastAction = 1;
     else if (g_lastTempC > (sp + HYST_BAND_C / 2))
       g_lastAction = 0;
 
-    // 3. BLE Scan (Blocking for ~2 seconds)
-    runBleScan();
-
-    // ==========================================
-    // ADDED: PRINT TO SERIAL MONITOR
-    // ==========================================
-    Serial.printf("[STATUS] Temp: %.2f C | Target: %.1f C | Heater: %s | Phone: %s (%d dBm) | WiFi: %s\n",
-                  g_lastTempC,
-                  sp,
-                  (g_lastAction == 1) ? "ON" : "OFF",
-                  g_phoneDetected ? "YES" : "NO",
-                  g_maxRssi,
-                  (WiFi.status() == WL_CONNECTED) ? "Conn" : "AP-Only");
-    // ==========================================
-
-    // 4. Send ESP-NOW
+    // 5. Send ESP-NOW
     JsonDocument jtx;
     jtx["heater"] = (g_lastAction == 1) ? "ON" : "OFF";
     jtx["temp"] = g_lastTempC;
     jtx["phone"] = g_phoneDetected;
     char buf[128];
     serializeJson(jtx, buf);
+    esp_now_send(TARGET, (uint8_t *)buf, strlen(buf));
 
-    // Send to peer (Target)
-    esp_err_t result = esp_now_send(TARGET, (uint8_t *)buf, strlen(buf));
-    if (result != ESP_OK)
-    {
-      Serial.println("[ESP-NOW] Send Error");
-    }
+    // 6. Serial Debug
+    Serial.printf("[STATUS] Temp: %.2f | Set: %.1f | Heat: %s | Phone: %s | LastSeen: %ds ago\n",
+                  g_lastTempC, sp, (g_lastAction == 1) ? "ON" : "OFF", g_phoneDetected ? "YES" : "NO", (millis() - g_lastPhoneSeenMs) / 1000);
 
-    // 5. Telemetry & WiFi Reconnection
+    // 7. HTTPS Telemetry
     if (WiFi.status() == WL_CONNECTED)
     {
       static uint32_t lastHttp = 0;
       uint32_t interval = (sp <= 10.0) ? INTERVAL_IDLE_MS : INTERVAL_ACTIVE_MS;
-
       if (millis() - lastHttp > interval)
       {
-        Serial.print("[HTTP] Uploading... ");
-        bool ok = cesanaReportAndFetch(g_lastTempC, g_lastAction);
-        Serial.println(ok ? "OK" : "Fail");
+        cesanaReportAndFetch(g_lastTempC, g_lastAction);
         lastHttp = millis();
       }
     }
     else
     {
-      // WiFi is down, retry occasionally
       static uint32_t lastReconnect = 0;
       if (millis() - lastReconnect > 30000)
       {
-        Serial.println("[WiFi] Connection lost. Retrying...");
         WiFi.reconnect();
         lastReconnect = millis();
       }
