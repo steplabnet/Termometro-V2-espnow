@@ -1,23 +1,44 @@
 <?php
 // get_setpoint.php
-// - Optional ?temp= updates state.json.actualTemp (rounded to 1 decimal)
-// - Optional ?cald=0|1 updates state.json.cald (relay status)
-// - Reads/Writes state.json from the same directory as this script
-// - Also logs temperature to temp_history.csv if last modification > 10 minutes
-// - Returns JSON: { ok, mode, setpoint, actualTemp, actualTemp_str, cald, date, time, timezone }
+//
+// INPUTS (GET or POST):
+// - ?temp=FLOAT   : Updates current temp. 
+//                   Logs to 'temp_history.csv' (Throttled: max 1 write/10mins, Keeps 48h).
+// - ?cald=0|1     : Updates boiler relay status.
+// - ?phone=0|1    : Updates phone state. 
+//                   Logs to 'phone_history.csv' (Immediate: logs every request, Keeps 24h).
+//
+// OPERATIONS:
+// - Reads/Writes 'state.json' (current status).
+// - Reads 'schedule.json' (weekly program) to calculate Auto Setpoint.
+//
+// RETURNS (JSON):
+// { 
+//   "ok": true, 
+//   "mode": "AUTO|ON|OFF", 
+//   "setpoint": 20.0, 
+//   "actualTemp": 19.5, 
+//   "cald": 1, 
+//   "phone": 0,
+//   "date": "YYYY-MM-DD", 
+//   "time": "HH:MM:SS", ... 
+// }
 
+
+// ... rest of script
 header('Content-Type: application/json; charset=utf-8');
-header('Access-Control-Allow-Origin: *'); // allow microcontrollers / other origins
+header('Access-Control-Allow-Origin: *');
 
 @ini_set('precision', 14);
 @ini_set('serialize_precision', 10);
 
 date_default_timezone_set('Europe/Rome');
 
-// Disk paths (same folder as this file)
+// Disk paths
 $stateFile = __DIR__ . '/state.json';
 $scheduleFile = __DIR__ . '/schedule.json';
-$historyFile = __DIR__ . '/temp_history.csv';   // <= CSV log here
+$historyFile = __DIR__ . '/temp_history.csv';
+$phoneHistoryFile = __DIR__ . '/phone_history.csv'; // <--- NEW LOG FILE
 
 // ---------- helpers ----------
 function read_json($file)
@@ -35,7 +56,6 @@ function write_json_atomic($file, $data)
     $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
     if ($json === false)
         return false;
-
     $fp = @fopen($tmp, 'wb');
     if (!$fp)
         return false;
@@ -43,7 +63,6 @@ function write_json_atomic($file, $data)
     $ok = fwrite($fp, $json) !== false;
     @flock($fp, LOCK_UN);
     @fclose($fp);
-
     if (!$ok) {
         @unlink($tmp);
         return false;
@@ -62,7 +81,7 @@ function hmToMinutes($hm)
 function computeAutoSetpoint($schedule, $manualSetpoint)
 {
     $now = new DateTime();
-    $dayIndex = ((int) $now->format('w') + 6) % 7; // Monday=0
+    $dayIndex = ((int) $now->format('w') + 6) % 7;
     if (!isset($schedule[$dayIndex]['slots']) || !is_array($schedule[$dayIndex]['slots']) || !count($schedule[$dayIndex]['slots'])) {
         return (float) $manualSetpoint;
     }
@@ -83,8 +102,8 @@ function one_decimal_str($n)
 }
 
 /**
- * Append "unix_ts,temperature" to $historyFile if its last modification
- * was more than $minDelta seconds ago. Also prunes rows older than $keepSec.
+ * Temp History: Prunes older than $keepSec (default 48h)
+ * Throttles writes ($minDelta)
  */
 function history_append_if_due(string $historyFile, float $temp, int $minDelta = 600, int $keepSec = 172800): void
 {
@@ -96,10 +115,9 @@ function history_append_if_due(string $historyFile, float $temp, int $minDelta =
     }
 
     if ($due) {
-        // Append new sample
         @file_put_contents($historyFile, $now . ',' . number_format($temp, 2, '.', '') . "\n", FILE_APPEND);
 
-        // Prune > keepSec old
+        // Prune
         $cutoff = $now - $keepSec;
         $rows = @file($historyFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
         if ($rows !== false) {
@@ -108,11 +126,9 @@ function history_append_if_due(string $historyFile, float $temp, int $minDelta =
                 $parts = explode(',', $r, 2);
                 if (!count($parts))
                     continue;
-                $ts = (int) $parts[0];
-                if ($ts >= $cutoff)
+                if ((int) $parts[0] >= $cutoff)
                     $kept[] = $r;
             }
-            // Atomic-ish rewrite
             $tmp = $historyFile . '.tmp';
             if (@file_put_contents($tmp, implode("\n", $kept) . (count($kept) ? "\n" : '')) !== false) {
                 @rename($tmp, $historyFile);
@@ -121,31 +137,81 @@ function history_append_if_due(string $historyFile, float $temp, int $minDelta =
     }
 }
 
+/**
+ * Phone History: Log NOW, prune older than 24h (86400 sec)
+ */
+function phone_history_append(string $file, int $val): void
+{
+    $now = time();
+    $keepSec = 86400; // 24 Hours
+
+    // 1. Append new value immediately
+    @file_put_contents($file, $now . ',' . $val . "\n", FILE_APPEND);
+
+    // 2. Prune old values
+    $cutoff = $now - $keepSec;
+    $rows = @file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+
+    // Only rewrite if we actually have data to check
+    if ($rows !== false && count($rows) > 0) {
+        $kept = [];
+        $rewriteNeeded = false;
+
+        foreach ($rows as $r) {
+            $parts = explode(',', $r, 2);
+            if (!count($parts))
+                continue;
+
+            $ts = (int) $parts[0];
+            if ($ts >= $cutoff) {
+                $kept[] = $r;
+            } else {
+                $rewriteNeeded = true; // Found an old row, so we need to save the cleaned list
+            }
+        }
+
+        // Optimization: only write to disk if we actually removed something
+        // (Or occasionally to ensure file health, but logic here is simple)
+        if ($rewriteNeeded) {
+            $tmp = $file . '.tmp';
+            $content = implode("\n", $kept) . (count($kept) ? "\n" : '');
+            if (@file_put_contents($tmp, $content) !== false) {
+                @rename($tmp, $file);
+            }
+        }
+    }
+}
+
 // ---------- load state & schedule ----------
 $state = read_json($stateFile);
 $scheduleWrap = read_json($scheduleFile);
-$schedule = isset($scheduleWrap['schedule']) && is_array($scheduleWrap['schedule'])
-    ? $scheduleWrap['schedule'] : [];
+$schedule = isset($scheduleWrap['schedule']) && is_array($scheduleWrap['schedule']) ? $scheduleWrap['schedule'] : [];
 
 $mode = $state['mode'] ?? 'AUTO';
 $manualSetpoint = isset($state['manualSetpoint']) ? (float) $state['manualSetpoint'] : 20.0;
 $actualTemp = isset($state['actualTemp']) ? round((float) $state['actualTemp'], 1) : null;
 $cald = isset($state['cald']) ? (int) $state['cald'] : 0;
+// Load phone state (default to 0 if missing)
+$phone = isset($state['phone']) ? (int) $state['phone'] : 0;
 
-// ---------- optional updates from parameters ----------
+// ---------- optional updates ----------
 $tempParam = $_GET['temp'] ?? $_POST['temp'] ?? null;
 $caldParam = $_GET['cald'] ?? $_POST['cald'] ?? null;
+$phoneParam = $_GET['phone'] ?? $_POST['phone'] ?? null; // <--- Check Param
 
 $updated = false;
+
+// 1. Handle Temp
 if ($tempParam !== null) {
-    $newTemp = round((float) $tempParam, 1); // store with 1 decimal
+    $newTemp = round((float) $tempParam, 1);
     $state['actualTemp'] = $newTemp;
     $actualTemp = $newTemp;
     $updated = true;
-
-    // --- NEW: log to history only if last modification > 10 minutes ---
+    // Log temp (throttled 10 mins, keep 48h)
     history_append_if_due($historyFile, (float) $newTemp, 600, 172800);
 }
+
+// 2. Handle Cald (Relay)
 if ($caldParam !== null) {
     $newCald = ((int) $caldParam === 1) ? 1 : 0;
     $state['cald'] = $newCald;
@@ -153,25 +219,36 @@ if ($caldParam !== null) {
     $updated = true;
 }
 
-// Save back if we updated anything
+// 3. Handle Phone (NEW)
+if ($phoneParam !== null) {
+    $newPhone = ((int) $phoneParam === 1) ? 1 : 0;
+    $state['phone'] = $newPhone;
+    $phone = $newPhone;
+    $updated = true;
+
+    // Log phone (Log now, keep 24h)
+    phone_history_append($phoneHistoryFile, $newPhone);
+}
+
+// Save state.json
 if ($updated) {
     $okDisk = write_json_atomic($stateFile, $state);
     if (!$okDisk) {
-        echo json_encode(['ok' => false, 'error' => 'Failed to write state.json (permissions?)']);
+        echo json_encode(['ok' => false, 'error' => 'Failed to write state.json']);
         exit;
     }
 }
 
-// ---------- compute current setpoint ----------
+// ---------- compute setpoint ----------
 if ($mode === 'OFF') {
     $setpoint = null;
 } elseif ($mode === 'ON') {
     $setpoint = $manualSetpoint;
-} else { // AUTO
+} else {
     $setpoint = computeAutoSetpoint($schedule, $manualSetpoint);
 }
 
-// ---------- normalize numbers for output ----------
+// ---------- normalize numbers ----------
 $actualTemp_num = ($actualTemp !== null) ? (float) one_decimal_str($actualTemp) : null;
 $actualTemp_str = ($actualTemp !== null) ? one_decimal_str($actualTemp) : null;
 
@@ -184,7 +261,9 @@ echo json_encode([
     'actualTemp' => $actualTemp_num,
     'actualTemp_str' => $actualTemp_str,
     'cald' => $cald,
+    'phone' => $phone, // <--- Return current phone state
     'date' => $now->format('Y-m-d'),
     'time' => $now->format('H:i:s'),
     'timezone' => $now->getTimezone()->getName()
 ], JSON_UNESCAPED_SLASHES);
+?>
