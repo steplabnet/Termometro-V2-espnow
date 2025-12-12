@@ -1,6 +1,6 @@
 <?php
 // stanza.php — single-file PHP dashboard for a chronothermostat
-// Backend endpoints: load/save schedule + load/save state (mode, manualSetpoint, actualTemp)
+// Backend endpoints: load/save schedule + load/save state (mode, manualSetpoint, actualTemp, phone)
 // NOW also: load/save presets (OFF/LOW/NORMAL/HIGH...) in presets.json
 // Frontend: modern light UI, OFF/ON/AUTO, weekly chrono table, active setpoint highlight,
 // polling actual temperature from state.json every 10s.
@@ -241,6 +241,10 @@ if ($action === 'save_state' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     if (isset($decoded['cald'])) {
         $state['cald'] = (int) $decoded['cald'];
     }
+    // Handle Phone presence
+    if (isset($decoded['phone'])) {
+        $state['phone'] = (int) $decoded['phone'];
+    }
 
     if (!write_json_atomic($GLOBALS['STATE_FILE'], $state)) {
         echo json_encode([
@@ -267,10 +271,11 @@ if ($action === 'load_state') {
             'mode' => $j['mode'] ?? null,
             'manualSetpoint' => isset($j['manualSetpoint']) ? (float) $j['manualSetpoint'] : null,
             'actualTemp' => isset($j['actualTemp']) ? (float) $j['actualTemp'] : null,
-            'cald' => isset($j['cald']) ? (int) $j['cald'] : 0
+            'cald' => isset($j['cald']) ? (int) $j['cald'] : 0,
+            'phone' => isset($j['phone']) ? (int) $j['phone'] : 0
         ]);
     } else {
-        echo json_encode(['ok' => true, 'mode' => null, 'manualSetpoint' => null, 'actualTemp' => null, 'cald' => 0]);
+        echo json_encode(['ok' => true, 'mode' => null, 'manualSetpoint' => null, 'actualTemp' => null, 'cald' => 0, 'phone' => 0]);
     }
     exit;
 }
@@ -672,10 +677,24 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     <div class="unit">°C</div>
                 </div>
             </div>
+
+            <!-- Heater Status Card with Phone Indicator -->
             <div class="card pad span4">
                 <div class="subtitle">Heater status</div>
                 <div class="row">
                     <div id="heaterStatus" style="font-size:20px;font-weight:600;color:#6b7280">--</div>
+                </div>
+                <!-- Added Phone Status Indicator with Icon -->
+                <div
+                    style="margin-top:12px; font-size:13px; color:var(--muted); display:flex; align-items:center; gap:6px; border-top:1px solid var(--border); padding-top:8px;">
+                    <!-- SVG Icon for Phone -->
+                    <svg id="phoneIcon" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24"
+                        fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+                        stroke-linejoin="round" style="color:var(--muted)">
+                        <rect x="5" y="2" width="14" height="20" rx="2" ry="2"></rect>
+                        <line x1="12" y1="18" x2="12.01" y2="18"></line>
+                    </svg>
+                    <span id="phoneStatus" style="font-weight:600">--</span>
                 </div>
             </div>
 
@@ -1366,6 +1385,8 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
             });
 
             const heaterStatusEl = document.getElementById('heaterStatus');
+            const phoneStatusEl = document.getElementById('phoneStatus');
+            const phoneIconEl = document.getElementById('phoneIcon');
 
             async function fetchActualTemp() {
                 try {
@@ -1391,10 +1412,32 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
                         heaterStatusEl.textContent = '--';
                         heaterStatusEl.style.color = '#6b7280';
                     }
+
+                    // --- Update Phone Status ---
+                    if (j && typeof j.phone === 'number') {
+                        if (j.phone === 1) {
+                            phoneStatusEl.textContent = 'Present';
+                            phoneStatusEl.style.color = '#2563eb'; // Blue
+                            phoneIconEl.style.color = '#2563eb';
+                            phoneIconEl.setAttribute('fill', '#dbeafe'); // Fill with light blue
+                        } else {
+                            phoneStatusEl.textContent = 'Absent';
+                            phoneStatusEl.style.color = '#9ca3af'; // Gray
+                            phoneIconEl.style.color = '#9ca3af';
+                            phoneIconEl.setAttribute('fill', 'none'); // No fill
+                        }
+                    } else {
+                        phoneStatusEl.textContent = '--';
+                        phoneStatusEl.style.color = '#6b7280';
+                        phoneIconEl.style.color = '#6b7280';
+                        phoneIconEl.setAttribute('fill', 'none');
+                    }
+
                 } catch (e) {
                     actualTempEl.textContent = '--.-';
                     heaterStatusEl.textContent = '--';
                     heaterStatusEl.style.color = '#6b7280';
+                    phoneStatusEl.textContent = '--';
                 }
             }
 
