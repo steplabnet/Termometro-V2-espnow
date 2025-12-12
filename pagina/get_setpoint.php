@@ -140,15 +140,25 @@ function history_append_if_due(string $historyFile, float $temp, int $minDelta =
 /**
  * Phone History: Log NOW, prune older than 24h (86400 sec)
  */
+/**
+ * Phone History: Log ONCE PER MINUTE, prune older than 24h (86400 sec)
+ */
 function phone_history_append(string $file, int $val): void
 {
     $now = time();
     $keepSec = 86400; // 24 Hours
+    $minDelta = 60;   // 60 Seconds throttle
 
-    // 1. Append new value immediately
+    // 1. Check Throttling (Don't write if written recently)
+    $mtime = @filemtime($file);
+    if ($mtime !== false && ($now - $mtime) < $minDelta) {
+        return; // Exit function, do not save
+    }
+
+    // 2. Append new value
     @file_put_contents($file, $now . ',' . $val . "\n", FILE_APPEND);
 
-    // 2. Prune old values
+    // 3. Prune old values
     $cutoff = $now - $keepSec;
     $rows = @file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
 
@@ -171,7 +181,6 @@ function phone_history_append(string $file, int $val): void
         }
 
         // Optimization: only write to disk if we actually removed something
-        // (Or occasionally to ensure file health, but logic here is simple)
         if ($rewriteNeeded) {
             $tmp = $file . '.tmp';
             $content = implode("\n", $kept) . (count($kept) ? "\n" : '');

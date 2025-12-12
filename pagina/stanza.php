@@ -1,7 +1,6 @@
 <?php
 // stanza.php — single-file PHP dashboard for a chronothermostat
-// Backend endpoints: load/save schedule + load/save state (mode, manualSetpoint, actualTemp, phone)
-// NOW also: load/save presets (OFF/LOW/NORMAL/HIGH...) in presets.json
+// Backend endpoints: load/save schedule + load/save state + load/save presets + load/save phone history
 // Frontend: modern light UI, OFF/ON/AUTO, weekly chrono table, active setpoint highlight,
 // polling actual temperature from state.json every 10s.
 
@@ -11,17 +10,18 @@ $action = $_GET['action'] ?? '';
 /** ---------- helpers for state in /dev/shm ---------- */
 $RAM_DIR = '/dev/shm';
 $STATE_FILENAME = 'state.json';
+$PHONE_HISTORY_FILENAME = 'phone_history.csv'; // New file for phone history
 
 /** ---------- temperature history (CSV in /dev/shm) ---------- */
 $HISTORY_FILENAME = 'temp_history.csv';
 $HISTORY_FILE = resolve_state_path($RAM_DIR, $HISTORY_FILENAME);
+$PHONE_HISTORY_FILE = resolve_state_path($RAM_DIR, $PHONE_HISTORY_FILENAME);
 
 /** ---------- presets file (in script dir) ---------- */
 $PRESETS_FILE = __DIR__ . '/presets.json';
 
 /**
  * Append one row "unix_ts,temperature" if last sample is older than $minDeltaSec.
- * Also prunes rows older than $keepSec.
  */
 function history_maybe_append(string $path, float $temp, int $minDeltaSec = 1200, int $keepSec = 172800): void
 {
@@ -54,6 +54,7 @@ function history_maybe_append(string $path, float $temp, int $minDeltaSec = 1200
         @file_put_contents($path, $now . ',' . number_format($temp, 2, '.', '') . "\n", FILE_APPEND);
     }
 
+    // Cleanup old lines
     if (is_readable($path)) {
         $cutoff = $now - $keepSec;
         $rows = @file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
@@ -89,7 +90,7 @@ function history_load_last24(string $path): array
     if ($rows === false)
         return $out;
 
-    $bucket = 1200;
+    $bucket = 1200; // Downsample for temp chart
     $seen = [];
     foreach ($rows as $r) {
         [$tsStr, $tempStr] = array_map('trim', explode(',', $r, 2) + ['', '']);
@@ -104,6 +105,34 @@ function history_load_last24(string $path): array
     ksort($seen);
     foreach ($seen as $ts => $temp) {
         $out[] = [gmdate('c', $ts), $temp];
+    }
+    return $out;
+}
+
+/** 
+ * Return last 24h of phone presence [ [t_iso, 0|1], ... ] 
+ * No bucket downsampling to preserve exact entry/exit times 
+ */
+function phone_history_load_last24(string $path): array
+{
+    $now = time();
+    $cutoff = $now - 86400;
+    $out = [];
+    if (!is_readable($path))
+        return $out;
+    $rows = @file($path, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    if ($rows === false)
+        return $out;
+
+    foreach ($rows as $r) {
+        [$tsStr, $valStr] = array_map('trim', explode(',', $r, 2) + ['', '']);
+        if (!is_numeric($tsStr))
+            continue;
+        $ts = (int) $tsStr;
+        if ($ts < $cutoff)
+            continue;
+
+        $out[] = [gmdate('c', $ts), (int) $valStr];
     }
     return $out;
 }
@@ -143,6 +172,18 @@ if ($action === 'load_history') {
         $csv = $GLOBALS['HISTORY_FILE'];
     }
     $points = history_load_last24($csv);
+    echo json_encode(['ok' => true, 'points' => $points], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    exit;
+}
+
+/** ---------- API: Load 24h Phone history (READ-ONLY) ---------- */
+if ($action === 'load_phone_history') {
+    header('Content-Type: application/json; charset=utf-8');
+    $csv = __DIR__ . '/phone_history.csv';
+    if (!is_readable($csv)) {
+        $csv = $GLOBALS['PHONE_HISTORY_FILE'];
+    }
+    $points = phone_history_load_last24($csv);
     echo json_encode(['ok' => true, 'points' => $points], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     exit;
 }
@@ -241,7 +282,7 @@ if ($action === 'save_state' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     if (isset($decoded['cald'])) {
         $state['cald'] = (int) $decoded['cald'];
     }
-    // Handle Phone presence
+    // Handle Phone presence state save
     if (isset($decoded['phone'])) {
         $state['phone'] = (int) $decoded['phone'];
     }
@@ -280,7 +321,7 @@ if ($action === 'load_state') {
     exit;
 }
 
-/** ---------- API: Load presets (new) ---------- */
+/** ---------- API: Load presets ---------- */
 if ($action === 'load_presets') {
     header('Content-Type: application/json; charset=utf-8');
 
@@ -309,7 +350,7 @@ if ($action === 'load_presets') {
     exit;
 }
 
-/** ---------- API: Save presets (new) ---------- */
+/** ---------- API: Save presets ---------- */
 if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     header('Content-Type: application/json; charset=utf-8');
     $body = file_get_contents('php://input');
@@ -656,6 +697,10 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
         #tempChart {
             height: 100px !important;
         }
+
+        #phoneChart {
+            height: 80px !important;
+        }
     </style>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
 
@@ -716,6 +761,8 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 </div>
                 <div class="subtitle" id="setpointHint">Manual setpoint</div>
             </div>
+
+            <!-- Temperature Chart -->
             <div class="card pad span12">
                 <div class="row" style="justify-content: space-between; align-items: flex-end; margin-bottom: 8px;">
                     <div class="subtitle">Temperature (last 24h)</div>
@@ -724,10 +771,14 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
                         <!-- JS will inject: ↗ +0.5 °C/h -->
                     </div>
                 </div>
-                <canvas id="tempChart" style="height:100px"></canvas>
+                <canvas id="tempChart"></canvas>
             </div>
 
-
+            <!-- Phone Presence Chart -->
+            <div class="card pad span12">
+                <div class="subtitle" style="margin-bottom:8px">Phone Presence (last 24h)</div>
+                <canvas id="phoneChart"></canvas>
+            </div>
 
             <div class="card pad span12">
                 <div class="toolbar">
@@ -841,8 +892,12 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
             const MANUAL_SP_KEY = 'chrono.manual_sp.v1';
             const SERVER_STATE_URL_SAVE = '?action=save_state';
             const SERVER_STATE_URL_LOAD = '?action=load_state';
+
+            // Charts
             const tempChartCanvas = document.getElementById('tempChart');
+            const phoneChartCanvas = document.getElementById('phoneChart');
             let tempChart;
+            let phoneChart;
 
             // ---- load presets from server BEFORE rendering UI ----
             try {
@@ -858,7 +913,7 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
 
-            // --- STATE FOR SELECTION ---
+            // --- STATE FOR SELECTION (Temp Chart) ---
             let rawHistoryPoints = []; // Store full objects {t: ms, y: val} globally for the chart
             let selection = { p1: null, p2: null }; // Store indices of clicked points
             let lastAutoTrendHtml = ''; // To restore if selection is cleared
@@ -1038,7 +1093,6 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     options: {
                         responsive: true,
                         maintainAspectRatio: false,
-                        // CRITICAL CHANGE: mode index + intersect false makes clicking the "column" works
                         interaction: { mode: 'index', intersect: false },
                         onClick: (e, elements, chart) => handleChartClick(e, elements, chart),
                         plugins: {
@@ -1068,68 +1122,137 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 });
             }
 
-            async function fetchHistoryAndRender() {
-                try {
-                    const res = await fetch('?action=load_history&_=' + Date.now());
-                    if (!res.ok) throw new Error('HTTP ' + res.status);
-                    const j = await res.json();
-                    if (!j.ok || !Array.isArray(j.points)) return;
+            function buildPhoneChart(labels, data) {
+                if (phoneChart) {
+                    phoneChart.data.labels = labels;
+                    phoneChart.data.datasets[0].data = data;
+                    phoneChart.update();
+                    return;
+                }
 
-                    const labels = [];
-                    const values = [];
-                    rawHistoryPoints = [];
-
-                    for (const [iso, tStr] of j.points) {
-                        const val = Number(tStr);
-                        const dt = new Date(iso);
-                        const hh = String(dt.getHours()).padStart(2, '0');
-                        const mm = String(dt.getMinutes()).padStart(2, '0');
-
-                        labels.push(`${hh}:${mm}`);
-                        values.push(val);
-                        rawHistoryPoints.push({ t: dt.getTime(), y: val });
-                    }
-
-                    // --- Auto 1h Trend Logic ---
-                    const trendDisplay = document.getElementById('trendDisplay');
-                    const trendData = new Array(values.length).fill(null);
-                    lastAutoTrendHtml = ''; // Reset global auto string
-
-                    if (rawHistoryPoints.length > 1) {
-                        const nowMs = rawHistoryPoints[rawHistoryPoints.length - 1].t;
-                        const recentPoints = rawHistoryPoints.filter(p => p.t >= (nowMs - 3600000));
-
-                        if (recentPoints.length >= 2) {
-                            const reg = calculateLinearRegression(recentPoints);
-                            if (reg) {
-                                const slopePerHour = reg.slopePerSec * 3600;
-                                const symbol = slopePerHour > 0 ? '↗' : (slopePerHour < 0 ? '↘' : '→');
-                                const color = slopePerHour > 0 ? '#ef4444' : (slopePerHour < 0 ? '#2563eb' : '#6b7280');
-
-                                lastAutoTrendHtml = `<span style="color:${color}; font-size:16px; margin-right:4px;">${symbol}</span> ${Math.abs(slopePerHour).toFixed(1)} °C/h`;
-
-                                // If user hasn't selected anything, show auto trend
-                                if (selection.p1 === null) {
-                                    trendDisplay.innerHTML = lastAutoTrendHtml;
-                                    trendDisplay.style.display = 'inline-flex';
-                                    trendDisplay.style.borderColor = 'transparent';
+                const ctx = phoneChartCanvas.getContext('2d');
+                phoneChart = new Chart(ctx, {
+                    type: 'line',
+                    data: {
+                        labels,
+                        datasets: [{
+                            label: 'Presence',
+                            data: data,
+                            borderColor: '#2563eb', // Brand blue
+                            backgroundColor: '#dbeafe', // Brand weak
+                            borderWidth: 1.5,
+                            fill: true,
+                            stepped: true, // Step chart for binary data
+                            pointRadius: 0,
+                            pointHitRadius: 10
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        maintainAspectRatio: false,
+                        interaction: { mode: 'index', intersect: false },
+                        plugins: {
+                            legend: { display: false },
+                            tooltip: {
+                                callbacks: {
+                                    label: (ctx) => ctx.parsed.y === 1 ? 'Present' : 'Absent'
                                 }
-
-                                const startIndex = rawHistoryPoints.indexOf(recentPoints[0]);
-                                for (let i = startIndex; i < rawHistoryPoints.length; i++) {
-                                    const p = rawHistoryPoints[i];
-                                    const secs = (p.t - reg.startX) / 1000;
-                                    trendData[i] = reg.intercept + (reg.slopePerSec * secs);
+                            }
+                        },
+                        scales: {
+                            x: {
+                                ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 12 },
+                                grid: { display: false }
+                            },
+                            y: {
+                                min: 0,
+                                max: 1.2, // little padding on top
+                                ticks: {
+                                    stepSize: 1,
+                                    callback: (v) => v === 0 ? 'Absent' : (v === 1 ? 'Present' : '')
                                 }
                             }
                         }
                     }
-                    if (!lastAutoTrendHtml && selection.p1 === null) {
-                        trendDisplay.style.display = 'none';
-                    }
+                });
+            }
 
-                    buildTempChart(labels, values, trendData);
-                } catch (e) { console.error(e); }
+            async function fetchHistoryAndRender() {
+                // Fetch Temp History
+                try {
+                    const res = await fetch('?action=load_history&_=' + Date.now());
+                    if (!res.ok) throw new Error('HTTP ' + res.status);
+                    const j = await res.json();
+                    if (j.ok && Array.isArray(j.points)) {
+                        const labels = [];
+                        const values = [];
+                        rawHistoryPoints = [];
+
+                        for (const [iso, tStr] of j.points) {
+                            const val = Number(tStr);
+                            const dt = new Date(iso);
+                            const hh = String(dt.getHours()).padStart(2, '0');
+                            const mm = String(dt.getMinutes()).padStart(2, '0');
+
+                            labels.push(`${hh}:${mm}`);
+                            values.push(val);
+                            rawHistoryPoints.push({ t: dt.getTime(), y: val });
+                        }
+
+                        // ... (Linear regression logic omitted for brevity, same as before) ...
+                        // --- Auto 1h Trend Logic (Simplified for this snippet) ---
+                        const trendData = new Array(values.length).fill(null);
+                        const trendDisplay = document.getElementById('trendDisplay');
+                        lastAutoTrendHtml = '';
+                        if (rawHistoryPoints.length > 1) {
+                            const nowMs = rawHistoryPoints[rawHistoryPoints.length - 1].t;
+                            const recentPoints = rawHistoryPoints.filter(p => p.t >= (nowMs - 3600000));
+                            if (recentPoints.length >= 2) {
+                                const reg = calculateLinearRegression(recentPoints);
+                                if (reg) {
+                                    const slopePerHour = reg.slopePerSec * 3600;
+                                    const symbol = slopePerHour > 0 ? '↗' : (slopePerHour < 0 ? '↘' : '→');
+                                    const color = slopePerHour > 0 ? '#ef4444' : (slopePerHour < 0 ? '#2563eb' : '#6b7280');
+                                    lastAutoTrendHtml = `<span style="color:${color}; font-size:16px; margin-right:4px;">${symbol}</span> ${Math.abs(slopePerHour).toFixed(1)} °C/h`;
+                                    if (selection.p1 === null) {
+                                        trendDisplay.innerHTML = lastAutoTrendHtml;
+                                        trendDisplay.style.display = 'inline-flex';
+                                        trendDisplay.style.borderColor = 'transparent';
+                                    }
+                                    const startIndex = rawHistoryPoints.indexOf(recentPoints[0]);
+                                    for (let i = startIndex; i < rawHistoryPoints.length; i++) {
+                                        const p = rawHistoryPoints[i];
+                                        const secs = (p.t - reg.startX) / 1000;
+                                        trendData[i] = reg.intercept + (reg.slopePerSec * secs);
+                                    }
+                                }
+                            }
+                        }
+                        if (!lastAutoTrendHtml && selection.p1 === null) trendDisplay.style.display = 'none';
+
+                        buildTempChart(labels, values, trendData);
+                    }
+                } catch (e) { console.error('Temp history error:', e); }
+
+                // Fetch Phone History
+                try {
+                    const res = await fetch('?action=load_phone_history&_=' + Date.now());
+                    if (res.ok) {
+                        const j = await res.json();
+                        if (j.ok && Array.isArray(j.points)) {
+                            const labels = [];
+                            const values = [];
+                            for (const [iso, val] of j.points) {
+                                const dt = new Date(iso);
+                                const hh = String(dt.getHours()).padStart(2, '0');
+                                const mm = String(dt.getMinutes()).padStart(2, '0');
+                                labels.push(`${hh}:${mm}`);
+                                values.push(val);
+                            }
+                            buildPhoneChart(labels, values);
+                        }
+                    }
+                } catch (e) { console.error('Phone history error:', e); }
             }
 
 
