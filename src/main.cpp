@@ -3,42 +3,32 @@
  * PROJECT: ESP32-C3 Smart Office Thermostat
  * ======================================================================================
  *
- * DESCRIPTION:
- * This sketch controls a heating system based on temperature readings (DS18B20),
- * manual user input (Web Interface), and automatic presence detection (BLE).
- *
  * AUTOMATION LOGIC & PRIORITIES:
- * The thermostat automatically adjusts the target temperature (Setpoint) based on
- * the presence of a specific smartphone (detected via Bluetooth Low Energy RSSI).
  *
- * 1. PRIORITY 1: COMFORT MODE (Presence Detected)
- *    - Condition: If the phone has been seen within the LAST 5 MINUTES.
- *    - Action:    The Setpoint is forced to a MINIMUM of 18.0°C.
- *                 (If the user set it to 10°C, it automatically raises to 18°C.
- *                  If it was already 20°C, it stays at 20°C).
+ * 1. PRIORITY 1: COMFORT ENFORCEMENT (Presence Detected)
+ *    - Trigger:   BLE Device (Phone) seen within the LAST 5 MINUTES.
+ *    - Behavior:  Enforces a MINIMUM floor of 18.0°C.
+ *                 (If setpoint is < 18.0, it is raised to 18.0.
+ *                  If setpoint is already higher, e.g. 21.0, it remains unchanged).
  *
- * 2. PRIORITY 2: ECO MODE (Absence Detected)
- *    - Condition: If the phone has NOT been seen for more than 10 MINUTES
- *                 AND the current time is after 10:00 AM.
- *    - Action:    The Setpoint is capped at a MAXIMUM of 15.0°C.
- *                 (If the setpoint was 19°C, it drops to 15°C to save energy).
+ * 2. PRIORITY 2: ECO / AWAY ENFORCEMENT (Absence Detected)
+ *    - Trigger:   Phone NOT seen for > 10 MINUTES
+ *                 AND Current Time is >= 10:00 AM.
+ *    - Behavior:  Enforces a MAXIMUM cap of 15.0°C.
+ *                 (If setpoint is > 15.0, it is lowered to 15.0).
  *
- * 3. PRIORITY 3: MANUAL / REMOTE SETTING
- *    - If neither of the above automatic overrides are triggered, the system
- *      uses the last setpoint defined by the user via the Web UI or HTTP Remote.
+ * 3. PRIORITY 3: MORNING / REMOTE / MANUAL DEFAULT
+ *    - Trigger:   Occurs when neither Priority 1 nor Priority 2 are active.
+ *                 (Specifically: Before 10:00 AM OR during the 5-10m buffer window).
+ *    - Behavior:  The thermostat follows the last setpoint received from:
+ *                 a) The Web Interface (Manual)
+ *                 b) The Remote Cloud API (HTTPS)
+ *    - Note:      This allows pre-heating in the morning (00:00 - 09:59) without
+ *                 needing a phone present.
  *
- * CONNECTIVITY:
- * - WiFi (Station + AP): Connects to local network for NTP time and Remote Logging.
- * - ESP-NOW: Broadcasts status to local displays/peers.
- * - BLE: Scans for nearby devices to detect presence.
- * - HTTP: Reports telemetry to a remote server and fetches remote overrides.
- *
- * HARDWARE:
- * - MCU: ESP32-C3 SuperMini
- * - Sensor: DS18B20 (OneWire) on GPIO 3
- * - Feedback: Onboard LED (GPIO 8)
  * ======================================================================================
  */
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
@@ -88,7 +78,7 @@ const int BLE_SCAN_TIME = 2;        // Seconds to scan per loop
 
 // Telemetry Timing
 static const uint32_t INTERVAL_ACTIVE_MS = 2000;
-static const uint32_t INTERVAL_IDLE_MS = 600000; // 10 mins
+static const uint32_t INTERVAL_IDLE_MS = 3000; // 10 mins
 
 // ======================================================================================
 // GLOBAL OBJECTS & VARIABLES
@@ -206,9 +196,13 @@ static bool cesanaReportAndFetch(float tempC, bool heating)
 
   HTTPClient https;
 
+  // Calculate if phone is considered present based on the 5-minute Logic Window
+  // (Matches Priority 1 Logic in main loop)
+  bool logicPhonePresent = (millis() - g_lastPhoneSeenMs < PHONE_PRESENCE_WINDOW_MS);
+
   String url = "https://cesana.steplab.net/get_setpoint.php?temp=" + String(tempC, 1) +
                "&cald=" + (heating ? "1" : "0") +
-               "&phone=" + (g_phoneDetected ? "1" : "0");
+               "&phone=" + (logicPhonePresent ? "1" : "0");
 
   Serial.print(">>> [HTTP] Calling: ");
   Serial.println(url);
@@ -539,16 +533,19 @@ void loop()
         saveFixedSetpoint();
       }
     }
-    // RULE B: ABSENCE / NIGHT (PRIORITY LOW)
-    // Only if Rule A didn't apply (because msSincePhone > 5 min implies this check is valid)
-    // If Time > 10:00 AND Phone missing > 10 mins -> Cap at 15.0
+    // RULE B: ABSENCE / ECO (PRIORITY LOW)
+    // Triggers ONLY if:
+    // 1. Time is known
+    // 2. Hour is >= 10 (10:00 AM, 11:00 AM... etc)
+    // 3. Phone absent > 10 min
     else if (timeKnown &&
-             timeinfo.tm_hour > 10 &&
+             timeinfo.tm_hour >= 10 &&
              msSincePhone > PHONE_ABSENCE_TIMEOUT_MS)
     {
+      // If time < 10, this block is SKIPPED, so it follows existing/remote setpoint.
       if (g_fixedSetpoint > 15.0)
       {
-        Serial.println(">>> [LOGIC] Time > 10 & Phone absent > 10min. Capping at 15.0 C");
+        Serial.println(">>> [LOGIC] Time >= 10 & Phone absent > 10min. Capping at 15.0 C");
         g_fixedSetpoint = 15.0;
         g_fixedPreset = "auto_eco_15";
         saveFixedSetpoint();
