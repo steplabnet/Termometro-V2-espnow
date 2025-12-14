@@ -10,7 +10,7 @@ $action = $_GET['action'] ?? '';
 /** ---------- helpers for state in /dev/shm ---------- */
 $RAM_DIR = '/dev/shm';
 $STATE_FILENAME = 'state.json';
-$PHONE_HISTORY_FILENAME = 'phone_history.csv'; // New file for phone history
+$PHONE_HISTORY_FILENAME = 'phone_history.csv';
 
 /** ---------- temperature history (CSV in /dev/shm) ---------- */
 $HISTORY_FILENAME = 'temp_history.csv';
@@ -282,9 +282,12 @@ if ($action === 'save_state' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     if (isset($decoded['cald'])) {
         $state['cald'] = (int) $decoded['cald'];
     }
-    // Handle Phone presence state save
     if (isset($decoded['phone'])) {
         $state['phone'] = (int) $decoded['phone'];
+    }
+    // Handle 'real' parameter
+    if (isset($decoded['real'])) {
+        $state['real'] = floatval($decoded['real']);
     }
 
     if (!write_json_atomic($GLOBALS['STATE_FILE'], $state)) {
@@ -312,11 +315,12 @@ if ($action === 'load_state') {
             'mode' => $j['mode'] ?? null,
             'manualSetpoint' => isset($j['manualSetpoint']) ? (float) $j['manualSetpoint'] : null,
             'actualTemp' => isset($j['actualTemp']) ? (float) $j['actualTemp'] : null,
+            'real' => isset($j['real']) ? (float) $j['real'] : null, // <--- Load real param
             'cald' => isset($j['cald']) ? (int) $j['cald'] : 0,
             'phone' => isset($j['phone']) ? (int) $j['phone'] : 0
         ]);
     } else {
-        echo json_encode(['ok' => true, 'mode' => null, 'manualSetpoint' => null, 'actualTemp' => null, 'cald' => 0, 'phone' => 0]);
+        echo json_encode(['ok' => true, 'mode' => null, 'manualSetpoint' => null, 'actualTemp' => null, 'real' => null, 'cald' => 0, 'phone' => 0]);
     }
     exit;
 }
@@ -762,6 +766,16 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
                 <div class="subtitle" id="setpointHint">Manual setpoint</div>
             </div>
 
+            <!-- NEW CARD FOR "REAL" PARAMETER -->
+            <div class="card pad span4">
+                <div class="subtitle">Real</div>
+                <div class="row">
+                    <div class="temp" id="realTemp" style="font-size: 40px;">--.-</div>
+                    <div class="unit">°C</div>
+                </div>
+                <div class="subtitle">Sensor value</div>
+            </div>
+
             <!-- Temperature Chart -->
             <div class="card pad span12">
                 <div class="row" style="justify-content: space-between; align-items: flex-end; margin-bottom: 8px;">
@@ -868,6 +882,7 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
             const days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"];
             const byId = id => document.getElementById(id);
             const actualTempEl = byId('actualTemp');
+            const realTempEl = byId('realTemp'); // <--- New Element
             const setpointInput = byId('setpointInput');
             const setpointHint = byId('setpointHint');
             const statusDot = byId('statusDot');
@@ -1517,12 +1532,21 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     if (!res.ok) throw new Error('HTTP ' + res.status);
                     const j = await res.json();
 
+                    // Update Actual Temp
                     if (j && typeof j.actualTemp === 'number') {
                         actualTempEl.textContent = j.actualTemp.toFixed(1);
                     } else {
                         actualTempEl.textContent = '--.-';
                     }
 
+                    // Update Real (Sensor) Value
+                    if (j && typeof j.real === 'number') {
+                        realTempEl.textContent = j.real.toFixed(1);
+                    } else {
+                        realTempEl.textContent = '--.-';
+                    }
+
+                    // Update Heater Status
                     if (j && typeof j.cald === 'number') {
                         if (j.cald === 1) {
                             heaterStatusEl.textContent = 'Heater active';
@@ -1558,6 +1582,7 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 } catch (e) {
                     actualTempEl.textContent = '--.-';
+                    realTempEl.textContent = '--.-';
                     heaterStatusEl.textContent = '--';
                     heaterStatusEl.style.color = '#6b7280';
                     phoneStatusEl.textContent = '--';
