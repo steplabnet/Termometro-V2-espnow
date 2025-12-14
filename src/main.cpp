@@ -1,31 +1,6 @@
 /*
  * ======================================================================================
- * PROJECT: ESP32-C3 Smart Office Thermostat
- * ======================================================================================
- *
- * AUTOMATION LOGIC & PRIORITIES:
- *
- * 1. PRIORITY 1: COMFORT ENFORCEMENT (Presence Detected)
- *    - Trigger:   BLE Device (Phone) seen within the LAST 5 MINUTES.
- *    - Behavior:  Enforces a MINIMUM floor of 18.0°C.
- *                 (If setpoint is < 18.0, it is raised to 18.0.
- *                  If setpoint is already higher, e.g. 21.0, it remains unchanged).
- *
- * 2. PRIORITY 2: ECO / AWAY ENFORCEMENT (Absence Detected)
- *    - Trigger:   Phone NOT seen for > 10 MINUTES
- *                 AND Current Time is >= 10:00 AM.
- *    - Behavior:  Enforces a MAXIMUM cap of 15.0°C.
- *                 (If setpoint is > 15.0, it is lowered to 15.0).
- *
- * 3. PRIORITY 3: MORNING / REMOTE / MANUAL DEFAULT
- *    - Trigger:   Occurs when neither Priority 1 nor Priority 2 are active.
- *                 (Specifically: Before 10:00 AM OR during the 5-10m buffer window).
- *    - Behavior:  The thermostat follows the last setpoint received from:
- *                 a) The Web Interface (Manual)
- *                 b) The Remote Cloud API (HTTPS)
- *    - Note:      This allows pre-heating in the morning (00:00 - 09:59) without
- *                 needing a phone present.
- *
+ * PROJECT: ESP32-C3 Smart Office Thermostat (Official DevKitM-1 RGB Version)
  * ======================================================================================
  */
 
@@ -42,6 +17,7 @@
 #include <WiFiClientSecure.h>
 #include <Ticker.h>
 #include <time.h>
+#include <Adafruit_NeoPixel.h> // REQUIRED LIBRARY
 
 // BLE Headers
 #include <BLEDevice.h>
@@ -53,11 +29,9 @@
 // CONFIGURATION
 // ======================================================================================
 
-// UPDATED WI-FI CREDENTIALS
 static const char *WIFI_SSID_DEFAULT = "NETGEAR11";
 static const char *WIFI_PASS_DEFAULT = "breezypiano838";
 
-// Emergency Access Point (If WiFi fails)
 static const char *AP_SSID = "termometroUff";
 static const char *AP_PASS = "12345678";
 
@@ -68,17 +42,32 @@ const char *ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 3600;     // GMT+1 (Italy/CET)
 const int daylightOffset_sec = 3600; // +1 hour for DST
 
-// Hardware Pins (ESP32-C3 SuperMini)
-#define ONE_WIRE_BUS 3 // GPIO 3 (D3) - Requires 4.7k Resistor to 3.3V!
-#define LED_PIN 8      // GPIO 8 (Onboard LED, Active Low)
+// Hardware Pins (Official ESP32-C3 DevKitM-1)
+#define ONE_WIRE_BUS 3 // GPIO 3 (D3)
+#define RGB_PIN 8      // GPIO 8 (Onboard RGB LED)
 
 // BLE Settings
-const int BLE_RSSI_THRESHOLD = -75; // Sensitivity (-60 close, -90 far)
-const int BLE_SCAN_TIME = 2;        // Seconds to scan per loop
+const int BLE_RSSI_THRESHOLD = -75;
+const int BLE_SCAN_TIME = 1; // 1 Second Scan
 
 // Telemetry Timing
 static const uint32_t INTERVAL_ACTIVE_MS = 2000;
-static const uint32_t INTERVAL_IDLE_MS = 3000; // 10 mins
+static const uint32_t INTERVAL_IDLE_MS = 3000;
+
+// ======================================================================================
+// PRESENCE FILTER SETTINGS
+// ======================================================================================
+#define REQUIRED_HITS 10    // 10 Hits required
+#define HIT_WINDOW_MS 60000 // 1 Minute
+
+unsigned long g_detectionHistory[REQUIRED_HITS] = {0};
+int g_historyIndex = 0;
+int g_currentValidHits = 0;
+
+// --- AI CONFIG ---
+#define WINDOW_CHECK_INTERVAL 60000 // Check every minute
+float g_prevTemp = 0.0;
+int g_dropCount = 0;
 
 // ======================================================================================
 // GLOBAL OBJECTS & VARIABLES
@@ -88,6 +77,10 @@ DallasTemperature sensors(&oneWire);
 WebServer server(80);
 BLEScan *pBLEScan;
 Ticker g_wdtTicker;
+Ticker ledBlinker;
+
+// NEW: RGB LED Object
+Adafruit_NeoPixel pixels(1, RGB_PIN, NEO_GRB + NEO_KHZ800);
 
 // ESP-NOW Broadcast Address
 uint8_t TARGET[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
@@ -95,12 +88,16 @@ esp_now_peer_info_t peerInfo;
 
 // State Variables
 volatile float g_lastTempC = NAN;
-volatile uint8_t g_lastAction = 0; // 1 = ON, 0 = OFF
+volatile uint8_t g_lastAction = 0;
 bool g_phoneDetected = false;
 int g_maxRssi = -100;
 volatile bool g_wdtFed = false;
 
-// Settings (Persisted)
+// LED State Variables
+bool g_ledState = false;
+uint32_t g_blinkColor = 0; // Stores the current color (Blue or Green)
+
+// Settings
 static float g_fixedSetpoint = 19.0f;
 static String g_fixedPreset = "on";
 static bool g_fixedEnabled = true;
@@ -108,8 +105,24 @@ static const float HYST_BAND_C = 0.5f;
 
 // Timer for Phone Presence
 static uint32_t g_lastPhoneSeenMs = 0;
-const uint32_t PHONE_ABSENCE_TIMEOUT_MS = 600000; // 10 Minutes (For Eco Mode)
-const uint32_t PHONE_PRESENCE_WINDOW_MS = 300000; // 5 Minutes (For Comfort Mode)
+const uint32_t PHONE_ABSENCE_TIMEOUT_MS = 600000; // 10 Minutes (Eco limit)
+
+// Dynamic Timeouts based on Heater State
+const uint32_t TIMEOUT_HEATER_ON = 300000; // 5 Minutes
+const uint32_t TIMEOUT_HEATER_OFF = 60000; // 1 Minute
+
+// --- HEATER MALFUNCTION CHECK ---
+
+#define HEATER_CHECK_INTERVAL_MS 1800000 // 30 Minutes
+#define MIN_REQUIRED_RISE 0.5            // 0.5°C
+
+unsigned long g_heatStartTime = 0;
+float g_heatStartTemp = 0.0;
+float g_alarmTriggerTemp = 0.0; // Temp when the alarm actually went off
+bool g_heaterMonitorActive = false;
+bool g_malfunctionState = false; // True if in alarm mode
+
+Ticker fastBlueTicker; // Dedicated ticker for the alarm
 
 // ======================================================================================
 // HELPERS
@@ -118,14 +131,29 @@ const uint32_t PHONE_PRESENCE_WINDOW_MS = 300000; // 5 Minutes (For Comfort Mode
 void IRAM_ATTR wdtCallback()
 {
   if (g_wdtFed)
-  {
     g_wdtFed = false;
-  }
   else
   {
     ets_printf("\n[WDT] System hung. Resetting...\n");
     ESP.restart();
   }
+}
+
+// RGB Toggle Function
+void toggleLed()
+{
+  g_ledState = !g_ledState;
+  if (g_ledState)
+  {
+    // Use the color determined by the scan loop
+    pixels.setPixelColor(0, g_blinkColor);
+  }
+  else
+  {
+    // OFF
+    pixels.setPixelColor(0, 0);
+  }
+  pixels.show();
 }
 
 static bool saveFixedSetpoint()
@@ -153,6 +181,49 @@ static void loadFixedSetpoint()
   f.close();
 }
 
+void checkWindowOpenAnomaly(float currentTemp, bool isHeaterOn)
+{
+  static unsigned long lastCheck = 0;
+
+  // Only run every minute
+  if (millis() - lastCheck < WINDOW_CHECK_INTERVAL)
+    return;
+  lastCheck = millis();
+
+  if (g_prevTemp == 0.0)
+  {
+    g_prevTemp = currentTemp;
+    return;
+  }
+
+  // AI LOGIC:
+  // If Heater is ON, Temperature should RISE.
+  // If Heater is ON and Temp DROPS significantly, it's an anomaly (Window Open).
+  float diff = currentTemp - g_prevTemp;
+
+  if (isHeaterOn && diff < -0.2)
+  { // Dropped 0.2C in 1 minute while heating
+    g_dropCount++;
+    Serial.printf(">>> [AI] Temp drop detected (%.2f -> %.2f). Count: %d\n", g_prevTemp, currentTemp, g_dropCount);
+  }
+  else
+  {
+    g_dropCount = 0; // Reset if temp stabilizes or rises
+  }
+
+  // Trigger Protection
+  if (g_dropCount >= 3)
+  { // 3 consecutive minutes of dropping
+    Serial.println(">>> [AI] WINDOW OPEN DETECTED! Forcing Heater OFF.");
+    g_fixedPreset = "off"; // Force OFF mode
+    g_fixedSetpoint = 10.0;
+    saveFixedSetpoint();
+    g_dropCount = 0;
+  }
+
+  g_prevTemp = currentTemp;
+}
+
 void runBleScan()
 {
   BLEScanResults *foundDevices = pBLEScan->start(BLE_SCAN_TIME, false);
@@ -165,6 +236,7 @@ void runBleScan()
   {
     BLEAdvertisedDevice device = foundDevices->getDevice(i);
     int rssi = device.getRSSI();
+
     if (rssi > BLE_RSSI_THRESHOLD)
     {
       nearbyCount++;
@@ -173,19 +245,93 @@ void runBleScan()
     }
   }
 
-  g_phoneDetected = (nearbyCount > 0);
-  g_maxRssi = strongest;
+  if (nearbyCount > 0)
+  {
+    g_detectionHistory[g_historyIndex] = millis();
+    g_historyIndex = (g_historyIndex + 1) % REQUIRED_HITS;
+    g_maxRssi = strongest;
+  }
 
-  if (g_phoneDetected)
+  int validHits = 0;
+  unsigned long now = millis();
+  for (int i = 0; i < REQUIRED_HITS; i++)
+  {
+    if (g_detectionHistory[i] != 0 && (now - g_detectionHistory[i] <= HIT_WINDOW_MS))
+    {
+      validHits++;
+    }
+  }
+  g_currentValidHits = validHits;
+
+  if (nearbyCount > 0)
+  {
+    Serial.printf(">>> [BLE] Phone Found! RSSI: %d dBm | Hits: %d/%d\n", strongest, validHits, REQUIRED_HITS);
+  }
+
+  // --- LOGIC ---
+  bool stablePresence = (validHits >= REQUIRED_HITS);
+  g_phoneDetected = stablePresence;
+
+  // Update "Last Seen" timer only if presence is stable
+  if (stablePresence)
   {
     g_lastPhoneSeenMs = millis();
   }
 
-  digitalWrite(LED_PIN, g_phoneDetected ? LOW : HIGH);
+  // ====================================================================
+  // LED FEEDBACK
+  // ====================================================================
+
+  // CRITICAL: If in Malfunction Alarm Mode (Fast Blue Blink),
+  // do NOT let this function touch the LEDs.
+  if (g_malfunctionState)
+  {
+    pBLEScan->clearResults();
+    return;
+  }
+
+  static bool isBlinking = false;
+
+  if (validHits > 0)
+  {
+    // Determine Color based on hit count
+    if (validHits < REQUIRED_HITS)
+    {
+      // Acquiring: 1 to 9 hits -> BLUE (Dim: 10)
+      g_blinkColor = pixels.Color(0, 0, 10);
+    }
+    else
+    {
+      // Stable: >= 10 hits -> GREEN (Dim: 10)
+      g_blinkColor = pixels.Color(0, 10, 0);
+    }
+
+    // Start Blinking if not already running
+    if (!isBlinking)
+    {
+      ledBlinker.attach(0.5, toggleLed); // Blink every 500ms
+      isBlinking = true;
+      Serial.println(">>> [LED] Blink START");
+    }
+  }
+  else
+  {
+    // 0 Hits -> Turn Off
+    if (isBlinking)
+    {
+      ledBlinker.detach();
+      pixels.clear(); // Turn OFF
+      pixels.show();
+      isBlinking = false;
+      g_ledState = false;
+      Serial.println(">>> [LED] Blink STOP");
+    }
+  }
+
   pBLEScan->clearResults();
 }
 
-static bool cesanaReportAndFetch(float tempC, bool heating)
+static bool cesanaReportAndFetch(float tempC, bool heating, float realSp)
 {
   if (WiFi.status() != WL_CONNECTED)
     return false;
@@ -193,16 +339,16 @@ static bool cesanaReportAndFetch(float tempC, bool heating)
   WiFiClientSecure client;
   client.setInsecure();
   client.setTimeout(5000);
-
   HTTPClient https;
 
-  // Calculate if phone is considered present based on the 5-minute Logic Window
-  // (Matches Priority 1 Logic in main loop)
-  bool logicPhonePresent = (millis() - g_lastPhoneSeenMs < PHONE_PRESENCE_WINDOW_MS);
+  // Logic phone presence depends on heater state
+  uint32_t presenceTimeout = heating ? TIMEOUT_HEATER_ON : TIMEOUT_HEATER_OFF;
+  bool logicPhonePresent = (millis() - g_lastPhoneSeenMs < presenceTimeout);
 
   String url = "https://cesana.steplab.net/get_setpoint.php?temp=" + String(tempC, 1) +
                "&cald=" + (heating ? "1" : "0") +
-               "&phone=" + (logicPhonePresent ? "1" : "0");
+               "&phone=" + (logicPhonePresent ? "1" : "0") +
+               "&real=" + String(realSp, 1);
 
   Serial.print(">>> [HTTP] Calling: ");
   Serial.println(url);
@@ -220,7 +366,6 @@ static bool cesanaReportAndFetch(float tempC, bool heating)
       if (!deserializeJson(doc, payload))
       {
         float remoteSp = doc["setpoint"] | -1.0;
-        // Only accept remote if reasonable
         if (remoteSp > 5.0 && remoteSp < 35.0 && abs(remoteSp - g_fixedSetpoint) > 0.1)
         {
           g_fixedSetpoint = remoteSp;
@@ -238,15 +383,11 @@ static bool cesanaReportAndFetch(float tempC, bool heating)
 }
 
 // ======================================================================================
-// ESP-NOW SETUP
+// ESP-NOW & WEB
 // ======================================================================================
 
 void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {}
 void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {}
-
-// ======================================================================================
-// WEB SERVER HANDLERS & HTML
-// ======================================================================================
 
 const char INDEX_HTML[] PROGMEM = R"HTML(
 <!doctype html><html lang="en"><head>
@@ -358,9 +499,7 @@ void handleStatus()
   bool connected = (WiFi.status() == WL_CONNECTED);
   w["connected"] = connected;
   if (connected)
-  {
     w["ssid"] = WiFi.SSID();
-  }
   else
   {
     w["ssid"] = nullptr;
@@ -400,12 +539,18 @@ void handlePostFixed()
     g_fixedSetpoint = doc["setpoint"] | g_fixedSetpoint;
     g_fixedPreset = "custom";
   }
-
   g_fixedEnabled = true;
   saveFixedSetpoint();
   server.send(200, "application/json", "{\"ok\":true}");
 }
-
+void toggleFastBlue()
+{
+  static bool state = false;
+  state = !state;
+  // Blue (0, 0, 255) if state is true, else OFF
+  pixels.setPixelColor(0, state ? pixels.Color(0, 0, 255) : 0);
+  pixels.show();
+}
 // ======================================================================================
 // MAIN SETUP
 // ======================================================================================
@@ -413,30 +558,32 @@ void setup()
 {
   Serial.begin(115200);
   delay(3000);
-  Serial.println("\n--- Starting ESP32-C3 Thermostat ---");
+  Serial.println("\n--- Starting ESP32-C3 Thermostat (Official DevKit RGB) ---");
 
   if (!LittleFS.begin(true))
     Serial.println("LittleFS Fail");
   loadFixedSetpoint();
 
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, HIGH); // Off
+  // Initialize RGB LED
+  pixels.begin();
+  pixels.clear();
+  pixels.show(); // Ensure it starts OFF
 
   g_lastPhoneSeenMs = millis();
 
-  // 1. Setup Sensors
+  // Sensors
   oneWire.begin(ONE_WIRE_BUS);
   sensors.begin();
   sensors.setResolution(12);
 
-  // 2. Setup BLE
+  // BLE
   BLEDevice::init("ESP32-Thermo");
   pBLEScan = BLEDevice::getScan();
   pBLEScan->setActiveScan(true);
   pBLEScan->setInterval(100);
   pBLEScan->setWindow(99);
 
-  // 3. Setup WiFi (AP + STA)
+  // WiFi
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(AP_SSID, AP_PASS, 1);
   WiFi.hostname(HOSTNAME);
@@ -457,16 +604,13 @@ void setup()
     Serial.print(">>> SUCCESS! IP: ");
     Serial.println(WiFi.localIP());
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-    Serial.println(">>> NTP Configured");
   }
   else
   {
     Serial.println(">>> TIMEOUT: Running in AP Mode.");
-    Serial.print(">>> AP IP: ");
-    Serial.println(WiFi.softAPIP());
   }
 
-  // 4. Setup ESP-NOW
+  // ESP-NOW
   if (esp_now_init() != ESP_OK)
   {
     Serial.println("ESP-NOW Fail");
@@ -481,14 +625,89 @@ void setup()
   if (esp_now_add_peer(&peerInfo) != ESP_OK)
     Serial.println("Add Peer Fail");
 
-  // 5. Setup Web
+  // Web
   server.on("/", handleIndex);
   server.on("/api/status", handleStatus);
   server.on("/api/fixed", HTTP_POST, handlePostFixed);
   server.begin();
 
-  // 6. Watchdog
+  // Watchdog
   g_wdtTicker.attach(20.0, wdtCallback);
+}
+void checkHeaterMalfunction(float currentTemp, bool isHeaterOn)
+{
+
+  // -------------------------------------------------
+  // 1. RECOVERY CHECK (If already in Alarm)
+  // -------------------------------------------------
+  if (g_malfunctionState)
+  {
+    // Condition: Exit if temperature rises 0.5°C above the temp recorded when alarm triggered
+    if (currentTemp >= (g_alarmTriggerTemp + MIN_REQUIRED_RISE))
+    {
+      Serial.println(">>> [ALARM] Recovery! Temp rose 0.5C. Exiting Malfunction State.");
+
+      g_malfunctionState = false;
+      fastBlueTicker.detach(); // Stop fast blinking
+      pixels.clear();
+      pixels.show();
+
+      // Note: We leave the setpoint at 10.0 (OFF) for safety.
+      // The user must manually raise it again via Web/Home Assistant.
+    }
+    return; // Do nothing else while in alarm
+  }
+
+  // -------------------------------------------------
+  // 2. MONITORING LOGIC
+  // -------------------------------------------------
+
+  // If heater is OFF, reset the tracking
+  if (!isHeaterOn)
+  {
+    g_heaterMonitorActive = false;
+    return;
+  }
+
+  // If heater JUST turned ON, snapshot time and temp
+  if (!g_heaterMonitorActive)
+  {
+    g_heaterMonitorActive = true;
+    g_heatStartTime = millis();
+    g_heatStartTemp = currentTemp;
+    Serial.printf(">>> [MONITOR] Heater Started at %.2f C. Timer: 30 mins.\n", currentTemp);
+    return;
+  }
+
+  // Check elapsed time
+  if (millis() - g_heatStartTime >= HEATER_CHECK_INTERVAL_MS)
+  {
+
+    float diff = currentTemp - g_heatStartTemp;
+
+    // If temp rise is INSUFFICIENT
+    if (diff < MIN_REQUIRED_RISE)
+    {
+      Serial.printf(">>> [ALARM] FAIL! 30 mins elapsed. Rise: %.2f (Req: %.2f). Stopping Heater.\n", diff, MIN_REQUIRED_RISE);
+
+      // A. Activate Alarm State
+      g_malfunctionState = true;
+      g_alarmTriggerTemp = currentTemp; // Reference for recovery
+
+      // B. Force Heater OFF (Set to 10C)
+      g_fixedSetpoint = 10.0;
+      g_fixedPreset = "off";
+      saveFixedSetpoint();
+
+      // C. Start Fast Blue Blink (100ms)
+      // Detach normal blinker first to avoid conflict
+      ledBlinker.detach();
+      fastBlueTicker.attach_ms(100, toggleFastBlue);
+
+      // Reset monitor
+      g_heaterMonitorActive = false;
+    }
+  }
 }
 
 // ======================================================================================
@@ -499,89 +718,106 @@ void loop()
   g_wdtFed = true;
   server.handleClient();
 
-  static uint32_t lastLoop = 0;
-  if (millis() - lastLoop > 2000)
-  {
-    lastLoop = millis();
+  // 1. FAST LOOP: BLE Scan (Blocks for 1 second)
+  // Logic inside checks "g_malfunctionState" to ensure it doesn't override the alarm LED
+  runBleScan();
 
-    // 1. Read Temp
+  // 2. SLOW LOOP: Temperature, Logic, WiFi (Every 2 seconds)
+  static uint32_t lastSlowLoop = 0;
+  if (millis() - lastSlowLoop > 2000)
+  {
+    lastSlowLoop = millis();
+
+    // A. Read Temperature
     sensors.requestTemperatures();
     float t = sensors.getTempCByIndex(0);
     if (t != DEVICE_DISCONNECTED_C && t > -50 && t < 100)
-    {
       g_lastTempC = t;
-    }
 
-    // 2. BLE Scan (Blocking)
-    runBleScan();
+    // B. Safety Checks
+    // -------------------------------------------------------------
+    // Check 1: Window Open (Sudden drop while heating)
+    checkWindowOpenAnomaly(g_lastTempC, (g_lastAction == 1));
 
-    // 3. LOGIC CONTROLLER
-    // ====================================================================
+    // Check 2: Heater Malfunction (Stalled temp for 30 mins)
+    checkHeaterMalfunction(g_lastTempC, (g_lastAction == 1));
+    // -------------------------------------------------------------
+
+    // C. Phone Presence & Time Logic
     uint32_t msSincePhone = millis() - g_lastPhoneSeenMs;
     struct tm timeinfo;
     bool timeKnown = getLocalTime(&timeinfo);
 
-    // RULE A: PRESENCE (PRIORITY HIGH)
-    // If phone seen within last 5 minutes, force Minimum Setpoint = 18.0
-    if (msSincePhone < PHONE_PRESENCE_WINDOW_MS)
+    // Only run automation if NO malfunction
+    if (!g_malfunctionState)
     {
-      if (g_fixedSetpoint < 18.0)
-      {
-        Serial.println(">>> [LOGIC] Phone Present (<5min). Forcing Min 18.0 C");
-        g_fixedSetpoint = 18.0;
-        g_fixedPreset = "auto_comfort";
-        saveFixedSetpoint();
-      }
-    }
-    // RULE B: ABSENCE / ECO (PRIORITY LOW)
-    // Triggers ONLY if:
-    // 1. Time is known
-    // 2. Hour is >= 10 (10:00 AM, 11:00 AM... etc)
-    // 3. Phone absent > 10 min
-    else if (timeKnown &&
-             timeinfo.tm_hour >= 10 &&
-             msSincePhone > PHONE_ABSENCE_TIMEOUT_MS)
-    {
-      // If time < 10, this block is SKIPPED, so it follows existing/remote setpoint.
-      if (g_fixedSetpoint > 15.0)
-      {
-        Serial.println(">>> [LOGIC] Time >= 10 & Phone absent > 10min. Capping at 15.0 C");
-        g_fixedSetpoint = 15.0;
-        g_fixedPreset = "auto_eco_15";
-        saveFixedSetpoint();
-      }
-    }
-    // ====================================================================
+      // Dynamic timeout based on Heater State
+      uint32_t activePresenceTimeout = (g_lastAction == 1) ? TIMEOUT_HEATER_ON : TIMEOUT_HEATER_OFF;
 
-    // 4. Hysteresis
+      if (msSincePhone < activePresenceTimeout)
+      {
+        if (g_fixedSetpoint < 18.0)
+        {
+          Serial.println(">>> [LOGIC] Stable Presence. Forcing Min 18.0 C");
+          g_fixedSetpoint = 18.0;
+          g_fixedPreset = "auto_comfort";
+          saveFixedSetpoint();
+        }
+      }
+      else if (timeKnown && timeinfo.tm_hour >= 10 && msSincePhone > PHONE_ABSENCE_TIMEOUT_MS)
+      {
+        if (g_fixedSetpoint > 15.0)
+        {
+          Serial.println(">>> [LOGIC] Time >= 10 & Phone absent > 10min. Capping at 15.0 C");
+          g_fixedSetpoint = 15.0;
+          g_fixedPreset = "auto_eco_15";
+          saveFixedSetpoint();
+        }
+      }
+    }
+
+    // D. Thermostat Hysteresis Control
     float sp = g_fixedEnabled ? g_fixedSetpoint : 19.0;
-    if (g_lastTempC < (sp - HYST_BAND_C / 2))
-      g_lastAction = 1;
-    else if (g_lastTempC > (sp + HYST_BAND_C / 2))
-      g_lastAction = 0;
 
-    // 5. Send ESP-NOW
+    // If Malfunction Alarm is active, FORCE OFF
+    if (g_malfunctionState)
+    {
+      g_lastAction = 0; // Force Heater OFF
+    }
+    else
+    {
+      // Normal Operation
+      if (g_lastTempC < (sp - HYST_BAND_C / 2))
+        g_lastAction = 1;
+      else if (g_lastTempC > (sp + HYST_BAND_C / 2))
+        g_lastAction = 0;
+    }
+
+    // E. ESP-NOW Broadcast
     JsonDocument jtx;
     jtx["heater"] = (g_lastAction == 1) ? "ON" : "OFF";
     jtx["temp"] = g_lastTempC;
     jtx["phone"] = g_phoneDetected;
+    jtx["alarm"] = g_malfunctionState; // Optional: Send alarm status
     jtx["id"] = 12;
     char buf[128];
     serializeJson(jtx, buf);
     esp_now_send(TARGET, (uint8_t *)buf, strlen(buf));
 
-    // 6. Serial Debug
-    Serial.printf("[STATUS] Temp: %.2f | Set: %.1f | Heat: %s | Phone: %s | LastSeen: %ds ago\n",
-                  g_lastTempC, sp, (g_lastAction == 1) ? "ON" : "OFF", g_phoneDetected ? "YES" : "NO", msSincePhone / 1000);
+    // F. Serial Debug
+    Serial.printf("[STATUS] Temp: %.2f | Set: %.1f | Heat: %s | Phone: %s | Alarm: %s\n",
+                  g_lastTempC, sp, (g_lastAction == 1) ? "ON" : "OFF",
+                  g_phoneDetected ? "YES" : "NO",
+                  g_malfunctionState ? "YES (BLINKING)" : "NO");
 
-    // 7. HTTPS Telemetry
+    // G. HTTP Telemetry
     if (WiFi.status() == WL_CONNECTED)
     {
       static uint32_t lastHttp = 0;
       uint32_t interval = (sp <= 10.0) ? INTERVAL_IDLE_MS : INTERVAL_ACTIVE_MS;
       if (millis() - lastHttp > interval)
       {
-        cesanaReportAndFetch(g_lastTempC, g_lastAction);
+        cesanaReportAndFetch(g_lastTempC, g_lastAction, sp);
         lastHttp = millis();
       }
     }
