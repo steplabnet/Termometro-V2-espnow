@@ -4,6 +4,8 @@
 // INPUTS (GET or POST):
 // - ?temp=FLOAT   : Updates current temp. 
 //                   Logs to 'temp_history.csv' (Throttled: max 1 write/10mins, Keeps 48h).
+// - ?real=FLOAT   : Updates "real" temp/value. (NEW)
+//                   Saves to state.json.
 // - ?cald=0|1     : Updates boiler relay status.
 // - ?phone=0|1    : Updates phone state. 
 //                   Logs to 'phone_history.csv' (Immediate: logs every request, Keeps 24h).
@@ -18,14 +20,13 @@
 //   "mode": "AUTO|ON|OFF", 
 //   "setpoint": 20.0, 
 //   "actualTemp": 19.5, 
+//   "real": 19.2,   <-- NEW
 //   "cald": 1, 
 //   "phone": 0,
 //   "date": "YYYY-MM-DD", 
-//   "time": "HH:MM:SS", ... 
+//   ... 
 // }
 
-
-// ... rest of script
 header('Content-Type: application/json; charset=utf-8');
 header('Access-Control-Allow-Origin: *');
 
@@ -38,7 +39,7 @@ date_default_timezone_set('Europe/Rome');
 $stateFile = __DIR__ . '/state.json';
 $scheduleFile = __DIR__ . '/schedule.json';
 $historyFile = __DIR__ . '/temp_history.csv';
-$phoneHistoryFile = __DIR__ . '/phone_history.csv'; // <--- NEW LOG FILE
+$phoneHistoryFile = __DIR__ . '/phone_history.csv';
 
 // ---------- helpers ----------
 function read_json($file)
@@ -138,9 +139,6 @@ function history_append_if_due(string $historyFile, float $temp, int $minDelta =
 }
 
 /**
- * Phone History: Log NOW, prune older than 24h (86400 sec)
- */
-/**
  * Phone History: Log ONCE PER MINUTE, prune older than 24h (86400 sec)
  */
 function phone_history_append(string $file, int $val): void
@@ -149,10 +147,10 @@ function phone_history_append(string $file, int $val): void
     $keepSec = 86400; // 24 Hours
     $minDelta = 60;   // 60 Seconds throttle
 
-    // 1. Check Throttling (Don't write if written recently)
+    // 1. Check Throttling
     $mtime = @filemtime($file);
     if ($mtime !== false && ($now - $mtime) < $minDelta) {
-        return; // Exit function, do not save
+        return;
     }
 
     // 2. Append new value
@@ -162,7 +160,6 @@ function phone_history_append(string $file, int $val): void
     $cutoff = $now - $keepSec;
     $rows = @file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
 
-    // Only rewrite if we actually have data to check
     if ($rows !== false && count($rows) > 0) {
         $kept = [];
         $rewriteNeeded = false;
@@ -176,11 +173,10 @@ function phone_history_append(string $file, int $val): void
             if ($ts >= $cutoff) {
                 $kept[] = $r;
             } else {
-                $rewriteNeeded = true; // Found an old row, so we need to save the cleaned list
+                $rewriteNeeded = true;
             }
         }
 
-        // Optimization: only write to disk if we actually removed something
         if ($rewriteNeeded) {
             $tmp = $file . '.tmp';
             $content = implode("\n", $kept) . (count($kept) ? "\n" : '');
@@ -200,13 +196,15 @@ $mode = $state['mode'] ?? 'AUTO';
 $manualSetpoint = isset($state['manualSetpoint']) ? (float) $state['manualSetpoint'] : 20.0;
 $actualTemp = isset($state['actualTemp']) ? round((float) $state['actualTemp'], 1) : null;
 $cald = isset($state['cald']) ? (int) $state['cald'] : 0;
-// Load phone state (default to 0 if missing)
 $phone = isset($state['phone']) ? (int) $state['phone'] : 0;
+// Load 'real' (default to null if missing)
+$real = isset($state['real']) ? round((float) $state['real'], 1) : null;
 
 // ---------- optional updates ----------
 $tempParam = $_GET['temp'] ?? $_POST['temp'] ?? null;
 $caldParam = $_GET['cald'] ?? $_POST['cald'] ?? null;
-$phoneParam = $_GET['phone'] ?? $_POST['phone'] ?? null; // <--- Check Param
+$phoneParam = $_GET['phone'] ?? $_POST['phone'] ?? null;
+$realParam = $_GET['real'] ?? $_POST['real'] ?? null; // <--- Check Param
 
 $updated = false;
 
@@ -216,7 +214,6 @@ if ($tempParam !== null) {
     $state['actualTemp'] = $newTemp;
     $actualTemp = $newTemp;
     $updated = true;
-    // Log temp (throttled 10 mins, keep 48h)
     history_append_if_due($historyFile, (float) $newTemp, 600, 172800);
 }
 
@@ -228,15 +225,21 @@ if ($caldParam !== null) {
     $updated = true;
 }
 
-// 3. Handle Phone (NEW)
+// 3. Handle Phone
 if ($phoneParam !== null) {
     $newPhone = ((int) $phoneParam === 1) ? 1 : 0;
     $state['phone'] = $newPhone;
     $phone = $newPhone;
     $updated = true;
-
-    // Log phone (Log now, keep 24h)
     phone_history_append($phoneHistoryFile, $newPhone);
+}
+
+// 4. Handle Real (NEW)
+if ($realParam !== null) {
+    $newReal = round((float) $realParam, 1);
+    $state['real'] = $newReal;
+    $real = $newReal;
+    $updated = true;
 }
 
 // Save state.json
@@ -260,6 +263,8 @@ if ($mode === 'OFF') {
 // ---------- normalize numbers ----------
 $actualTemp_num = ($actualTemp !== null) ? (float) one_decimal_str($actualTemp) : null;
 $actualTemp_str = ($actualTemp !== null) ? one_decimal_str($actualTemp) : null;
+// Format 'real' for output
+$real_num = ($real !== null) ? (float) one_decimal_str($real) : null;
 
 // ---------- respond ----------
 $now = new DateTime();
@@ -269,8 +274,9 @@ echo json_encode([
     'setpoint' => $setpoint,
     'actualTemp' => $actualTemp_num,
     'actualTemp_str' => $actualTemp_str,
+    'real' => $real_num, // <--- Return real
     'cald' => $cald,
-    'phone' => $phone, // <--- Return current phone state
+    'phone' => $phone,
     'date' => $now->format('Y-m-d'),
     'time' => $now->format('H:i:s'),
     'timezone' => $now->getTimezone()->getName()
