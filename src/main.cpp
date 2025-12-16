@@ -1,6 +1,6 @@
 /*
  * ======================================================================================
- * PROJECT: ESP32-C3 Smart Office Thermostat (Official DevKitM-1 RGB Version)
+ * PROJECT: ESP32-C3 Smart Office Thermostat (NimBLE + OTA Version)
  * ======================================================================================
  */
 
@@ -17,13 +17,13 @@
 #include <WiFiClientSecure.h>
 #include <Ticker.h>
 #include <time.h>
-#include <Adafruit_NeoPixel.h> // REQUIRED LIBRARY
+#include <Adafruit_NeoPixel.h>
 
-// BLE Headers
-#include <BLEDevice.h>
-#include <BLEUtils.h>
-#include <BLEScan.h>
-#include <BLEAdvertisedDevice.h>
+// OTA LIBRARY
+#include <ArduinoOTA.h>
+
+// NIMBLE LIBRARY
+#include <NimBLEDevice.h>
 
 // ======================================================================================
 // CONFIGURATION
@@ -75,11 +75,13 @@ int g_dropCount = 0;
 OneWire oneWire(ONE_WIRE_BUS);
 DallasTemperature sensors(&oneWire);
 WebServer server(80);
-BLEScan *pBLEScan;
+
+NimBLEScan *pBLEScan;
+
 Ticker g_wdtTicker;
 Ticker ledBlinker;
 
-// NEW: RGB LED Object
+// RGB LED Object
 Adafruit_NeoPixel pixels(1, RGB_PIN, NEO_GRB + NEO_KHZ800);
 
 // ESP-NOW Broadcast Address
@@ -92,10 +94,11 @@ volatile uint8_t g_lastAction = 0;
 bool g_phoneDetected = false;
 int g_maxRssi = -100;
 volatile bool g_wdtFed = false;
+bool g_otaInProgress = false; // Flag to stop logic during OTA
 
 // LED State Variables
 bool g_ledState = false;
-uint32_t g_blinkColor = 0; // Stores the current color (Blue or Green)
+uint32_t g_blinkColor = 0;
 
 // Settings
 static float g_fixedSetpoint = 19.0f;
@@ -118,11 +121,11 @@ const uint32_t TIMEOUT_HEATER_OFF = 60000; // 1 Minute
 
 unsigned long g_heatStartTime = 0;
 float g_heatStartTemp = 0.0;
-float g_alarmTriggerTemp = 0.0; // Temp when the alarm actually went off
+float g_alarmTriggerTemp = 0.0;
 bool g_heaterMonitorActive = false;
-bool g_malfunctionState = false; // True if in alarm mode
+bool g_malfunctionState = false;
 
-Ticker fastBlueTicker; // Dedicated ticker for the alarm
+Ticker fastBlueTicker;
 
 // ======================================================================================
 // HELPERS
@@ -130,6 +133,12 @@ Ticker fastBlueTicker; // Dedicated ticker for the alarm
 
 void IRAM_ATTR wdtCallback()
 {
+  if (g_otaInProgress)
+  {
+    g_wdtFed = true; // Don't reset during OTA
+    return;
+  }
+
   if (g_wdtFed)
     g_wdtFed = false;
   else
@@ -142,15 +151,16 @@ void IRAM_ATTR wdtCallback()
 // RGB Toggle Function
 void toggleLed()
 {
+  if (g_otaInProgress)
+    return; // Don't toggle during OTA
+
   g_ledState = !g_ledState;
   if (g_ledState)
   {
-    // Use the color determined by the scan loop
     pixels.setPixelColor(0, g_blinkColor);
   }
   else
   {
-    // OFF
     pixels.setPixelColor(0, 0);
   }
   pixels.show();
@@ -184,8 +194,6 @@ static void loadFixedSetpoint()
 void checkWindowOpenAnomaly(float currentTemp, bool isHeaterOn)
 {
   static unsigned long lastCheck = 0;
-
-  // Only run every minute
   if (millis() - lastCheck < WINDOW_CHECK_INTERVAL)
     return;
   lastCheck = millis();
@@ -196,26 +204,21 @@ void checkWindowOpenAnomaly(float currentTemp, bool isHeaterOn)
     return;
   }
 
-  // AI LOGIC:
-  // If Heater is ON, Temperature should RISE.
-  // If Heater is ON and Temp DROPS significantly, it's an anomaly (Window Open).
   float diff = currentTemp - g_prevTemp;
-
   if (isHeaterOn && diff < -0.2)
-  { // Dropped 0.2C in 1 minute while heating
+  {
     g_dropCount++;
     Serial.printf(">>> [AI] Temp drop detected (%.2f -> %.2f). Count: %d\n", g_prevTemp, currentTemp, g_dropCount);
   }
   else
   {
-    g_dropCount = 0; // Reset if temp stabilizes or rises
+    g_dropCount = 0;
   }
 
-  // Trigger Protection
   if (g_dropCount >= 3)
-  { // 3 consecutive minutes of dropping
+  {
     Serial.println(">>> [AI] WINDOW OPEN DETECTED! Forcing Heater OFF.");
-    g_fixedPreset = "off"; // Force OFF mode
+    g_fixedPreset = "off";
     g_fixedSetpoint = 10.0;
     saveFixedSetpoint();
     g_dropCount = 0;
@@ -226,15 +229,19 @@ void checkWindowOpenAnomaly(float currentTemp, bool isHeaterOn)
 
 void runBleScan()
 {
-  BLEScanResults *foundDevices = pBLEScan->start(BLE_SCAN_TIME, false);
+  // Safety: Do not scan if OTA is running
+  if (g_otaInProgress)
+    return;
+
+  NimBLEScanResults foundDevices = pBLEScan->start(BLE_SCAN_TIME, false);
 
   int nearbyCount = 0;
   int strongest = -120;
-  int count = foundDevices->getCount();
+  int count = foundDevices.getCount();
 
   for (int i = 0; i < count; i++)
   {
-    BLEAdvertisedDevice device = foundDevices->getDevice(i);
+    NimBLEAdvertisedDevice device = foundDevices.getDevice(i);
     int rssi = device.getRSSI();
 
     if (rssi > BLE_RSSI_THRESHOLD)
@@ -268,22 +275,15 @@ void runBleScan()
     Serial.printf(">>> [BLE] Phone Found! RSSI: %d dBm | Hits: %d/%d\n", strongest, validHits, REQUIRED_HITS);
   }
 
-  // --- LOGIC ---
   bool stablePresence = (validHits >= REQUIRED_HITS);
   g_phoneDetected = stablePresence;
 
-  // Update "Last Seen" timer only if presence is stable
   if (stablePresence)
   {
     g_lastPhoneSeenMs = millis();
   }
 
-  // ====================================================================
-  // LED FEEDBACK
-  // ====================================================================
-
-  // CRITICAL: If in Malfunction Alarm Mode (Fast Blue Blink),
-  // do NOT let this function touch the LEDs.
+  // LED Logic
   if (g_malfunctionState)
   {
     pBLEScan->clearResults();
@@ -291,40 +291,28 @@ void runBleScan()
   }
 
   static bool isBlinking = false;
-
   if (validHits > 0)
   {
-    // Determine Color based on hit count
     if (validHits < REQUIRED_HITS)
-    {
-      // Acquiring: 1 to 9 hits -> BLUE (Dim: 10)
-      g_blinkColor = pixels.Color(0, 0, 10);
-    }
+      g_blinkColor = pixels.Color(0, 0, 10); // Blue
     else
-    {
-      // Stable: >= 10 hits -> GREEN (Dim: 10)
-      g_blinkColor = pixels.Color(0, 10, 0);
-    }
+      g_blinkColor = pixels.Color(0, 10, 0); // Green
 
-    // Start Blinking if not already running
     if (!isBlinking)
     {
-      ledBlinker.attach(0.5, toggleLed); // Blink every 500ms
+      ledBlinker.attach(0.5, toggleLed);
       isBlinking = true;
-      Serial.println(">>> [LED] Blink START");
     }
   }
   else
   {
-    // 0 Hits -> Turn Off
     if (isBlinking)
     {
       ledBlinker.detach();
-      pixels.clear(); // Turn OFF
+      pixels.clear();
       pixels.show();
       isBlinking = false;
       g_ledState = false;
-      Serial.println(">>> [LED] Blink STOP");
     }
   }
 
@@ -341,7 +329,6 @@ static bool cesanaReportAndFetch(float tempC, bool heating, float realSp)
   client.setTimeout(5000);
   HTTPClient https;
 
-  // Logic phone presence depends on heater state
   uint32_t presenceTimeout = heating ? TIMEOUT_HEATER_ON : TIMEOUT_HEATER_OFF;
   bool logicPhonePresent = (millis() - g_lastPhoneSeenMs < presenceTimeout);
 
@@ -350,18 +337,12 @@ static bool cesanaReportAndFetch(float tempC, bool heating, float realSp)
                "&phone=" + (logicPhonePresent ? "1" : "0") +
                "&real=" + String(realSp, 1);
 
-  Serial.print(">>> [HTTP] Calling: ");
-  Serial.println(url);
-
   if (https.begin(client, url))
   {
     int code = https.GET();
     if (code == HTTP_CODE_OK)
     {
       String payload = https.getString();
-      Serial.print(">>> [HTTP] Reply: ");
-      Serial.println(payload);
-
       JsonDocument doc;
       if (!deserializeJson(doc, payload))
       {
@@ -371,7 +352,6 @@ static bool cesanaReportAndFetch(float tempC, bool heating, float realSp)
           g_fixedSetpoint = remoteSp;
           g_fixedPreset = "remote";
           saveFixedSetpoint();
-          Serial.println(">>> [HTTP] Setpoint updated via Remote!");
         }
       }
       https.end();
@@ -545,12 +525,79 @@ void handlePostFixed()
 }
 void toggleFastBlue()
 {
+  if (g_otaInProgress)
+    return;
   static bool state = false;
   state = !state;
-  // Blue (0, 0, 255) if state is true, else OFF
   pixels.setPixelColor(0, state ? pixels.Color(0, 0, 255) : 0);
   pixels.show();
 }
+
+// ======================================================================================
+// OTA SETUP FUNCTION
+// ======================================================================================
+void setupOTA()
+{
+  ArduinoOTA.setHostname(HOSTNAME);
+
+  ArduinoOTA.onStart([]()
+                     {
+    g_otaInProgress = true;
+    String type = (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
+    
+    Serial.println("Start updating " + type);
+    
+    // CRITICAL: Stop BLE Scan to prevent radio conflicts
+    if(pBLEScan) pBLEScan->stop();
+    
+    // Disable other tickers
+    ledBlinker.detach();
+    fastBlueTicker.detach();
+
+    // Visual Indicator: Magenta
+    pixels.setPixelColor(0, pixels.Color(255, 0, 255));
+    pixels.show(); });
+
+  ArduinoOTA.onEnd([]()
+                   {
+    Serial.println("\nEnd");
+    g_otaInProgress = false;
+    // Turn off LED
+    pixels.clear();
+    pixels.show(); });
+
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total)
+                        {
+    // Optional: Blink logic could go here, but keep it simple
+    // Just toggle small dim magenta every 10%?
+    if (progress % 10 == 0) {
+        pixels.setPixelColor(0, pixels.Color(50, 0, 50)); 
+        pixels.show();
+    } else if (progress % 5 == 0) {
+        pixels.setPixelColor(0, pixels.Color(0, 0, 0));
+        pixels.show();
+    } });
+
+  ArduinoOTA.onError([](ota_error_t error)
+                     {
+                       g_otaInProgress = false;
+                       Serial.printf("Error[%u]: ", error);
+                       if (error == OTA_AUTH_ERROR)
+                         Serial.println("Auth Failed");
+                       else if (error == OTA_BEGIN_ERROR)
+                         Serial.println("Begin Failed");
+                       else if (error == OTA_CONNECT_ERROR)
+                         Serial.println("Connect Failed");
+                       else if (error == OTA_RECEIVE_ERROR)
+                         Serial.println("Receive Failed");
+                       else if (error == OTA_END_ERROR)
+                         Serial.println("End Failed");
+                       ESP.restart(); // Best to restart on error
+                     });
+
+  ArduinoOTA.begin();
+}
+
 // ======================================================================================
 // MAIN SETUP
 // ======================================================================================
@@ -564,10 +611,9 @@ void setup()
     Serial.println("LittleFS Fail");
   loadFixedSetpoint();
 
-  // Initialize RGB LED
   pixels.begin();
   pixels.clear();
-  pixels.show(); // Ensure it starts OFF
+  pixels.show();
 
   g_lastPhoneSeenMs = millis();
 
@@ -576,9 +622,9 @@ void setup()
   sensors.begin();
   sensors.setResolution(12);
 
-  // BLE
-  BLEDevice::init("ESP32-Thermo");
-  pBLEScan = BLEDevice::getScan();
+  // NimBLE Init
+  NimBLEDevice::init("ESP32-Thermo");
+  pBLEScan = NimBLEDevice::getScan();
   pBLEScan->setActiveScan(true);
   pBLEScan->setInterval(100);
   pBLEScan->setWindow(99);
@@ -604,6 +650,9 @@ void setup()
     Serial.print(">>> SUCCESS! IP: ");
     Serial.println(WiFi.localIP());
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
+
+    // INITIALIZE OTA ONLY IF CONNECTED
+    setupOTA();
   }
   else
   {
@@ -633,45 +682,35 @@ void setup()
 
   // Watchdog
   g_wdtTicker.attach(20.0, wdtCallback);
-
-  // ... existing WiFi connection code ...
 }
+
 void checkHeaterMalfunction(float currentTemp, bool isHeaterOn)
 {
+  if (g_otaInProgress)
+    return; // Skip checks during update
 
-  // -------------------------------------------------
   // 1. RECOVERY CHECK (If already in Alarm)
-  // -------------------------------------------------
   if (g_malfunctionState)
   {
-    // Condition: Exit if temperature rises 0.5°C above the temp recorded when alarm triggered
     if (currentTemp >= (g_alarmTriggerTemp + MIN_REQUIRED_RISE))
     {
       Serial.println(">>> [ALARM] Recovery! Temp rose 0.5C. Exiting Malfunction State.");
 
       g_malfunctionState = false;
-      fastBlueTicker.detach(); // Stop fast blinking
+      fastBlueTicker.detach();
       pixels.clear();
       pixels.show();
-
-      // Note: We leave the setpoint at 10.0 (OFF) for safety.
-      // The user must manually raise it again via Web/Home Assistant.
     }
-    return; // Do nothing else while in alarm
+    return;
   }
 
-  // -------------------------------------------------
   // 2. MONITORING LOGIC
-  // -------------------------------------------------
-
-  // If heater is OFF, reset the tracking
   if (!isHeaterOn)
   {
     g_heaterMonitorActive = false;
     return;
   }
 
-  // If heater JUST turned ON, snapshot time and temp
   if (!g_heaterMonitorActive)
   {
     g_heaterMonitorActive = true;
@@ -681,32 +720,24 @@ void checkHeaterMalfunction(float currentTemp, bool isHeaterOn)
     return;
   }
 
-  // Check elapsed time
   if (millis() - g_heatStartTime >= HEATER_CHECK_INTERVAL_MS)
   {
-
     float diff = currentTemp - g_heatStartTemp;
 
-    // If temp rise is INSUFFICIENT
     if (diff < MIN_REQUIRED_RISE)
     {
       Serial.printf(">>> [ALARM] FAIL! 30 mins elapsed. Rise: %.2f (Req: %.2f). Stopping Heater.\n", diff, MIN_REQUIRED_RISE);
 
-      // A. Activate Alarm State
       g_malfunctionState = true;
-      g_alarmTriggerTemp = currentTemp; // Reference for recovery
+      g_alarmTriggerTemp = currentTemp;
 
-      // B. Force Heater OFF (Set to 10C)
       g_fixedSetpoint = 10.0;
       g_fixedPreset = "off";
       saveFixedSetpoint();
 
-      // C. Start Fast Blue Blink (100ms)
-      // Detach normal blinker first to avoid conflict
       ledBlinker.detach();
       fastBlueTicker.attach_ms(100, toggleFastBlue);
 
-      // Reset monitor
       g_heaterMonitorActive = false;
     }
   }
@@ -717,13 +748,17 @@ void checkHeaterMalfunction(float currentTemp, bool isHeaterOn)
 // ======================================================================================
 void loop()
 {
- 
+  // 0. OTA HANDLE - MUST BE FIRST
+  ArduinoOTA.handle();
+
+  // If OTA is running, skip everything else to prevent crashes
+  if (g_otaInProgress)
+    return;
 
   g_wdtFed = true;
   server.handleClient();
 
-  // 1. FAST LOOP: BLE Scan (Blocks for 1 second)
-  // Logic inside checks "g_malfunctionState" to ensure it doesn't override the alarm LED
+  // 1. FAST LOOP: BLE Scan
   runBleScan();
 
   // 2. SLOW LOOP: Temperature, Logic, WiFi (Every 2 seconds)
@@ -739,23 +774,16 @@ void loop()
       g_lastTempC = t;
 
     // B. Safety Checks
-    // -------------------------------------------------------------
-    // Check 1: Window Open (Sudden drop while heating)
     checkWindowOpenAnomaly(g_lastTempC, (g_lastAction == 1));
-
-    // Check 2: Heater Malfunction (Stalled temp for 30 mins)
     checkHeaterMalfunction(g_lastTempC, (g_lastAction == 1));
-    // -------------------------------------------------------------
 
     // C. Phone Presence & Time Logic
     uint32_t msSincePhone = millis() - g_lastPhoneSeenMs;
     struct tm timeinfo;
     bool timeKnown = getLocalTime(&timeinfo);
 
-    // Only run automation if NO malfunction
     if (!g_malfunctionState)
     {
-      // Dynamic timeout based on Heater State
       uint32_t activePresenceTimeout = (g_lastAction == 1) ? TIMEOUT_HEATER_ON : TIMEOUT_HEATER_OFF;
 
       if (msSincePhone < activePresenceTimeout)
@@ -783,14 +811,12 @@ void loop()
     // D. Thermostat Hysteresis Control
     float sp = g_fixedEnabled ? g_fixedSetpoint : 19.0;
 
-    // If Malfunction Alarm is active, FORCE OFF
     if (g_malfunctionState)
     {
-      g_lastAction = 0; // Force Heater OFF
+      g_lastAction = 0;
     }
     else
     {
-      // Normal Operation
       if (g_lastTempC < (sp - HYST_BAND_C / 2))
         g_lastAction = 1;
       else if (g_lastTempC > (sp + HYST_BAND_C / 2))
@@ -802,7 +828,7 @@ void loop()
     jtx["heater"] = (g_lastAction == 1) ? "ON" : "OFF";
     jtx["temp"] = g_lastTempC;
     jtx["phone"] = g_phoneDetected;
-    jtx["alarm"] = g_malfunctionState; // Optional: Send alarm status
+    jtx["alarm"] = g_malfunctionState;
     jtx["id"] = 12;
     char buf[128];
     serializeJson(jtx, buf);
