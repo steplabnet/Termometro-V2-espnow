@@ -1,27 +1,30 @@
 <?php
 // stanza.php — single-file PHP dashboard for a chronothermostat
 // Backend endpoints: load/save schedule + load/save state + load/save presets + load/save phone history
-// Frontend: modern light UI, OFF/ON/AUTO, weekly chrono table, active setpoint highlight,
-// polling actual temperature from state.json every 10s.
+// Frontend: modern light UI, OFF/ON/AUTO, weekly chrono table, active setpoint highlight.
 
 header('X-Content-Type-Options: nosniff');
 $action = $_GET['action'] ?? '';
 
-/** ---------- helpers for state in /dev/shm ---------- */
-$RAM_DIR = '/dev/shm';
-$STATE_FILENAME = 'state.json';
-$PHONE_HISTORY_FILENAME = 'phone_history.csv';
+/** ---------- CONFIGURATION: STORAGE PATHS ---------- */
+// storage directory (RAM disk)
+$DATA_DIR = '/dev/shm/thermo_data';
 
-/** ---------- temperature history (CSV in /dev/shm) ---------- */
-$HISTORY_FILENAME = 'temp_history.csv';
-$HISTORY_FILE = resolve_state_path($RAM_DIR, $HISTORY_FILENAME);
-$PHONE_HISTORY_FILE = resolve_state_path($RAM_DIR, $PHONE_HISTORY_FILENAME);
+// Ensure the directory exists
+if (!is_dir($DATA_DIR)) {
+    @mkdir($DATA_DIR, 0775, true);
+}
 
-/** ---------- presets file (in script dir) ---------- */
-$PRESETS_FILE = __DIR__ . '/presets.json';
+// Define file paths
+$STATE_FILE = $DATA_DIR . '/state.json';
+$SCHEDULE_FILE = $DATA_DIR . '/schedule.json';
+$PRESETS_FILE = $DATA_DIR . '/presets.json';
+$HISTORY_FILE = $DATA_DIR . '/temp_history.csv';
+$PHONE_HISTORY_FILE = $DATA_DIR . '/phone_history.csv';
 
 /**
  * Append one row "unix_ts,temperature" if last sample is older than $minDeltaSec.
+ * (Note: This function is defined but primarily used by the logger script, included here for completeness)
  */
 function history_maybe_append(string $path, float $temp, int $minDeltaSec = 1200, int $keepSec = 172800): void
 {
@@ -111,7 +114,6 @@ function history_load_last24(string $path): array
 
 /** 
  * Return last 24h of phone presence [ [t_iso, 0|1], ... ] 
- * No bucket downsampling to preserve exact entry/exit times 
  */
 function phone_history_load_last24(string $path): array
 {
@@ -137,20 +139,12 @@ function phone_history_load_last24(string $path): array
     return $out;
 }
 
-
-function resolve_state_path(string $ramDir, string $filename): string
-{
-    if (is_dir($ramDir) && is_writable($ramDir)) {
-        return rtrim($ramDir, '/') . '/' . $filename;
-    }
-    return __DIR__ . '/' . $filename;
-}
-
 function write_json_atomic(string $path, array $data): bool
 {
     $dir = dirname($path);
     if (!is_dir($dir))
-        return false;
+        @mkdir($dir, 0775, true);
+
     $tmp = $dir . '/.' . basename($path) . '.' . bin2hex(random_bytes(6)) . '.tmp';
     $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
     if ($json === false)
@@ -162,16 +156,11 @@ function write_json_atomic(string $path, array $data): bool
     return @rename($tmp, $path);
 }
 
-$STATE_FILE = resolve_state_path($RAM_DIR, $STATE_FILENAME);
-
 /** ---------- API: Load 24h history (READ-ONLY) ---------- */
 if ($action === 'load_history') {
     header('Content-Type: application/json; charset=utf-8');
-    $csv = __DIR__ . '/temp_history.csv';
-    if (!is_readable($csv)) {
-        $csv = $GLOBALS['HISTORY_FILE'];
-    }
-    $points = history_load_last24($csv);
+    // Using global path defined at top
+    $points = history_load_last24($HISTORY_FILE);
     echo json_encode(['ok' => true, 'points' => $points], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     exit;
 }
@@ -179,11 +168,8 @@ if ($action === 'load_history') {
 /** ---------- API: Load 24h Phone history (READ-ONLY) ---------- */
 if ($action === 'load_phone_history') {
     header('Content-Type: application/json; charset=utf-8');
-    $csv = __DIR__ . '/phone_history.csv';
-    if (!is_readable($csv)) {
-        $csv = $GLOBALS['PHONE_HISTORY_FILE'];
-    }
-    $points = phone_history_load_last24($csv);
+    // Using global path defined at top
+    $points = phone_history_load_last24($PHONE_HISTORY_FILE);
     echo json_encode(['ok' => true, 'points' => $points], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
     exit;
 }
@@ -195,9 +181,8 @@ if ($action === 'load_schedule') {
     header('Pragma: no-cache');
     header('Expires: 0');
 
-    $file = __DIR__ . '/schedule.json';
-    if (is_readable($file)) {
-        $raw = file_get_contents($file);
+    if (is_readable($SCHEDULE_FILE)) {
+        $raw = file_get_contents($SCHEDULE_FILE);
         $j = json_decode($raw, true);
         if (is_array($j)) {
             $out = [
@@ -219,7 +204,7 @@ if ($action === 'load_schedule') {
 /** ---------- API: Save schedule ---------- */
 if ($action === 'save_schedule' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     header('Content-Type: application/json; charset=utf-8');
-    $file = __DIR__ . '/schedule.json';
+
     $body = file_get_contents('php://input');
     $decoded = json_decode($body, true);
     if (!is_array($decoded) || !isset($decoded['schedule']) || !is_array($decoded['schedule'])) {
@@ -229,8 +214,8 @@ if ($action === 'save_schedule' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     $prevVersion = 0;
-    if (is_readable($file)) {
-        $prev = json_decode(@file_get_contents($file), true);
+    if (is_readable($SCHEDULE_FILE)) {
+        $prev = json_decode(@file_get_contents($SCHEDULE_FILE), true);
         if (is_array($prev) && isset($prev['version'])) {
             $prevVersion = (int) $prev['version'];
         }
@@ -246,18 +231,18 @@ if ($action === 'save_schedule' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     ];
 
     $wrote = false;
-    if (is_writable(dirname($file))) {
-        $wrote = write_json_atomic($file, $payloadToSave);
+    if (is_writable(dirname($SCHEDULE_FILE))) {
+        $wrote = write_json_atomic($SCHEDULE_FILE, $payloadToSave);
     }
     if (!$wrote) {
-        $ok = @file_put_contents($file, json_encode($payloadToSave, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+        $ok = @file_put_contents($SCHEDULE_FILE, json_encode($payloadToSave, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
         $wrote = $ok !== false;
     }
 
     if (!$wrote) {
         echo json_encode(["ok" => false, "error" => "Could not write schedule.json. Check file permissions."]);
     } else {
-        echo json_encode(["ok" => true, "saved_to" => basename($file), "version" => $version, "saved_at" => $saved_at]);
+        echo json_encode(["ok" => true, "saved_to" => basename($SCHEDULE_FILE), "version" => $version, "saved_at" => $saved_at]);
     }
     exit;
 }
@@ -285,18 +270,18 @@ if ($action === 'save_state' && $_SERVER['REQUEST_METHOD'] === 'POST') {
     if (isset($decoded['phone'])) {
         $state['phone'] = (int) $decoded['phone'];
     }
-    // Handle 'real' parameter
+    // Handle 'real' parameter (calculated setpoint)
     if (isset($decoded['real'])) {
         $state['real'] = floatval($decoded['real']);
     }
 
-    if (!write_json_atomic($GLOBALS['STATE_FILE'], $state)) {
+    if (!write_json_atomic($STATE_FILE, $state)) {
         echo json_encode([
             "ok" => false,
-            "error" => "Could not write " . basename($GLOBALS['STATE_FILE']) . ". Check permissions or /dev/shm availability."
+            "error" => "Could not write " . basename($STATE_FILE) . ". Check permissions or /dev/shm availability."
         ]);
     } else {
-        echo json_encode(["ok" => true, "saved_to" => $GLOBALS['STATE_FILE']]);
+        echo json_encode(["ok" => true, "saved_to" => $STATE_FILE]);
     }
     exit;
 }
@@ -304,9 +289,9 @@ if ($action === 'save_state' && $_SERVER['REQUEST_METHOD'] === 'POST') {
 /** ---------- API: Load state ---------- */
 if ($action === 'load_state') {
     header('Content-Type: application/json; charset=utf-8');
-    $file = $GLOBALS['STATE_FILE'];
-    if (is_readable($file)) {
-        $raw = file_get_contents($file);
+
+    if (is_readable($STATE_FILE)) {
+        $raw = file_get_contents($STATE_FILE);
         $j = json_decode($raw, true);
         if (!is_array($j))
             $j = [];
@@ -315,7 +300,7 @@ if ($action === 'load_state') {
             'mode' => $j['mode'] ?? null,
             'manualSetpoint' => isset($j['manualSetpoint']) ? (float) $j['manualSetpoint'] : null,
             'actualTemp' => isset($j['actualTemp']) ? (float) $j['actualTemp'] : null,
-            'real' => isset($j['real']) ? (float) $j['real'] : null, // <--- Load real param
+            'real' => isset($j['real']) ? (float) $j['real'] : null,
             'cald' => isset($j['cald']) ? (int) $j['cald'] : 0,
             'phone' => isset($j['phone']) ? (int) $j['phone'] : 0
         ]);
@@ -764,16 +749,12 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
                     <div class="unit">°C</div>
                 </div>
                 <div class="subtitle" id="setpointHint">Manual setpoint</div>
-            </div>
-
-            <!-- NEW CARD FOR "REAL" PARAMETER -->
-            <div class="card pad span4">
-                <div class="subtitle">Real</div>
-                <div class="row">
-                    <div class="temp" id="realTemp" style="font-size: 40px;">--.-</div>
-                    <div class="unit">°C</div>
+                <!-- Small "Real" calculated setpoint footer -->
+                <div id="realContainer"
+                    style="display:none; margin-top:10px; padding-top:8px; border-top:1px solid var(--border); font-size:13px; color:var(--muted);">
+                    Real: <strong id="realTemp" style="color:var(--text)">--.-</strong> <span
+                        style="font-size:11px">°C</span>
                 </div>
-                <div class="subtitle">Sensor value</div>
             </div>
 
             <!-- Temperature Chart -->
@@ -883,6 +864,7 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
             const byId = id => document.getElementById(id);
             const actualTempEl = byId('actualTemp');
             const realTempEl = byId('realTemp'); // <--- New Element
+            const realContainer = byId('realContainer'); // <--- Container
             const setpointInput = byId('setpointInput');
             const setpointHint = byId('setpointHint');
             const statusDot = byId('statusDot');
@@ -1539,11 +1521,12 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
                         actualTempEl.textContent = '--.-';
                     }
 
-                    // Update Real (Sensor) Value
+                    // Update Real (Calculated Setpoint) Value
                     if (j && typeof j.real === 'number') {
                         realTempEl.textContent = j.real.toFixed(1);
+                        realContainer.style.display = 'block';
                     } else {
-                        realTempEl.textContent = '--.-';
+                        realContainer.style.display = 'none';
                     }
 
                     // Update Heater Status
@@ -1582,7 +1565,7 @@ if ($action === 'save_presets' && $_SERVER['REQUEST_METHOD'] === 'POST') {
 
                 } catch (e) {
                     actualTempEl.textContent = '--.-';
-                    realTempEl.textContent = '--.-';
+                    realContainer.style.display = 'none';
                     heaterStatusEl.textContent = '--';
                     heaterStatusEl.style.color = '#6b7280';
                     phoneStatusEl.textContent = '--';

@@ -1,31 +1,5 @@
 <?php
 // get_setpoint.php
-//
-// INPUTS (GET or POST):
-// - ?temp=FLOAT   : Updates current temp. 
-//                   Logs to 'temp_history.csv' (Throttled: max 1 write/10mins, Keeps 48h).
-// - ?real=FLOAT   : Updates "real" temp/value. (NEW)
-//                   Saves to state.json.
-// - ?cald=0|1     : Updates boiler relay status.
-// - ?phone=0|1    : Updates phone state. 
-//                   Logs to 'phone_history.csv' (Immediate: logs every request, Keeps 24h).
-//
-// OPERATIONS:
-// - Reads/Writes 'state.json' (current status).
-// - Reads 'schedule.json' (weekly program) to calculate Auto Setpoint.
-//
-// RETURNS (JSON):
-// { 
-//   "ok": true, 
-//   "mode": "AUTO|ON|OFF", 
-//   "setpoint": 20.0, 
-//   "actualTemp": 19.5, 
-//   "real": 19.2,   <-- NEW
-//   "cald": 1, 
-//   "phone": 0,
-//   "date": "YYYY-MM-DD", 
-//   ... 
-// }
 
 header('Content-Type: application/json; charset=utf-8');
 header('Access-Control-Allow-Origin: *');
@@ -35,13 +9,65 @@ header('Access-Control-Allow-Origin: *');
 
 date_default_timezone_set('Europe/Rome');
 
-// Disk paths
-$stateFile = __DIR__ . '/state.json';
-$scheduleFile = __DIR__ . '/schedule.json';
-$historyFile = __DIR__ . '/temp_history.csv';
-$phoneHistoryFile = __DIR__ . '/phone_history.csv';
+// ---------- CONFIGURATION ----------
 
-// ---------- helpers ----------
+// 1. RAM STORAGE (Using a new folder name to avoid previous permission locks)
+$ramDir = '/dev/shm/thermo_data';
+
+// 2. DISK BACKUPS (Local folder)
+$stateBackup = __DIR__ . '/state.json';
+$scheduleBackup = __DIR__ . '/schedule.json';
+$historyBackup = __DIR__ . '/temp_history.csv';
+$phoneHistoryBackup = __DIR__ . '/phone_history.csv';
+
+// ---------- INIT & CHECKS ----------
+
+// Check open_basedir restrictions
+$basedir = ini_get('open_basedir');
+if ($basedir && !str_contains($basedir, '/dev/shm') && !str_contains($basedir, '/dev/')) {
+    echo json_encode(['ok' => false, 'error' => "PHP Configuration 'open_basedir' prevents access to /dev/shm. Please edit php.ini."]);
+    exit;
+}
+
+// Create RAM directory if missing
+if (!is_dir($ramDir)) {
+    if (!@mkdir($ramDir, 0777, true)) {
+        $e = error_get_last();
+        echo json_encode(['ok' => false, 'error' => "Failed to create RAM folder ($ramDir). Permission denied.", 'details' => $e['message'] ?? '']);
+        exit;
+    }
+    @chmod($ramDir, 0777);
+}
+
+// Check write permissions
+if (!is_writable($ramDir)) {
+    echo json_encode(['ok' => false, 'error' => "RAM folder ($ramDir) is not writable. Check permissions."]);
+    exit;
+}
+
+// Define paths
+$stateFile = $ramDir . '/state.json';
+$scheduleFile = $ramDir . '/schedule.json';
+$historyFile = $ramDir . '/temp_history.csv';
+$phoneHistoryFile = $ramDir . '/phone_history.csv';
+
+// ---------- STARTUP SYNC (Disk -> RAM) ----------
+$filesToSync = [
+    $stateFile => $stateBackup,
+    $scheduleFile => $scheduleBackup,
+    $historyFile => $historyBackup,
+    $phoneHistoryFile => $phoneHistoryBackup
+];
+
+foreach ($filesToSync as $ramPath => $diskPath) {
+    if (!file_exists($ramPath) && file_exists($diskPath)) {
+        if (@copy($diskPath, $ramPath)) {
+            @chmod($ramPath, 0666);
+        }
+    }
+}
+
+// ---------- HELPERS ----------
 function read_json($file)
 {
     if (!is_readable($file))
@@ -55,226 +81,178 @@ function write_json_atomic($file, $data)
 {
     $tmp = $file . '.tmp';
     $json = json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES);
-    if ($json === false)
-        return false;
+
     $fp = @fopen($tmp, 'wb');
     if (!$fp)
-        return false;
-    @flock($fp, LOCK_EX);
-    $ok = fwrite($fp, $json) !== false;
-    @flock($fp, LOCK_UN);
-    @fclose($fp);
-    if (!$ok) {
-        @unlink($tmp);
-        return false;
+        return ['error' => "Cannot open $tmp"];
+
+    if (!flock($fp, LOCK_EX)) {
+        fclose($fp);
+        return ['error' => "Cannot lock $tmp"];
     }
-    return @rename($tmp, $file);
+
+    $res = fwrite($fp, $json);
+    flock($fp, LOCK_UN);
+    fclose($fp);
+
+    if ($res === false) {
+        @unlink($tmp);
+        return ['error' => "Write failed"];
+    }
+
+    if (!@rename($tmp, $file)) {
+        @unlink($tmp);
+        return ['error' => "Rename failed (Permissions?)"];
+    }
+
+    @chmod($file, 0666);
+    return true;
 }
 
 function hmToMinutes($hm)
 {
     $parts = explode(':', $hm);
-    $h = isset($parts[0]) ? intval($parts[0]) : 0;
-    $m = isset($parts[1]) ? intval($parts[1]) : 0;
-    return $h * 60 + $m;
+    return (int) ($parts[0] ?? 0) * 60 + (int) ($parts[1] ?? 0);
 }
 
 function computeAutoSetpoint($schedule, $manualSetpoint)
 {
     $now = new DateTime();
     $dayIndex = ((int) $now->format('w') + 6) % 7;
-    if (!isset($schedule[$dayIndex]['slots']) || !is_array($schedule[$dayIndex]['slots']) || !count($schedule[$dayIndex]['slots'])) {
+    if (empty($schedule[$dayIndex]['slots']))
         return (float) $manualSetpoint;
-    }
+
     $slots = $schedule[$dayIndex]['slots'];
     usort($slots, fn($a, $b) => strcmp($a['time'] ?? '', $b['time'] ?? ''));
+
     $minutes = intval($now->format('G')) * 60 + intval($now->format('i'));
     $chosen = $slots[0];
     foreach ($slots as $s) {
         if (isset($s['time']) && hmToMinutes($s['time']) <= $minutes)
             $chosen = $s;
     }
-    return isset($chosen['setpoint']) ? (float) $chosen['setpoint'] : (float) $manualSetpoint;
+    return (float) ($chosen['setpoint'] ?? $manualSetpoint);
 }
 
-function one_decimal_str($n)
-{
-    return number_format((float) $n, 1, '.', '');
-}
-
-/**
- * Temp History: Prunes older than $keepSec (default 48h)
- * Throttles writes ($minDelta)
- */
-function history_append_if_due(string $historyFile, float $temp, int $minDelta = 600, int $keepSec = 172800): void
+function history_append_if_due($file, $temp, $minDelta = 600, $keep = 172800)
 {
     $now = time();
-    $due = true;
-    $mtime = @filemtime($historyFile);
-    if ($mtime !== false && ($now - $mtime) < $minDelta) {
-        $due = false;
-    }
-
-    if ($due) {
-        @file_put_contents($historyFile, $now . ',' . number_format($temp, 2, '.', '') . "\n", FILE_APPEND);
-
-        // Prune
-        $cutoff = $now - $keepSec;
-        $rows = @file($historyFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-        if ($rows !== false) {
-            $kept = [];
-            foreach ($rows as $r) {
-                $parts = explode(',', $r, 2);
-                if (!count($parts))
-                    continue;
-                if ((int) $parts[0] >= $cutoff)
-                    $kept[] = $r;
-            }
-            $tmp = $historyFile . '.tmp';
-            if (@file_put_contents($tmp, implode("\n", $kept) . (count($kept) ? "\n" : '')) !== false) {
-                @rename($tmp, $historyFile);
-            }
-        }
-    }
-}
-
-/**
- * Phone History: Log ONCE PER MINUTE, prune older than 24h (86400 sec)
- */
-function phone_history_append(string $file, int $val): void
-{
-    $now = time();
-    $keepSec = 86400; // 24 Hours
-    $minDelta = 60;   // 60 Seconds throttle
-
-    // 1. Check Throttling
-    $mtime = @filemtime($file);
-    if ($mtime !== false && ($now - $mtime) < $minDelta) {
+    if (@filemtime($file) > $now - $minDelta)
         return;
-    }
 
-    // 2. Append new value
-    @file_put_contents($file, $now . ',' . $val . "\n", FILE_APPEND);
+    @file_put_contents($file, "$now," . number_format($temp, 2, '.', '') . "\n", FILE_APPEND);
 
-    // 3. Prune old values
-    $cutoff = $now - $keepSec;
+    // Prune
     $rows = @file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-
-    if ($rows !== false && count($rows) > 0) {
+    if ($rows) {
+        $cutoff = $now - $keep;
         $kept = [];
-        $rewriteNeeded = false;
-
         foreach ($rows as $r) {
-            $parts = explode(',', $r, 2);
-            if (!count($parts))
-                continue;
-
-            $ts = (int) $parts[0];
-            if ($ts >= $cutoff) {
+            if (((int) explode(',', $r)[0]) >= $cutoff)
                 $kept[] = $r;
-            } else {
-                $rewriteNeeded = true;
-            }
         }
-
-        if ($rewriteNeeded) {
-            $tmp = $file . '.tmp';
-            $content = implode("\n", $kept) . (count($kept) ? "\n" : '');
-            if (@file_put_contents($tmp, $content) !== false) {
-                @rename($tmp, $file);
-            }
+        $tmp = $file . '.tmp';
+        if (@file_put_contents($tmp, implode("\n", $kept) . "\n")) {
+            @rename($tmp, $file);
+            @chmod($file, 0666);
         }
     }
 }
 
-// ---------- load state & schedule ----------
+function phone_history_append($file, $val)
+{
+    $now = time();
+    if (@filemtime($file) > $now - 60)
+        return;
+    @file_put_contents($file, "$now,$val\n", FILE_APPEND);
+
+    // Prune (Keep 24h)
+    $rows = @file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+    if ($rows) {
+        $cutoff = $now - 86400;
+        $kept = [];
+        foreach ($rows as $r) {
+            if (((int) explode(',', $r)[0]) >= $cutoff)
+                $kept[] = $r;
+        }
+        $tmp = $file . '.tmp';
+        if (@file_put_contents($tmp, implode("\n", $kept) . "\n")) {
+            @rename($tmp, $file);
+            @chmod($file, 0666);
+        }
+    }
+}
+
+// ---------- LOGIC ----------
+
 $state = read_json($stateFile);
 $scheduleWrap = read_json($scheduleFile);
-$schedule = isset($scheduleWrap['schedule']) && is_array($scheduleWrap['schedule']) ? $scheduleWrap['schedule'] : [];
+$schedule = $scheduleWrap['schedule'] ?? [];
 
 $mode = $state['mode'] ?? 'AUTO';
-$manualSetpoint = isset($state['manualSetpoint']) ? (float) $state['manualSetpoint'] : 20.0;
+$manualSetpoint = (float) ($state['manualSetpoint'] ?? 20.0);
 $actualTemp = isset($state['actualTemp']) ? round((float) $state['actualTemp'], 1) : null;
-$cald = isset($state['cald']) ? (int) $state['cald'] : 0;
-$phone = isset($state['phone']) ? (int) $state['phone'] : 0;
-// Load 'real' (default to null if missing)
+$cald = (int) ($state['cald'] ?? 0);
+$phone = (int) ($state['phone'] ?? 0);
 $real = isset($state['real']) ? round((float) $state['real'], 1) : null;
 
-// ---------- optional updates ----------
+// Handle Updates
 $tempParam = $_GET['temp'] ?? $_POST['temp'] ?? null;
 $caldParam = $_GET['cald'] ?? $_POST['cald'] ?? null;
 $phoneParam = $_GET['phone'] ?? $_POST['phone'] ?? null;
-$realParam = $_GET['real'] ?? $_POST['real'] ?? null; // <--- Check Param
+$realParam = $_GET['real'] ?? $_POST['real'] ?? null;
 
 $updated = false;
 
-// 1. Handle Temp
 if ($tempParam !== null) {
-    $newTemp = round((float) $tempParam, 1);
-    $state['actualTemp'] = $newTemp;
-    $actualTemp = $newTemp;
+    $actualTemp = round((float) $tempParam, 1);
+    $state['actualTemp'] = $actualTemp;
+    history_append_if_due($historyFile, $actualTemp);
     $updated = true;
-    history_append_if_due($historyFile, (float) $newTemp, 600, 172800);
 }
-
-// 2. Handle Cald (Relay)
 if ($caldParam !== null) {
-    $newCald = ((int) $caldParam === 1) ? 1 : 0;
-    $state['cald'] = $newCald;
-    $cald = $newCald;
+    $cald = ((int) $caldParam === 1) ? 1 : 0;
+    $state['cald'] = $cald;
     $updated = true;
 }
-
-// 3. Handle Phone
 if ($phoneParam !== null) {
-    $newPhone = ((int) $phoneParam === 1) ? 1 : 0;
-    $state['phone'] = $newPhone;
-    $phone = $newPhone;
+    $phone = ((int) $phoneParam === 1) ? 1 : 0;
+    $state['phone'] = $phone;
+    phone_history_append($phoneHistoryFile, $phone);
     $updated = true;
-    phone_history_append($phoneHistoryFile, $newPhone);
 }
-
-// 4. Handle Real (NEW)
 if ($realParam !== null) {
-    $newReal = round((float) $realParam, 1);
-    $state['real'] = $newReal;
-    $real = $newReal;
+    $real = round((float) $realParam, 1);
+    $state['real'] = $real;
     $updated = true;
 }
 
-// Save state.json
 if ($updated) {
-    $okDisk = write_json_atomic($stateFile, $state);
-    if (!$okDisk) {
-        echo json_encode(['ok' => false, 'error' => 'Failed to write state.json']);
+    $res = write_json_atomic($stateFile, $state);
+    if ($res !== true) {
+        echo json_encode(['ok' => false, 'error' => $res['error']]);
         exit;
     }
 }
 
-// ---------- compute setpoint ----------
-if ($mode === 'OFF') {
+// Calculate Setpoint
+if ($mode === 'OFF')
     $setpoint = null;
-} elseif ($mode === 'ON') {
+elseif ($mode === 'ON')
     $setpoint = $manualSetpoint;
-} else {
+else
     $setpoint = computeAutoSetpoint($schedule, $manualSetpoint);
-}
 
-// ---------- normalize numbers ----------
-$actualTemp_num = ($actualTemp !== null) ? (float) one_decimal_str($actualTemp) : null;
-$actualTemp_str = ($actualTemp !== null) ? one_decimal_str($actualTemp) : null;
-// Format 'real' for output
-$real_num = ($real !== null) ? (float) one_decimal_str($real) : null;
-
-// ---------- respond ----------
+// Response
 $now = new DateTime();
 echo json_encode([
     'ok' => true,
+    'debug_storage' => $ramDir, // <--- Verify path here
     'mode' => $mode,
     'setpoint' => $setpoint,
-    'actualTemp' => $actualTemp_num,
-    'actualTemp_str' => $actualTemp_str,
-    'real' => $real_num, // <--- Return real
+    'actualTemp' => $actualTemp,
+    'actualTemp_str' => ($actualTemp !== null) ? number_format($actualTemp, 1, '.', '') : null,
+    'real' => $real,
     'cald' => $cald,
     'phone' => $phone,
     'date' => $now->format('Y-m-d'),

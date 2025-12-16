@@ -633,6 +633,8 @@ void setup()
 
   // Watchdog
   g_wdtTicker.attach(20.0, wdtCallback);
+
+  // ... existing WiFi connection code ...
 }
 void checkHeaterMalfunction(float currentTemp, bool isHeaterOn)
 {
@@ -715,6 +717,8 @@ void checkHeaterMalfunction(float currentTemp, bool isHeaterOn)
 // ======================================================================================
 void loop()
 {
+ 
+
   g_wdtFed = true;
   server.handleClient();
 
