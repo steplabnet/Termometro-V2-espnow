@@ -1,6 +1,6 @@
 /*
  * ======================================================================================
- * PROJECT: ESP32-C3 Smart Office Thermostat (NimBLE + OTA Version)
+ * PROJECT: ESP32-C3 Smart Office Thermostat (NimBLE + OTA + Telnet Debug)
  * ======================================================================================
  */
 
@@ -17,13 +17,23 @@
 #include <WiFiClientSecure.h>
 #include <Ticker.h>
 #include <time.h>
-#include <Adafruit_NeoPixel.h>
+#include <Adafruit_NeoPixel.h> 
 
 // OTA LIBRARY
 #include <ArduinoOTA.h>
 
 // NIMBLE LIBRARY
 #include <NimBLEDevice.h>
+
+// TELNET STREAM (IP Monitor)
+#include <TelnetStream.h>
+
+// ======================================================================================
+// LOGGING MACROS (Sends to BOTH Serial and Telnet)
+// ======================================================================================
+#define LOG_PRINT(...)   { Serial.print(__VA_ARGS__); TelnetStream.print(__VA_ARGS__); }
+#define LOG_PRINTLN(...) { Serial.println(__VA_ARGS__); TelnetStream.println(__VA_ARGS__); }
+#define LOG_PRINTF(...)  { Serial.printf(__VA_ARGS__); TelnetStream.printf(__VA_ARGS__); }
 
 // ======================================================================================
 // CONFIGURATION
@@ -94,11 +104,11 @@ volatile uint8_t g_lastAction = 0;
 bool g_phoneDetected = false;
 int g_maxRssi = -100;
 volatile bool g_wdtFed = false;
-bool g_otaInProgress = false; // Flag to stop logic during OTA
+bool g_otaInProgress = false; 
 
 // LED State Variables
 bool g_ledState = false;
-uint32_t g_blinkColor = 0;
+uint32_t g_blinkColor = 0; 
 
 // Settings
 static float g_fixedSetpoint = 19.0f;
@@ -121,11 +131,11 @@ const uint32_t TIMEOUT_HEATER_OFF = 60000; // 1 Minute
 
 unsigned long g_heatStartTime = 0;
 float g_heatStartTemp = 0.0;
-float g_alarmTriggerTemp = 0.0;
+float g_alarmTriggerTemp = 0.0; 
 bool g_heaterMonitorActive = false;
-bool g_malfunctionState = false;
+bool g_malfunctionState = false; 
 
-Ticker fastBlueTicker;
+Ticker fastBlueTicker; 
 
 // ======================================================================================
 // HELPERS
@@ -133,9 +143,8 @@ Ticker fastBlueTicker;
 
 void IRAM_ATTR wdtCallback()
 {
-  if (g_otaInProgress)
-  {
-    g_wdtFed = true; // Don't reset during OTA
+  if (g_otaInProgress) {
+    g_wdtFed = true; 
     return;
   }
 
@@ -143,6 +152,7 @@ void IRAM_ATTR wdtCallback()
     g_wdtFed = false;
   else
   {
+    // ets_printf is ISR safe, do not change to LOG_PRINTF
     ets_printf("\n[WDT] System hung. Resetting...\n");
     ESP.restart();
   }
@@ -151,8 +161,7 @@ void IRAM_ATTR wdtCallback()
 // RGB Toggle Function
 void toggleLed()
 {
-  if (g_otaInProgress)
-    return; // Don't toggle during OTA
+  if (g_otaInProgress) return; 
 
   g_ledState = !g_ledState;
   if (g_ledState)
@@ -194,31 +203,25 @@ static void loadFixedSetpoint()
 void checkWindowOpenAnomaly(float currentTemp, bool isHeaterOn)
 {
   static unsigned long lastCheck = 0;
-  if (millis() - lastCheck < WINDOW_CHECK_INTERVAL)
-    return;
+  if (millis() - lastCheck < WINDOW_CHECK_INTERVAL) return;
   lastCheck = millis();
 
-  if (g_prevTemp == 0.0)
-  {
+  if (g_prevTemp == 0.0) {
     g_prevTemp = currentTemp;
     return;
   }
 
   float diff = currentTemp - g_prevTemp;
-  if (isHeaterOn && diff < -0.2)
-  {
+  if (isHeaterOn && diff < -0.2) { 
     g_dropCount++;
-    Serial.printf(">>> [AI] Temp drop detected (%.2f -> %.2f). Count: %d\n", g_prevTemp, currentTemp, g_dropCount);
-  }
-  else
-  {
-    g_dropCount = 0;
+    LOG_PRINTF(">>> [AI] Temp drop detected (%.2f -> %.2f). Count: %d\n", g_prevTemp, currentTemp, g_dropCount);
+  } else {
+    g_dropCount = 0; 
   }
 
-  if (g_dropCount >= 3)
-  {
-    Serial.println(">>> [AI] WINDOW OPEN DETECTED! Forcing Heater OFF.");
-    g_fixedPreset = "off";
+  if (g_dropCount >= 3) { 
+    LOG_PRINTLN(">>> [AI] WINDOW OPEN DETECTED! Forcing Heater OFF.");
+    g_fixedPreset = "off"; 
     g_fixedSetpoint = 10.0;
     saveFixedSetpoint();
     g_dropCount = 0;
@@ -230,8 +233,7 @@ void checkWindowOpenAnomaly(float currentTemp, bool isHeaterOn)
 void runBleScan()
 {
   // Safety: Do not scan if OTA is running
-  if (g_otaInProgress)
-    return;
+  if(g_otaInProgress) return;
 
   NimBLEScanResults foundDevices = pBLEScan->start(BLE_SCAN_TIME, false);
 
@@ -272,7 +274,7 @@ void runBleScan()
 
   if (nearbyCount > 0)
   {
-    Serial.printf(">>> [BLE] Phone Found! RSSI: %d dBm | Hits: %d/%d\n", strongest, validHits, REQUIRED_HITS);
+    LOG_PRINTF(">>> [BLE] Phone Found! RSSI: %d dBm | Hits: %d/%d\n", strongest, validHits, REQUIRED_HITS);
   }
 
   bool stablePresence = (validHits >= REQUIRED_HITS);
@@ -286,22 +288,21 @@ void runBleScan()
   // LED Logic
   if (g_malfunctionState)
   {
-    pBLEScan->clearResults();
+    pBLEScan->clearResults(); 
     return;
   }
 
   static bool isBlinking = false;
   if (validHits > 0)
   {
-    if (validHits < REQUIRED_HITS)
-      g_blinkColor = pixels.Color(0, 0, 10); // Blue
-    else
-      g_blinkColor = pixels.Color(0, 10, 0); // Green
+    if (validHits < REQUIRED_HITS) g_blinkColor = pixels.Color(0, 0, 10); // Blue
+    else g_blinkColor = pixels.Color(0, 10, 0); // Green
 
     if (!isBlinking)
     {
       ledBlinker.attach(0.5, toggleLed);
       isBlinking = true;
+      LOG_PRINTLN(">>> [LED] Blink START");
     }
   }
   else
@@ -313,10 +314,11 @@ void runBleScan()
       pixels.show();
       isBlinking = false;
       g_ledState = false;
+      LOG_PRINTLN(">>> [LED] Blink STOP");
     }
   }
 
-  pBLEScan->clearResults();
+  pBLEScan->clearResults(); 
 }
 
 static bool cesanaReportAndFetch(float tempC, bool heating, float realSp)
@@ -336,6 +338,10 @@ static bool cesanaReportAndFetch(float tempC, bool heating, float realSp)
                "&cald=" + (heating ? "1" : "0") +
                "&phone=" + (logicPhonePresent ? "1" : "0") +
                "&real=" + String(realSp, 1);
+  
+  // Note: Printing URLs to logs can be spammy, but useful for debug
+  LOG_PRINT(">>> [HTTP] Calling: ");
+  LOG_PRINTLN(url);
 
   if (https.begin(client, url))
   {
@@ -343,6 +349,9 @@ static bool cesanaReportAndFetch(float tempC, bool heating, float realSp)
     if (code == HTTP_CODE_OK)
     {
       String payload = https.getString();
+      // LOG_PRINT(">>> [HTTP] Reply: ");
+      // LOG_PRINTLN(payload);
+
       JsonDocument doc;
       if (!deserializeJson(doc, payload))
       {
@@ -352,6 +361,7 @@ static bool cesanaReportAndFetch(float tempC, bool heating, float realSp)
           g_fixedSetpoint = remoteSp;
           g_fixedPreset = "remote";
           saveFixedSetpoint();
+          LOG_PRINTLN(">>> [HTTP] Setpoint updated via Remote!");
         }
       }
       https.end();
@@ -525,8 +535,7 @@ void handlePostFixed()
 }
 void toggleFastBlue()
 {
-  if (g_otaInProgress)
-    return;
+  if(g_otaInProgress) return;
   static bool state = false;
   state = !state;
   pixels.setPixelColor(0, state ? pixels.Color(0, 0, 255) : 0);
@@ -536,15 +545,14 @@ void toggleFastBlue()
 // ======================================================================================
 // OTA SETUP FUNCTION
 // ======================================================================================
-void setupOTA()
-{
+void setupOTA() {
   ArduinoOTA.setHostname(HOSTNAME);
 
-  ArduinoOTA.onStart([]()
-                     {
+  ArduinoOTA.onStart([]() {
     g_otaInProgress = true;
     String type = (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
     
+    // We can't really use Telnet reliably here, it might cut off
     Serial.println("Start updating " + type);
     
     // CRITICAL: Stop BLE Scan to prevent radio conflicts
@@ -556,44 +564,36 @@ void setupOTA()
 
     // Visual Indicator: Magenta
     pixels.setPixelColor(0, pixels.Color(255, 0, 255));
-    pixels.show(); });
+    pixels.show();
+  });
 
-  ArduinoOTA.onEnd([]()
-                   {
+  ArduinoOTA.onEnd([]() {
     Serial.println("\nEnd");
     g_otaInProgress = false;
-    // Turn off LED
     pixels.clear();
-    pixels.show(); });
+    pixels.show();
+  });
 
-  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total)
-                        {
-    // Optional: Blink logic could go here, but keep it simple
-    // Just toggle small dim magenta every 10%?
+  ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
     if (progress % 10 == 0) {
         pixels.setPixelColor(0, pixels.Color(50, 0, 50)); 
         pixels.show();
     } else if (progress % 5 == 0) {
         pixels.setPixelColor(0, pixels.Color(0, 0, 0));
         pixels.show();
-    } });
+    }
+  });
 
-  ArduinoOTA.onError([](ota_error_t error)
-                     {
-                       g_otaInProgress = false;
-                       Serial.printf("Error[%u]: ", error);
-                       if (error == OTA_AUTH_ERROR)
-                         Serial.println("Auth Failed");
-                       else if (error == OTA_BEGIN_ERROR)
-                         Serial.println("Begin Failed");
-                       else if (error == OTA_CONNECT_ERROR)
-                         Serial.println("Connect Failed");
-                       else if (error == OTA_RECEIVE_ERROR)
-                         Serial.println("Receive Failed");
-                       else if (error == OTA_END_ERROR)
-                         Serial.println("End Failed");
-                       ESP.restart(); // Best to restart on error
-                     });
+  ArduinoOTA.onError([](ota_error_t error) {
+    g_otaInProgress = false;
+    Serial.printf("Error[%u]: ", error);
+    if (error == OTA_AUTH_ERROR) Serial.println("Auth Failed");
+    else if (error == OTA_BEGIN_ERROR) Serial.println("Begin Failed");
+    else if (error == OTA_CONNECT_ERROR) Serial.println("Connect Failed");
+    else if (error == OTA_RECEIVE_ERROR) Serial.println("Receive Failed");
+    else if (error == OTA_END_ERROR) Serial.println("End Failed");
+    ESP.restart(); 
+  });
 
   ArduinoOTA.begin();
 }
@@ -650,8 +650,11 @@ void setup()
     Serial.print(">>> SUCCESS! IP: ");
     Serial.println(WiFi.localIP());
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-
-    // INITIALIZE OTA ONLY IF CONNECTED
+    
+    // --- START TELNET ---
+    TelnetStream.begin();
+    Serial.println(">>> Telnet Server Started on Port 23");
+    
     setupOTA();
   }
   else
@@ -686,22 +689,21 @@ void setup()
 
 void checkHeaterMalfunction(float currentTemp, bool isHeaterOn)
 {
-  if (g_otaInProgress)
-    return; // Skip checks during update
+  if (g_otaInProgress) return; 
 
   // 1. RECOVERY CHECK (If already in Alarm)
   if (g_malfunctionState)
   {
     if (currentTemp >= (g_alarmTriggerTemp + MIN_REQUIRED_RISE))
     {
-      Serial.println(">>> [ALARM] Recovery! Temp rose 0.5C. Exiting Malfunction State.");
+      LOG_PRINTLN(">>> [ALARM] Recovery! Temp rose 0.5C. Exiting Malfunction State.");
 
       g_malfunctionState = false;
-      fastBlueTicker.detach();
+      fastBlueTicker.detach(); 
       pixels.clear();
       pixels.show();
     }
-    return;
+    return; 
   }
 
   // 2. MONITORING LOGIC
@@ -716,7 +718,7 @@ void checkHeaterMalfunction(float currentTemp, bool isHeaterOn)
     g_heaterMonitorActive = true;
     g_heatStartTime = millis();
     g_heatStartTemp = currentTemp;
-    Serial.printf(">>> [MONITOR] Heater Started at %.2f C. Timer: 30 mins.\n", currentTemp);
+    LOG_PRINTF(">>> [MONITOR] Heater Started at %.2f C. Timer: 30 mins.\n", currentTemp);
     return;
   }
 
@@ -726,10 +728,10 @@ void checkHeaterMalfunction(float currentTemp, bool isHeaterOn)
 
     if (diff < MIN_REQUIRED_RISE)
     {
-      Serial.printf(">>> [ALARM] FAIL! 30 mins elapsed. Rise: %.2f (Req: %.2f). Stopping Heater.\n", diff, MIN_REQUIRED_RISE);
+      LOG_PRINTF(">>> [ALARM] FAIL! 30 mins elapsed. Rise: %.2f (Req: %.2f). Stopping Heater.\n", diff, MIN_REQUIRED_RISE);
 
       g_malfunctionState = true;
-      g_alarmTriggerTemp = currentTemp;
+      g_alarmTriggerTemp = currentTemp; 
 
       g_fixedSetpoint = 10.0;
       g_fixedPreset = "off";
@@ -752,8 +754,7 @@ void loop()
   ArduinoOTA.handle();
 
   // If OTA is running, skip everything else to prevent crashes
-  if (g_otaInProgress)
-    return;
+  if(g_otaInProgress) return;
 
   g_wdtFed = true;
   server.handleClient();
@@ -790,7 +791,7 @@ void loop()
       {
         if (g_fixedSetpoint < 18.0)
         {
-          Serial.println(">>> [LOGIC] Stable Presence. Forcing Min 18.0 C");
+          LOG_PRINTLN(">>> [LOGIC] Stable Presence. Forcing Min 18.0 C");
           g_fixedSetpoint = 18.0;
           g_fixedPreset = "auto_comfort";
           saveFixedSetpoint();
@@ -800,7 +801,7 @@ void loop()
       {
         if (g_fixedSetpoint > 15.0)
         {
-          Serial.println(">>> [LOGIC] Time >= 10 & Phone absent > 10min. Capping at 15.0 C");
+          LOG_PRINTLN(">>> [LOGIC] Time >= 10 & Phone absent > 10min. Capping at 15.0 C");
           g_fixedSetpoint = 15.0;
           g_fixedPreset = "auto_eco_15";
           saveFixedSetpoint();
@@ -813,7 +814,7 @@ void loop()
 
     if (g_malfunctionState)
     {
-      g_lastAction = 0;
+      g_lastAction = 0; 
     }
     else
     {
@@ -828,14 +829,14 @@ void loop()
     jtx["heater"] = (g_lastAction == 1) ? "ON" : "OFF";
     jtx["temp"] = g_lastTempC;
     jtx["phone"] = g_phoneDetected;
-    jtx["alarm"] = g_malfunctionState;
+    jtx["alarm"] = g_malfunctionState; 
     jtx["id"] = 12;
     char buf[128];
     serializeJson(jtx, buf);
     esp_now_send(TARGET, (uint8_t *)buf, strlen(buf));
 
-    // F. Serial Debug
-    Serial.printf("[STATUS] Temp: %.2f | Set: %.1f | Heat: %s | Phone: %s | Alarm: %s\n",
+    // F. Debug Logs (Telnet + Serial)
+    LOG_PRINTF("[STATUS] Temp: %.2f | Set: %.1f | Heat: %s | Phone: %s | Alarm: %s\n",
                   g_lastTempC, sp, (g_lastAction == 1) ? "ON" : "OFF",
                   g_phoneDetected ? "YES" : "NO",
                   g_malfunctionState ? "YES (BLINKING)" : "NO");
