@@ -1,7 +1,12 @@
 /*
  * ======================================================================================
- * PROJECT: ESP32-C3 Smart Office Thermostat (OTA-STABLE VERSION)
- * FIXES: Aggressive BLE De-init on OTA start to prevent Radio collisions
+ * PROJECT: ESP32-C3 Smart Office Thermostat (1-MIN ABSENCE VERSION)
+ * LOGIC:
+ *   - 00-06: Forced 10C (Night)
+ *   - 06-10: Follow Web (if phone absent) OR 18C (if phone present)
+ *   - 10-24: Forced 15C (if phone absent 1m) OR 18C (if phone present)
+ *   - PHONE: Detect at 3 hits/min, Absent at 0 hits/min (Hysteresis)
+ *   - OTA: Aggressive BLE de-init for 100% stability
  * ======================================================================================
  */
 
@@ -50,13 +55,13 @@ const int daylightOffset_sec = 3600;
 const int BLE_RSSI_THRESHOLD = -75;
 const int BLE_SCAN_TIME = 1;
 #define REQUIRED_HITS 3
-#define HIT_WINDOW_MS 60000
+#define HIT_WINDOW_MS 60000 // 1 Minute window
 
 // Logic Settings
 static float g_fixedSetpoint = 19.0f;
 static String g_fixedPreset = "on";
 static const float HYST_BAND_C = 0.5f;
-const uint32_t PHONE_ABSENCE_TIMEOUT_MS = 600000;
+const uint32_t PHONE_ABSENCE_TIMEOUT_MS = 60000; // REDUCED TO 1 MINUTE
 const uint32_t TIMEOUT_HEATER_ON = 300000;
 const uint32_t TIMEOUT_HEATER_OFF = 60000;
 
@@ -81,7 +86,7 @@ bool g_otaInProgress = false;
 bool g_ledState = false;
 uint32_t g_blinkColor = 0;
 uint32_t g_lastPhoneSeenMs = 0;
-unsigned long g_detectionHistory[10] = {0};
+unsigned long g_detectionHistory[20] = {0}; // Increased for 5s scan rate
 int g_historyIndex = 0;
 bool g_malfunctionState = false;
 
@@ -160,26 +165,39 @@ void runBleScan()
     if (foundDevices.getDevice(i).getRSSI() > BLE_RSSI_THRESHOLD)
       nearbyCount++;
   }
+
   if (nearbyCount > 0)
   {
     g_detectionHistory[g_historyIndex] = millis();
-    g_historyIndex = (g_historyIndex + 1) % 10;
+    g_historyIndex = (g_historyIndex + 1) % 20;
   }
+
   int validHits = 0;
   unsigned long now = millis();
-  for (int i = 0; i < 10; i++)
+  for (int i = 0; i < 20; i++)
   {
     if (g_detectionHistory[i] != 0 && (now - g_detectionHistory[i] <= HIT_WINDOW_MS))
       validHits++;
   }
   g_currentHits = validHits;
-  g_phoneDetected = (validHits >= REQUIRED_HITS);
-  if (g_phoneDetected)
-    g_lastPhoneSeenMs = millis();
 
+  // HYSTERESIS LOGIC:
+  // Arrive: Requires 3 hits
+  // Leave: Requires 0 hits for a full minute
+  if (validHits >= REQUIRED_HITS)
+  {
+    g_phoneDetected = true;
+    g_lastPhoneSeenMs = millis();
+  }
+  else if (validHits == 0)
+  {
+    g_phoneDetected = false;
+  }
+
+  // Visuals
   if (validHits > 0 && !g_malfunctionState)
   {
-    g_blinkColor = (validHits < REQUIRED_HITS) ? pixels.Color(0, 0, 15) : pixels.Color(0, 15, 0);
+    g_blinkColor = (g_phoneDetected) ? pixels.Color(0, 15, 0) : pixels.Color(0, 0, 15);
     static bool isBlinking = false;
     if (!isBlinking)
     {
@@ -246,38 +264,21 @@ void setupOTA()
   ArduinoOTA.onStart([]()
                      {
     g_otaInProgress = true;
-    
-    // 1. KILL WATCHDOG
-    esp_task_wdt_delete(NULL); 
-    esp_task_wdt_deinit();
-
-    // 2. KILL RADIOS COLLISION SOURCES
+    esp_task_wdt_delete(NULL); esp_task_wdt_deinit();
     if(pBLEScan) pBLEScan->stop();
-    NimBLEDevice::deinit(true); // Completely remove BLE stack from memory
+    NimBLEDevice::deinit(true);
     pBLEScan = nullptr;
-    
-    esp_now_deinit(); // Kill ESP-NOW radio traffic
-    server.stop();    // Stop Web Server
-
-    // 3. SET WIFI TO STATION ONLY (Disable AP interference)
+    esp_now_deinit();
+    server.stop();
     WiFi.softAPdisconnect(true);
     WiFi.mode(WIFI_STA);
-
-    // 4. VISUAL INDICATOR
     ledBlinker.detach();
-    pixels.setPixelColor(0, pixels.Color(150, 0, 255)); // Solid Purple for OTA
-    pixels.show();
-    
-    LOG_PRINTLN(">>> [OTA] Starting Update. Radio sanitized."); });
-
+    pixels.setPixelColor(0, pixels.Color(150, 0, 255)); pixels.show();
+    LOG_PRINTLN(">>> [OTA] RADIO SANITIZED. Writing flash..."); });
   ArduinoOTA.onEnd([]()
-                   { LOG_PRINTLN(">>> [OTA] Finished. Restarting..."); });
-
+                   { ESP.restart(); });
   ArduinoOTA.onError([](ota_error_t error)
-                     {
-                       ESP.restart(); // Restart on failure to recover
-                     });
-
+                     { ESP.restart(); });
   ArduinoOTA.begin();
 }
 
@@ -291,41 +292,34 @@ void setup()
   oneWire.begin(ONE_WIRE_BUS);
   sensors.begin();
   sensors.setResolution(12);
-
   NimBLEDevice::init(HOSTNAME);
   pBLEScan = NimBLEDevice::getScan();
   pBLEScan->setActiveScan(true);
-
   WiFi.mode(WIFI_AP_STA);
   WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID_DEFAULT, WIFI_PASS_DEFAULT);
-
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 8000)
     delay(500);
-
   if (WiFi.status() == WL_CONNECTED)
   {
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
     TelnetStream.begin();
     setupOTA();
   }
-
   esp_now_init();
   memcpy(peerInfo.peer_addr, TARGET, 6);
   esp_now_add_peer(&peerInfo);
-
   esp_task_wdt_init(&twdt_config);
   esp_task_wdt_add(NULL);
+  LOG_PRINTLN(">>> SYSTEM READY. Presence Absence set to 60s.");
 }
 
 void loop()
 {
-  // Always handle OTA first
   ArduinoOTA.handle();
   if (g_otaInProgress)
-    return; // Stop all other tasks immediately
-
+    return;
   esp_task_wdt_reset();
   server.handleClient();
   uint32_t now = millis();
@@ -370,21 +364,26 @@ void loop()
         {
           g_fixedSetpoint = 18.0;
           saveFixedSetpoint();
+          LOG_PRINTLN(">>> [MORNING] Present. Comfort 18.0 C.");
         }
       }
       else
       {
+        // OFFICE HOURS (10:00+)
         if (g_phoneDetected && g_fixedSetpoint < 18.0)
         {
           g_fixedSetpoint = 18.0;
           saveFixedSetpoint();
+          LOG_PRINTLN(">>> [DAY] Present. Comfort 18.0 C.");
         }
         else if (timeKnown && !g_phoneDetected && g_fixedSetpoint > 15.0)
         {
+          // CHECK THE 1 MINUTE TIMEOUT
           if (now - g_lastPhoneSeenMs > PHONE_ABSENCE_TIMEOUT_MS)
           {
             g_fixedSetpoint = 15.0;
             saveFixedSetpoint();
+            LOG_PRINTLN(">>> [DAY] Absent for 1m. Eco 15.0 C.");
           }
         }
       }
@@ -415,9 +414,9 @@ void loop()
       getLocalTime(&t_sync);
       bool night = (t_sync.tm_hour >= 0 && t_sync.tm_hour < 6);
       cesanaReportAndFetch(g_lastTempC, (g_lastAction == 1), g_fixedSetpoint, night);
-      LOG_PRINTF("[%s] T:%.1f SP:%.1f Heat:%s Phone:%s\n",
+      LOG_PRINTF("[%s] T:%.1f SP:%.1f Heat:%s Phone:%s (Hits:%d)\n",
                  getLogTime().c_str(), g_lastTempC, g_fixedSetpoint,
-                 (g_lastAction == 1) ? "ON" : "OFF", g_phoneDetected ? "YES" : "NO");
+                 (g_lastAction == 1) ? "ON" : "OFF", g_phoneDetected ? "YES" : "NO", g_currentHits);
     }
   }
 }
