@@ -1,7 +1,10 @@
 /*
  * ======================================================================================
- * PROJECT: ESP32-C3 Smart Office Thermostat (LED-FIX VERSION)
- * FIXES: LED brightness, LED logic reset, Weekend Logic, 1-min Absence
+ * PROJECT: ESP32-C3 Smart Office Thermostat (HEATER-PRIORITY LED VERSION)
+ * LOGIC:
+ *   - LED RED: Heater ON (Priority 1)
+ *   - LED GREEN: Phone Detected & Heater OFF (Priority 2)
+ *   - LED BLUE: Phone Signal Found & Heater OFF (Priority 3)
  * ======================================================================================
  */
 
@@ -74,12 +77,12 @@ uint8_t TARGET[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 esp_now_peer_info_t peerInfo;
 
 volatile float g_lastTempC = NAN;
-volatile uint8_t g_lastAction = 0;
+volatile uint8_t g_lastAction = 0; // 1 = Heater ON, 0 = Heater OFF
 bool g_phoneDetected = false;
 int g_currentHits = 0;
 bool g_otaInProgress = false;
 bool g_ledState = false;
-bool g_isBlinking = false; // Moved from static to global for reliable reset
+bool g_isBlinking = false;
 uint32_t g_blinkColor = 0;
 uint32_t g_lastPhoneSeenMs = 0;
 unsigned long g_detectionHistory[20] = {0};
@@ -149,6 +152,54 @@ void toggleLed()
   pixels.show();
 }
 
+// Function to calculate and apply LED status
+void updateLedDisplay()
+{
+  if (g_otaInProgress)
+    return;
+
+  uint32_t targetColor = 0;
+
+  if (g_lastAction == 1)
+  {
+    // Heater is ON - Priority 1 (RED)
+    targetColor = pixels.Color(150, 0, 0);
+  }
+  else if (g_currentHits > 0)
+  {
+    // Heater OFF, but Phone signal found - Priority 2
+    if (g_phoneDetected)
+    {
+      targetColor = pixels.Color(0, 120, 0); // Detected (GREEN)
+    }
+    else
+    {
+      targetColor = pixels.Color(0, 0, 120); // Scanning/Weak (BLUE)
+    }
+  }
+
+  g_blinkColor = targetColor;
+
+  if (targetColor > 0)
+  {
+    if (!g_isBlinking)
+    {
+      ledBlinker.attach(0.5, toggleLed);
+      g_isBlinking = true;
+    }
+  }
+  else
+  {
+    if (g_isBlinking)
+    {
+      ledBlinker.detach();
+      pixels.clear();
+      pixels.show();
+      g_isBlinking = false;
+    }
+  }
+}
+
 void runBleScan()
 {
   if (g_otaInProgress || pBLEScan == nullptr)
@@ -177,7 +228,6 @@ void runBleScan()
   }
   g_currentHits = validHits;
 
-  // Hysteresis logic
   if (validHits >= REQUIRED_HITS)
   {
     g_phoneDetected = true;
@@ -188,31 +238,7 @@ void runBleScan()
     g_phoneDetected = false;
   }
 
-  // --- LED COLOR & BLINK LOGIC ---
-  if (validHits > 0 && !g_malfunctionState)
-  {
-    // BLUE = Signal found but not enough for detection, GREEN = Detected
-    // Brightness increased to 120 for visibility
-    g_blinkColor = (g_phoneDetected) ? pixels.Color(0, 15, 0) : pixels.Color(0, 0, 15);
-
-    if (!g_isBlinking)
-    {
-      ledBlinker.attach(0.5, toggleLed);
-      g_isBlinking = true;
-      LOG_PRINTF(">>> [%s] LED Started: %s\n", getLogTime().c_str(), g_phoneDetected ? "GREEN" : "BLUE");
-    }
-  }
-  else
-  {
-    if (g_isBlinking)
-    {
-      ledBlinker.detach();
-      pixels.clear();
-      pixels.show();
-      g_isBlinking = false;
-      LOG_PRINTLN(">>> LED Cleared (No hits)");
-    }
-  }
+  updateLedDisplay(); // Refresh LED color based on new hits
   pBLEScan->clearResults();
 }
 
@@ -316,7 +342,7 @@ void setup()
   esp_now_add_peer(&peerInfo);
   esp_task_wdt_init(&twdt_config);
   esp_task_wdt_add(NULL);
-  LOG_PRINTLN(">>> SYSTEM READY. Presence Absence 60s. LED Fixed.");
+  LOG_PRINTLN(">>> SYSTEM READY. Heater LED priority set to RED.");
 }
 
 void loop()
@@ -360,58 +386,51 @@ void loop()
         {
           g_fixedSetpoint = 10.0f;
           saveFixedSetpoint();
-          LOG_PRINTLN(">>> [MODE] Night 10.0 C.");
         }
       }
       else if (isMorningGap)
       {
-        if (g_phoneDetected)
+        if (g_phoneDetected && g_fixedSetpoint < 18.0)
         {
-          if (g_fixedSetpoint < 18.0)
-          {
-            g_fixedSetpoint = 18.0;
-            saveFixedSetpoint();
-          }
+          g_fixedSetpoint = 18.0;
+          saveFixedSetpoint();
         }
-        else if (isWeekend)
+        else if (isWeekend && g_fixedSetpoint != 14.0f)
         {
-          if (g_fixedSetpoint != 14.0f)
-          {
-            g_fixedSetpoint = 14.0f;
-            saveFixedSetpoint();
-            LOG_PRINTLN(">>> [MODE] Weekend Morning 14.0 C.");
-          }
+          g_fixedSetpoint = 14.0f;
+          saveFixedSetpoint();
         }
       }
       else
       {
-        if (g_phoneDetected)
+        if (g_phoneDetected && g_fixedSetpoint < 18.0)
         {
-          if (g_fixedSetpoint < 18.0)
-          {
-            g_fixedSetpoint = 18.0;
-            saveFixedSetpoint();
-          }
+          g_fixedSetpoint = 18.0;
+          saveFixedSetpoint();
         }
-        else if (timeKnown)
+        else if (timeKnown && !g_phoneDetected && g_fixedSetpoint > 15.0)
         {
           if (now - g_lastPhoneSeenMs > PHONE_ABSENCE_TIMEOUT_MS)
           {
-            if (g_fixedSetpoint > 15.0)
-            {
-              g_fixedSetpoint = 15.0;
-              saveFixedSetpoint();
-              LOG_PRINTLN(">>> [MODE] Absent Eco 15.0 C.");
-            }
+            g_fixedSetpoint = 15.0;
+            saveFixedSetpoint();
           }
         }
       }
     }
 
+    uint8_t oldAction = g_lastAction;
     if (g_lastTempC < (g_fixedSetpoint - HYST_BAND_C / 2))
       g_lastAction = 1;
     else if (g_lastTempC > (g_fixedSetpoint + HYST_BAND_C / 2))
       g_lastAction = 0;
+
+    // If heater state changed, refresh LED color immediately
+    if (oldAction != g_lastAction)
+    {
+      updateLedDisplay();
+      LOG_PRINTF(">>> [HEATER] State changed to: %s\n", (g_lastAction == 1) ? "ON" : "OFF");
+    }
 
     JsonDocument jtx;
     jtx["heater"] = (g_lastAction == 1) ? "ON" : "OFF";
@@ -433,7 +452,7 @@ void loop()
       getLocalTime(&t_sync);
       bool night = (t_sync.tm_hour >= 0 && t_sync.tm_hour < 6);
       cesanaReportAndFetch(g_lastTempC, (g_lastAction == 1), g_fixedSetpoint, night);
-      LOG_PRINTF("[%s] T:%.1f SP:%.1f Heat:%s Phone:%s (Hits:%d)\n",
+      LOG_PRINTF("[%s] T:%.1f SP:%.1f Heat:%s Phone:%s Hits:%d\n",
                  getLogTime().c_str(), g_lastTempC, g_fixedSetpoint,
                  (g_lastAction == 1) ? "ON" : "OFF", g_phoneDetected ? "YES" : "NO", g_currentHits);
     }
