@@ -1,11 +1,7 @@
 /*
  * ======================================================================================
- * PROJECT: ESP32-C3 Smart Office Thermostat (WEEKEND-LOGIC VERSION)
- * LOGIC:
- *   - 00-06: Forced 10C (Night)
- *   - 06-10 WEEKEND: Forced 14C (if phone absent) OR 18C (if phone present)
- *   - 06-10 WEEKDAY: Follow Web (if phone absent) OR 18C (if phone present)
- *   - 10-24: Forced 15C (if phone absent 1m) OR 18C (if phone present)
+ * PROJECT: ESP32-C3 Smart Office Thermostat (LED-FIX VERSION)
+ * FIXES: LED brightness, LED logic reset, Weekend Logic, 1-min Absence
  * ======================================================================================
  */
 
@@ -60,7 +56,7 @@ const int BLE_SCAN_TIME = 1;
 static float g_fixedSetpoint = 19.0f;
 static String g_fixedPreset = "on";
 static const float HYST_BAND_C = 0.5f;
-const uint32_t PHONE_ABSENCE_TIMEOUT_MS = 60000; // 1 Minute
+const uint32_t PHONE_ABSENCE_TIMEOUT_MS = 60000;
 const uint32_t TIMEOUT_HEATER_ON = 300000;
 const uint32_t TIMEOUT_HEATER_OFF = 60000;
 
@@ -83,6 +79,7 @@ bool g_phoneDetected = false;
 int g_currentHits = 0;
 bool g_otaInProgress = false;
 bool g_ledState = false;
+bool g_isBlinking = false; // Moved from static to global for reliable reset
 uint32_t g_blinkColor = 0;
 uint32_t g_lastPhoneSeenMs = 0;
 unsigned long g_detectionHistory[20] = {0};
@@ -180,6 +177,7 @@ void runBleScan()
   }
   g_currentHits = validHits;
 
+  // Hysteresis logic
   if (validHits >= REQUIRED_HITS)
   {
     g_phoneDetected = true;
@@ -190,21 +188,30 @@ void runBleScan()
     g_phoneDetected = false;
   }
 
+  // --- LED COLOR & BLINK LOGIC ---
   if (validHits > 0 && !g_malfunctionState)
   {
+    // BLUE = Signal found but not enough for detection, GREEN = Detected
+    // Brightness increased to 120 for visibility
     g_blinkColor = (g_phoneDetected) ? pixels.Color(0, 15, 0) : pixels.Color(0, 0, 15);
-    static bool isBlinking = false;
-    if (!isBlinking)
+
+    if (!g_isBlinking)
     {
       ledBlinker.attach(0.5, toggleLed);
-      isBlinking = true;
+      g_isBlinking = true;
+      LOG_PRINTF(">>> [%s] LED Started: %s\n", getLogTime().c_str(), g_phoneDetected ? "GREEN" : "BLUE");
     }
   }
   else
   {
-    ledBlinker.detach();
-    pixels.clear();
-    pixels.show();
+    if (g_isBlinking)
+    {
+      ledBlinker.detach();
+      pixels.clear();
+      pixels.show();
+      g_isBlinking = false;
+      LOG_PRINTLN(">>> LED Cleared (No hits)");
+    }
   }
   pBLEScan->clearResults();
 }
@@ -213,7 +220,6 @@ static bool cesanaReportAndFetch(float tempC, bool heating, float realSp, bool i
 {
   if (WiFi.status() != WL_CONNECTED || g_otaInProgress)
     return false;
-
   struct tm t_now;
   if (!getLocalTime(&t_now))
     return false;
@@ -239,11 +245,7 @@ static bool cesanaReportAndFetch(float tempC, bool heating, float realSp, bool i
       if (!deserializeJson(doc, https.getString()))
       {
         float remoteSp = doc["setpoint"] | -1.0;
-
-        // ACCEPT UPDATES IF: Night, Phone Present, OR Weekday Morning Gap
-        // We block remote updates during Weekend Morning Gap (forced 14C)
         bool blockRemote = (isMorningGap && isWeekend && !g_phoneDetected);
-
         if (!blockRemote && (isNightMode || g_phoneDetected || isMorningGap))
         {
           if (remoteSp > 5.0 && remoteSp < 35.0 && abs(remoteSp - g_fixedSetpoint) > 0.1)
@@ -314,7 +316,7 @@ void setup()
   esp_now_add_peer(&peerInfo);
   esp_task_wdt_init(&twdt_config);
   esp_task_wdt_add(NULL);
-  LOG_PRINTLN(">>> SYSTEM READY. Weekend Logic Patched.");
+  LOG_PRINTLN(">>> SYSTEM READY. Presence Absence 60s. LED Fixed.");
 }
 
 void loop()
@@ -354,7 +356,6 @@ void loop()
     {
       if (isNightMode)
       {
-        // NIGHT: 00-06
         if (g_fixedSetpoint != 10.0f)
         {
           g_fixedSetpoint = 10.0f;
@@ -364,7 +365,6 @@ void loop()
       }
       else if (isMorningGap)
       {
-        // MORNING GAP: 06-10
         if (g_phoneDetected)
         {
           if (g_fixedSetpoint < 18.0)
@@ -375,7 +375,6 @@ void loop()
         }
         else if (isWeekend)
         {
-          // --- WEEKEND RULE ---
           if (g_fixedSetpoint != 14.0f)
           {
             g_fixedSetpoint = 14.0f;
@@ -383,11 +382,9 @@ void loop()
             LOG_PRINTLN(">>> [MODE] Weekend Morning 14.0 C.");
           }
         }
-        // If Weekday & Absent: cesanaReportAndFetch handles remote setpoint.
       }
       else
       {
-        // OFFICE HOURS: 10:00+
         if (g_phoneDetected)
         {
           if (g_fixedSetpoint < 18.0)
@@ -436,9 +433,9 @@ void loop()
       getLocalTime(&t_sync);
       bool night = (t_sync.tm_hour >= 0 && t_sync.tm_hour < 6);
       cesanaReportAndFetch(g_lastTempC, (g_lastAction == 1), g_fixedSetpoint, night);
-      LOG_PRINTF("[%s] T:%.1f SP:%.1f Heat:%s Phone:%s\n",
+      LOG_PRINTF("[%s] T:%.1f SP:%.1f Heat:%s Phone:%s (Hits:%d)\n",
                  getLogTime().c_str(), g_lastTempC, g_fixedSetpoint,
-                 (g_lastAction == 1) ? "ON" : "OFF", g_phoneDetected ? "YES" : "NO");
+                 (g_lastAction == 1) ? "ON" : "OFF", g_phoneDetected ? "YES" : "NO", g_currentHits);
     }
   }
 }
