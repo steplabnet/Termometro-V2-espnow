@@ -89,6 +89,9 @@ unsigned long g_detectionHistory[20] = {0};
 int g_historyIndex = 0;
 bool g_malfunctionState = false;
 
+uint32_t g_lastRelayChangeMs = 0;       // Memorizza l'ultimo cambio di stato
+const uint32_t MIN_RELAY_TIME = 180000; // Tempo minimo di 3 minuti (180.000 ms) tra i cambi
+
 esp_task_wdt_config_t twdt_config = {
     .timeout_ms = WDT_TIMEOUT_MS,
     .idle_core_mask = (1 << 0),
@@ -105,6 +108,13 @@ esp_task_wdt_config_t twdt_config = {
     TelnetStream.println(__VA_ARGS__); \
   }
 
+bool g_waitingForTimer = false;         // Stato: stiamo aspettando il timer di sicurezza?
+
+
+// Variabili per il nuovo comportamento del Ticker
+uint32_t g_colorA = 0;
+uint32_t g_colorB = 0;
+float g_currentBlinkRate = 0.5;
 // ======================================================================================
 // HELPERS
 // ======================================================================================
@@ -148,7 +158,7 @@ void toggleLed()
   if (g_otaInProgress)
     return;
   g_ledState = !g_ledState;
-  pixels.setPixelColor(0, g_ledState ? g_blinkColor : 0);
+  pixels.setPixelColor(0, g_ledState ? g_colorA : g_colorB);
   pixels.show();
 }
 
@@ -158,41 +168,47 @@ void updateLedDisplay()
   if (g_otaInProgress)
     return;
 
-  uint32_t targetColor = 0;
+  uint32_t nextColorA = 0;
+  uint32_t nextColorB = 0;
+  float nextRate = 0.5;
 
-  if (g_lastAction == 1)
+  if (g_waitingForTimer)
   {
-    // Heater is ON - Priority 1 (RED)
-    targetColor = pixels.Color(150, 0, 0);
+    // STATO: Vorrei cambiare ma il timer me lo impedisce -> ROSSO lampeggiante
+    nextColorA = pixels.Color(150, 0, 0);
+    nextColorB = 0; // Rosso / Spento
+    nextRate = 0.5;
+  }
+  else if (g_lastAction == 1)
+  {
+    // STATO: Caldaia ACCESA -> Verde / Blu alternato veloce
+    nextColorA = pixels.Color(0, 150, 0); // Verde
+    nextColorB = pixels.Color(0, 0, 150); // Blu
+    nextRate = 0.1;                       // 100ms
   }
   else if (g_currentHits > 0)
   {
-    // Heater OFF, but Phone signal found - Priority 2
-    if (g_phoneDetected)
+    // STATO: Caldaia spenta, ma telefono rilevato o in ricerca
+    nextColorA = g_phoneDetected ? pixels.Color(0, 150, 0) : pixels.Color(0, 0, 150);
+    nextColorB = 0;
+    nextRate = 0.5;
+  }
+
+  // Applica i cambiamenti al Ticker solo se necessario
+  if (nextColorA != g_colorA || nextColorB != g_colorB || nextRate != g_currentBlinkRate)
+  {
+    g_colorA = nextColorA;
+    g_colorB = nextColorB;
+    g_currentBlinkRate = nextRate;
+
+    ledBlinker.detach();
+    if (g_colorA > 0 || g_colorB > 0)
     {
-      targetColor = pixels.Color(0, 120, 0); // Detected (GREEN)
+      ledBlinker.attach(g_currentBlinkRate, toggleLed);
+      g_isBlinking = true;
     }
     else
     {
-      targetColor = pixels.Color(0, 0, 120); // Scanning/Weak (BLUE)
-    }
-  }
-
-  g_blinkColor = targetColor;
-
-  if (targetColor > 0)
-  {
-    if (!g_isBlinking)
-    {
-      ledBlinker.attach(0.5, toggleLed);
-      g_isBlinking = true;
-    }
-  }
-  else
-  {
-    if (g_isBlinking)
-    {
-      ledBlinker.detach();
       pixels.clear();
       pixels.show();
       g_isBlinking = false;
@@ -368,7 +384,7 @@ void loop()
   {
     lastLogic = now;
     sensors.requestTemperatures();
-    float t = sensors.getTempCByIndex(0);
+    float t = sensors.getTempCByIndex(0)-1;
     if (t > -50 && t < 100)
       g_lastTempC = t;
 
@@ -419,18 +435,35 @@ void loop()
       }
     }
 
-    uint8_t oldAction = g_lastAction;
+    // --- NUOVA LOGICA CON SAFETY TIMER E LED ---
+    uint8_t desiredAction = g_lastAction;
     if (g_lastTempC < (g_fixedSetpoint - HYST_BAND_C / 2))
-      g_lastAction = 1;
+      desiredAction = 1;
     else if (g_lastTempC > (g_fixedSetpoint + HYST_BAND_C / 2))
-      g_lastAction = 0;
+      desiredAction = 0;
 
-    // If heater state changed, refresh LED color immediately
-    if (oldAction != g_lastAction)
+    if (desiredAction != g_lastAction)
     {
-      updateLedDisplay();
-      LOG_PRINTF(">>> [HEATER] State changed to: %s\n", (g_lastAction == 1) ? "ON" : "OFF");
+      // Vorremmo cambiare stato... controlliamo il timer
+      if (now - g_lastRelayChangeMs >= MIN_RELAY_TIME)
+      {
+        g_lastAction = desiredAction;
+        g_lastRelayChangeMs = now;
+        g_waitingForTimer = false; // Cambio effettuato
+        LOG_PRINTF(">>> [HEATER] Safety OK. New State: %d\n", g_lastAction);
+      }
+      else
+      {
+        g_waitingForTimer = true; // Siamo in attesa del timer
+      }
     }
+    else
+    {
+      g_waitingForTimer = false; // Lo stato desiderato è quello attuale, niente attesa
+    }
+
+    // Aggiorna sempre il display LED a ogni ciclo di logica
+    updateLedDisplay();
 
     JsonDocument jtx;
     jtx["heater"] = (g_lastAction == 1) ? "ON" : "OFF";
