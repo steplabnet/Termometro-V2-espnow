@@ -9,12 +9,6 @@ date_default_timezone_set('Europe/Rome');
 
 $file_path = rtrim($_SERVER['DOCUMENT_ROOT'] ?? '', '/') . "/icache.html";
 
-// Simple cache check
-if (is_file($file_path) && filemtime($file_path) > (time() - 60)) {
-  // readfile($file_path);
-  // exit;
-}
-
 ob_start();
 
 require_once 'funzioni.php';
@@ -71,27 +65,6 @@ $mm_max_power = fmt($mm['max_power'] ?? null, 0);
 $mm_min_portata = fmt($mm['min_portata'] ?? null, 2);
 $mm_max_portata = fmt($mm['max_portata'] ?? null, 2);
 
-
-/** ---------- 2. ENERGY CALCULATION ---------- */
-$energy = 0.0;
-$a = 0;
-$prev = null;
-
-$query = "SELECT `power` FROM `dati_meteo` WHERE `data` < {$timeup} AND `data` > {$timedw}";
-$result = $link->query($query);
-if ($result instanceof mysqli_result) {
-  while ($row = $result->fetch_assoc()) {
-    $act = (float) ($row['power'] ?? 0);
-    if ($a > 0 && $prev !== null) {
-      $energy += ($act + $prev) / 2.0;
-    }
-    $prev = $act;
-    $a++;
-  }
-  $result->free();
-}
-$energy = $energy / 6.0;
-
 /** ---------- 3. LATEST DATA ---------- */
 $temp = $tombra = $hombra = $power = $dataora = $tMobile = $portata = [];
 
@@ -110,7 +83,6 @@ if ($result instanceof mysqli_result) {
   $result->free();
 }
 
-// Pad arrays
 $temp = array_pad($temp, 4, null);
 $tombra = array_pad($tombra, 4, null);
 $hombra = array_pad($hombra, 4, null);
@@ -122,16 +94,15 @@ $portata = array_pad($portata, 4, null);
 $safeTemp0 = ($temp[0] !== null && (float) $temp[0] > -50) ? (float) $temp[0] : -100.0;
 $safeTombra0 = ($tombra[0] !== null && (float) $tombra[0] > -50) ? (float) $tombra[0] : -100.0;
 $safeTMobile0 = ($tMobile[0] !== null && (float) $tMobile[0] > -50) ? (float) $tMobile[0] : -100.0;
-
 $safeHombra0 = ($hombra[0] !== null) ? (string) $hombra[0] : '0';
 $safePower0 = ($power[0] !== null) ? (float) $power[0] : 0.0;
 $safeData0 = ($dataora[0] !== null) ? (int) $dataora[0] : time();
 $safePortata0 = ($portata[0] !== null) ? (float) $portata[0] : 0.0;
 
-/** ---------- 3b. NEW: PRESSURE & WEATHER FORECAST (from RAM JSON/CSV) ---------- */
+/** ---------- 3b. ATMOSPHERIC PRESSURE & FORECAST ---------- */
 $stateFile = '/dev/shm/thermo_data/state.json';
 $presHistoryFile = '/dev/shm/thermo_data/pres_history.csv';
-$safePres0 = 1013.0; // Standard default
+$safePres0 = 1013.0; 
 $presTrend3h = 0.0;
 
 if (file_exists($stateFile)) {
@@ -139,53 +110,35 @@ if (file_exists($stateFile)) {
     if (isset($stateJson['pres'])) $safePres0 = (float)$stateJson['pres'];
 }
 
-// Calculate 3-hour trend for weather forecasting
 if (file_exists($presHistoryFile)) {
     $pRows = file($presHistoryFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-    $targetTs = time() - 10800; // 3 hours ago
+    $targetTs = time() - 10800;
     $oldP = null;
     foreach (array_reverse($pRows) as $pr) {
         $pParts = explode(',', $pr);
-        if ((int)$pParts[0] <= $targetTs) {
-            $oldP = (float)$pParts[1];
-            break;
-        }
+        if ((int)$pParts[0] <= $targetTs) { $oldP = (float)$pParts[1]; break; }
     }
     if ($oldP !== null) $presTrend3h = $safePres0 - $oldP;
 }
 
-// MSLP (Mean Sea Level Pressure) calculation for 264m altitude (+31.8 hPa)
 $mslp = $safePres0 + 31.8;
-
-// Forecast Logic
 $forecast = ['icon' => 'cloud', 'text' => 'Variabile', 'color' => 'var(--text-muted)'];
-if ($presTrend3h <= -1.5) {
-    $forecast = ['icon' => 'storm', 'text' => 'Temporale', 'color' => 'var(--accent-red)'];
-} elseif ($presTrend3h <= -0.5) {
-    $forecast = ['icon' => 'rain', 'text' => 'Pioggia', 'color' => 'var(--accent-blue)'];
-} elseif ($mslp > 1022) {
-    $forecast = ['icon' => 'sun', 'text' => 'Sereno', 'color' => 'var(--accent-orange)'];
-} elseif ($presTrend3h >= 0.5) {
-    $forecast = ['icon' => 'sun', 'text' => 'Migliora', 'color' => 'var(--accent-orange)'];
-} elseif ($mslp < 1008) {
-    $forecast = ['icon' => 'rain', 'text' => 'Instabile', 'color' => 'var(--accent-blue)'];
-}
+if ($presTrend3h <= -1.5) { $forecast = ['icon' => 'storm', 'text' => 'Temporale', 'color' => 'var(--accent-red)']; }
+elseif ($presTrend3h <= -0.5) { $forecast = ['icon' => 'rain', 'text' => 'Pioggia', 'color' => 'var(--accent-blue)']; }
+elseif ($mslp > 1022) { $forecast = ['icon' => 'sun', 'text' => 'Sereno', 'color' => 'var(--accent-orange)']; }
+elseif ($presTrend3h >= 0.5) { $forecast = ['icon' => 'sun', 'text' => 'Migliora', 'color' => 'var(--accent-orange)']; }
 
-/** ---------- 4. TREND CALCULATION (Last 30 mins) ---------- */
+/** ---------- 4. TREND CALCULATION (30 mins) ---------- */
 $time30mAgo = $now - 1800;
 $queryTrend = "SELECT `temperatura`, `tombra`, `tMobile`, `portata`, `data` 
-               FROM `dati_meteo` 
-               WHERE `data` <= {$time30mAgo} 
-               ORDER BY `data` DESC 
-               LIMIT 1";
+               FROM `dati_meteo` WHERE `data` <= {$time30mAgo} 
+               ORDER BY `data` DESC LIMIT 1";
 
 $resTrend = $link->query($queryTrend);
 $trendData = ($resTrend && $resTrend->num_rows > 0) ? $resTrend->fetch_assoc() : null;
 
-function calculateTrend($current, $old)
-{
-  if ($current === null || $old === null || $current <= -50)
-    return null;
+function calculateTrend($current, $old) {
+  if ($current === null || $old === null || $current <= -50) return null;
   return ($current - (float) $old) * 2;
 }
 
@@ -193,6 +146,14 @@ $trend_temp1 = calculateTrend($safeTemp0, $trendData['temperatura'] ?? null);
 $trend_tombra = calculateTrend($safeTombra0, $trendData['tombra'] ?? null);
 $trend_tMobile = calculateTrend($safeTMobile0, $trendData['tMobile'] ?? null);
 $trend_piave = calculateTrend($safePortata0, $trendData['portata'] ?? null);
+
+/** ---------- 4b. PIAVE STATUS LOGIC ---------- */
+$waterStatus = 'normal';
+if ($safePortata0 <= 17.0) {
+    $waterStatus = 'dry';
+} elseif ($trend_piave !== null && $trend_piave >= 1.0) {
+    $waterStatus = 'increasing';
+}
 
 /** ---------- 5. FREEZING TIME PREDICTION ---------- */
 function getFreezingTime($currentTemp, $trendPerHour)
@@ -212,24 +173,15 @@ $iceTime_temp1 = getFreezingTime($safeTemp0, $trend_temp1);
 $iceTime_tombra = getFreezingTime($safeTombra0, $trend_tombra);
 $iceTime_tMobile = getFreezingTime($safeTMobile0, $trend_temp1);
 
-
-// Helper for formatting trend HTML
 function getTrendHtml($val, $unit = '°C/h', $icePrediction = null)
 {
-  if ($val === null)
-    return '<span class="trend-neutral">--</span>';
-
+  if ($val === null) return '<span class="trend-neutral">--</span>';
   $rounded = round($val, 2);
   $sign = ($rounded > 0) ? '+' : '';
   $colorClass = ($rounded > 0) ? 'trend-up' : (($rounded < 0) ? 'trend-down' : 'trend-neutral');
   $arrow = ($rounded > 0) ? '&#8593;' : (($rounded < 0) ? '&#8595;' : '&nbsp;');
-
   $html = "<span class=\"{$colorClass}\">{$arrow} {$sign}{$rounded} <small>{$unit}</small></span>";
-
-  if ($icePrediction) {
-    $html .= "<div class=\"ice-prediction\">&#10052; 0°C alle {$icePrediction}</div>";
-  }
-
+  if ($icePrediction) { $html .= "<div class=\"ice-prediction\">&#10052; 0°C alle {$icePrediction}</div>"; }
   return $html;
 }
 
@@ -247,91 +199,47 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="refresh" content="600">
   <title>Dashboard Meteo Cesana</title>
-
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
-
   <style>
     :root {
-      --bg-color: #f0f2f5;
-      --card-bg: #ffffff;
-      --text-main: #1f2937;
-      --text-muted: #6b7280;
-      --accent-blue: #3b82f6;
-      --accent-orange: #f59e0b;
-      --accent-red: #ef4444;
-      --accent-teal: #14b8a6;
-      --accent-ice: #0ea5e9;
-      --accent-purple: #8b5cf6;
+      --bg-color: #f0f2f5; --card-bg: #ffffff; --text-main: #1f2937; --text-muted: #6b7280;
+      --accent-blue: #3b82f6; --accent-orange: #f59e0b; --accent-red: #ef4444;
+      --accent-teal: #14b8a6; --accent-ice: #0ea5e9; --accent-purple: #8b5cf6;
+      --accent-dry: #92400e;
       --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1), 0 2px 4px -1px rgba(0, 0, 0, 0.06);
     }
-
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: 'Inter', sans-serif; background-color: var(--bg-color); color: var(--text-main); padding: 20px; }
     a { text-decoration: none; color: inherit; display: block; height: 100%; }
     header { text-align: center; margin-bottom: 30px; }
     header h1 { font-weight: 800; font-size: 1.5rem; letter-spacing: -0.025em; }
-    header p { color: var(--text-muted); font-size: 0.9rem; margin-top: 5px; }
     header .powered { font-size: 0.75rem; margin-top: 5px; opacity: 0.7; }
-
-    .dashboard-grid {
-      display: grid;
-      gap: 20px;
-      max-width: 1200px;
-      margin: 0 auto;
-      grid-template-columns: 1fr;
-    }
-
+    .dashboard-grid { display: grid; gap: 20px; max-width: 1200px; margin: 0 auto; grid-template-columns: 1fr; }
     @media (min-width: 600px) { .dashboard-grid { grid-template-columns: repeat(2, 1fr); } }
     @media (min-width: 900px) { .dashboard-grid { grid-template-columns: repeat(3, 1fr); } }
     @media (min-width: 1200px) { .dashboard-grid { grid-template-columns: repeat(4, 1fr); } }
-
-    .card {
-      background: var(--card-bg);
-      border-radius: 16px;
-      padding: 20px;
-      box-shadow: var(--shadow);
-      transition: transform 0.2s;
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-      justify-content: space-between;
-      text-align: center;
-      min-height: 220px;
-    }
-
+    .card { background: var(--card-bg); border-radius: 16px; padding: 20px; box-shadow: var(--shadow); transition: transform 0.2s; display: flex; flex-direction: column; align-items: center; text-align: center; min-height: 220px; }
     .card:hover { transform: translateY(-3px); box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1); }
-    .card-content { width: 100%; display: flex; flex-direction: column; align-items: center; margin-bottom: 15px; }
+    .card-content { width: 100%; display: flex; flex-direction: column; align-items: center; margin-bottom: 15px; height:100%; }
     .card-icon { width: 48px; height: 48px; margin-bottom: 10px; fill: currentColor; }
-    
     .icon-temp { color: var(--accent-red); }
     .icon-power { color: var(--accent-orange); }
     .icon-humi { color: var(--accent-teal); }
     .icon-water { color: var(--accent-blue); }
     .icon-pres { color: var(--accent-purple); }
-
+    .icon-water-dry { color: var(--accent-dry); }
     .icon-cold { display: none; }
     .card.freezing .icon-warm { display: none; }
     .card.freezing .icon-cold { display: block; color: var(--accent-ice); fill: none; stroke: var(--accent-ice); }
-
     .icon-night { display: none; }
     .card.night-mode .icon-day { display: none; }
     .card.night-mode .icon-night { display: block; }
-
     .card-label { font-size: 0.85rem; font-weight: 600; color: var(--text-muted); text-transform: uppercase; margin-bottom: 5px; }
     .card-value { font-size: 2.2rem; font-weight: 800; color: var(--text-main); line-height: 1; }
     .card-unit { font-size: 1.1rem; color: var(--text-muted); margin-left: 2px; }
-
-    .minmax-row {
-      display: flex;
-      justify-content: space-between;
-      width: 100%;
-      padding-top: 15px;
-      border-top: 1px solid #e5e7eb;
-      margin-top: auto;
-    }
-
+    .minmax-row { display: flex; justify-content: space-between; width: 100%; padding-top: 15px; border-top: 1px solid #e5e7eb; margin-top: auto; }
     .minmax-item { display: flex; flex-direction: column; font-size: 0.8rem; flex: 1; }
     .minmax-label { color: #9ca3af; font-size: 0.7rem; text-transform: uppercase; }
     .minmax-val { font-weight: 700; }
@@ -339,33 +247,15 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
     .val-max { color: var(--accent-red); }
     .trend-up { color: var(--accent-red); font-weight: 700; }
     .trend-down { color: var(--accent-blue); font-weight: 700; }
-    .trend-neutral { color: var(--text-muted); }
-    .ice-prediction { color: var(--accent-ice); font-size: 0.75em; font-weight: 700; margin-top: 2px; }
-
-    .forecast-tag {
-        font-size: 0.75rem;
-        font-weight: 800;
-        margin-top: 5px;
-        text-transform: uppercase;
-    }
-
+    .forecast-tag { font-size: 0.75rem; font-weight: 800; margin-top: 5px; text-transform: uppercase; }
     .border-power { border-top: 5px solid var(--accent-orange); }
     .border-water { border-top: 5px solid var(--accent-blue); }
+    .border-water.river-dry { border-top-color: var(--accent-dry); }
     .border-humi { border-top: 5px solid var(--accent-teal); }
     .border-temp { border-top: 5px solid var(--accent-red); }
     .border-pres { border-top: 5px solid var(--accent-purple); }
-
     footer { text-align: center; margin-top: 40px; font-size: 0.8rem; color: var(--text-muted); }
   </style>
-
-  <script async src="https://www.googletagmanager.com/gtag/js?id=G-0TX9BGLRNC"></script>
-  <script>
-    window.dataLayer = window.dataLayer || [];
-    function gtag() { dataLayer.push(arguments); }
-    gtag('js', new Date());
-    gtag('config', 'G-0TX9BGLRNC');
-  </script>
-
   <script>
     function meteo_ajax() {
       var xhttp = new XMLHttpRequest();
@@ -383,19 +273,14 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
       };
       xhttp.open("GET", "dati_ajax.php?c=" + new Date().getTime(), true);
       xhttp.send();
-
-      // Separate fetch for pressure card from state.json
       fetch('get_setpoint.php?' + new Date().getTime())
         .then(response => response.json())
-        .then(data => {
-            if (data.pres) document.getElementById("actualPres").textContent = parseFloat(data.pres).toFixed(1);
-        }).catch(err => {});
+        .then(data => { if (data.pres) document.getElementById("actualPres").textContent = parseFloat(data.pres).toFixed(1); }).catch(err => {});
     }
     setInterval(meteo_ajax, 10000);
     window.onload = meteo_ajax;
   </script>
 </head>
-
 <body>
   <header>
     <h1>Stazione Meteo Cesana</h1>
@@ -404,7 +289,6 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
   </header>
 
   <div class="dashboard-grid">
-    
     <!-- 1. Temp Sensore (Sole) -->
     <div class="card border-temp <?php echo getTempClass($safeTemp0); ?>" id="temp1_card" <?php echo $showTemp1; ?>>
       <a href="grafico.php?var=temperatura" class="card-content">
@@ -432,10 +316,9 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
       </div>
     </div>
 
-    <!-- 3. NEW CARD: Pressione & Previsioni (264m Altitude logic) -->
+    <!-- 3. Pressione -->
     <div class="card border-pres" id="pres_card">
       <div class="card-content">
-        <!-- Weather Icons Container -->
         <?php if ($forecast['icon'] == 'sun'): ?>
             <svg viewBox="0 0 24 24" class="card-icon" style="color:var(--accent-orange)" fill="currentColor"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4" stroke="currentColor" stroke-width="2"/></svg>
         <?php elseif ($forecast['icon'] == 'rain' || $forecast['icon'] == 'storm'): ?>
@@ -443,13 +326,12 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
         <?php else: ?>
             <svg viewBox="0 0 24 24" class="card-icon" style="color:var(--text-muted)" fill="currentColor"><path d="M17.5 19c-3.037 0-5.5-2.463-5.5-5.5 0-3.037 2.463-5.5 5.5-5.5.38 0 .75.039 1.107.111C17.706 5.826 15.081 4 12 4 8.134 4 5 7.134 5 11c0 .138.004.276.012.412C3.289 12.288 2 13.992 2 16c0 2.761 2.239 5 5 5h10.5c2.485 0 4.5-2.015 4.5-4.5S19.985 12 17.5 12z"/></svg>
         <?php endif; ?>
-        
         <div class="card-label">Pressione</div>
         <div><span class="card-value" id="actualPres"><?php echo number_format($safePres0, 1); ?></span><span class="card-unit">hPa</span></div>
         <div class="forecast-tag" style="color: <?php echo $forecast['color']; ?>"><?php echo $forecast['text']; ?></div>
       </div>
       <div class="minmax-row">
-          <div class="minmax-item"><span class="minmax-label">MSLP (Sea)</span><span class="minmax-val"><?php echo number_format($mslp, 1); ?></span></div>
+          <div class="minmax-item"><span class="minmax-label">Sea Lvl</span><span class="minmax-val"><?php echo number_format($mslp, 1); ?></span></div>
           <div class="minmax-item"><span class="minmax-label">Tend (3h)</span><span class="minmax-val <?php echo ($presTrend3h < 0 ? 'trend-down' : 'trend-up'); ?>"><?php echo ($presTrend3h > 0 ? '+': '') . number_format($presTrend3h, 1); ?></span></div>
       </div>
     </div>
@@ -457,7 +339,7 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
     <!-- 4. Potenza -->
     <div class="card border-power <?php echo getPowerClass($safePower0); ?>" id="power_card">
       <a href="grafico.php?var=power" class="card-content">
-        <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-power icon-day" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.25v2.25M12 18.75V21M18.75 12h2.25M3 12h2.25M12 7.5a4.5 4.5 0 1 1 0 9 4.5 4.5 0 0 1 0-9Z"/></svg>
+        <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-power" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2.25v2.25M12 18.75V21M18.75 12h2.25M3 12h2.25M12 7.5a4.5 4.5 0 1 1 0 9 4.5 4.5 0 0 1 0-9Z"/></svg>
         <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-night" viewBox="0 0 24 24" fill="currentColor"><path d="M9.528 1.718a.75.75 0 01.162.819A8.97 8.97 0 009 6a9 9 0 009 9 8.97 8.97 0 003.463-.69.75.75 0 01.981.98 10.503 10.503 0 01-9.694 6.46c-5.799 0-10.5-4.701-10.5-10.5 0-4.368 2.667-8.112 6.46-9.694a.75.75 0 01.818.162z"/></svg>
         <div class="card-label">Potenza</div>
         <div><span class="card-value" id="power"><?php echo $safePower0; ?></span><span class="card-unit">W</span></div>
@@ -475,14 +357,28 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
       <div class="minmax-row"><div class="minmax-item"><span class="minmax-label">Range 24h</span><span class="minmax-val"><?php echo $mm_min_humi; ?>-<?php echo $mm_max_humi; ?>%</span></div></div>
     </div>
 
-    <!-- 6. Piave -->
-    <div class="card border-water">
+    <!-- 6. Piave (Dynamic Icons) -->
+    <div class="card border-water <?php echo ($waterStatus == 'dry' ? 'river-dry' : ''); ?>">
       <a href="grafico.php?var=portata" class="card-content">
-        <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-water" viewBox="0 0 24 24" fill="currentColor"><path d="M3.75 6h15M3.75 12h15M3.75 18h15"/></svg>
+        <?php if ($waterStatus == 'dry'): ?>
+            <!-- Dry River Icon -->
+            <svg viewBox="0 0 24 24" class="card-icon icon-water-dry" fill="currentColor"><path d="M2 13h20v2H2v-2zm2-4h16v2H4V9zm4-4h8v2H8V5z" opacity="0.3"/><path d="M12 22a9 9 0 0 1-9-9c0-1.5.5-3 1.5-4l1.5 1.5c-.6.7-1 1.6-1 2.5 0 3.9 3.1 7 7 7s7-3.1 7-7c0-.9-.4-1.8-1-2.5l1.5-1.5c1 1 1.5 2.5 1.5 4a9 9 0 0 1-9 9z"/><path d="M7 12h10v1H7z"/></svg>
+        <?php elseif ($waterStatus == 'increasing'): ?>
+            <!-- Increasing/Rising River Icon -->
+            <svg viewBox="0 0 24 24" class="card-icon icon-water" fill="currentColor"><path d="M3.5 18c0-1.5 1-2.5 2.5-2.5s2.5 1 2.5 2.5-1 2.5-2.5 2.5-2.5-1-2.5-2.5zM15.5 18c0-1.5 1-2.5 2.5-2.5s2.5 1 2.5 2.5-1 2.5-2.5 2.5-2.5-1-2.5-2.5z"/><path d="M3 14c2 0 3-1 3-3s1-3 3-3 3 1 3 3 1 3 3 3 3-1 3-3 1-3 3-3 3 1 3 3-1 3-3 3H3z"/><path d="M12 2l-3 3h6l-3-3z" fill="var(--accent-red)"/></svg>
+        <?php else: ?>
+            <!-- Normal River Icon -->
+            <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-water" viewBox="0 0 24 24" fill="currentColor"><path d="M3.75 6h15M3.75 12h15M3.75 18h15"/></svg>
+        <?php endif; ?>
         <div class="card-label">Piave</div>
-        <div><span class="card-value" id="piave_portata"><?php echo $safePortata0; ?></span><span class="card-unit">m³/s</span></div>
+        <div><span class="card-value" id="piave_portata"><?php echo number_format($safePortata0, 2); ?></span><span class="card-unit">m³/s</span></div>
+        <div class="forecast-tag" style="color: <?php echo ($waterStatus == 'dry' ? 'var(--accent-dry)' : ($waterStatus == 'increasing' ? 'var(--accent-red)' : 'var(--accent-blue)')); ?>">
+            <?php echo ($waterStatus == 'dry' ? 'Secca' : ($waterStatus == 'increasing' ? 'In Piena' : 'Regolare')); ?>
+        </div>
       </a>
-      <div class="minmax-row"><div class="minmax-item"><span class="minmax-label">Trend</span><span class="minmax-val"><?php echo getTrendHtml($trend_piave, 'm³/s/h'); ?></span></div></div>
+      <div class="minmax-row">
+          <div class="minmax-item"><span class="minmax-label">Trend</span><span class="minmax-val"><?php echo getTrendHtml($trend_piave, 'm³/s/h'); ?></span></div>
+      </div>
     </div>
 
     <!-- 7. Temp Ombra (Interno) -->
@@ -497,7 +393,6 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
         <div class="minmax-item"><span class="minmax-label">Max 24h</span><span class="minmax-val val-max"><?php echo $mm_max_tombra; ?>°</span></div>
       </div>
     </div>
-
   </div>
 
   <footer style="margin-top:20px; text-align:center;">&copy; <?php echo date("Y"); ?> Cesana Beach | Alt: 264m slm</footer>
@@ -506,7 +401,5 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
 <?php
 $output = ob_get_contents();
 ob_end_flush();
-if ($output !== false) {
-  file_put_contents($file_path, $output);
-}
+if ($output !== false) { file_put_contents($file_path, $output); }
 ?>
