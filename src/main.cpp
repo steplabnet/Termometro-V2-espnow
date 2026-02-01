@@ -1,10 +1,10 @@
 /*
  * ======================================================================================
- * PROJECT: ESP32-C3 Smart Office Thermostat (HEATER-PRIORITY LED VERSION)
+ * PROJECT: ESP32-C3 Smart Office Thermostat (BME280 VERSION)
  * LOGIC:
- *   - LED RED: Heater ON (Priority 1)
- *   - LED GREEN: Phone Detected & Heater OFF (Priority 2)
- *   - LED BLUE: Phone Signal Found & Heater OFF (Priority 3)
+ *   - LED RED/BLINK: Safety Timer Active
+ *   - LED GREEN/BLUE FLASH: Heater ON
+ *   - SENSOR: BME280 (SDA: 7, SCL: 6)
  * ======================================================================================
  */
 
@@ -12,8 +12,9 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <ArduinoJson.h>
-#include <OneWire.h>
-#include <DallasTemperature.h>
+#include <Wire.h>            // Added for I2C
+#include <Adafruit_Sensor.h> // Added for BME280
+#include <Adafruit_BME280.h> // Added for BME280
 #include <LittleFS.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
@@ -31,8 +32,11 @@
 // CONFIGURATION & PINS
 // ======================================================================================
 #define WDT_TIMEOUT_MS 15000
-#define ONE_WIRE_BUS 3
 #define RGB_PIN 8
+
+// BME280 I2C Pins
+#define I2C_SDA 7
+#define I2C_SCL 6
 
 static const char *WIFI_SSID_DEFAULT = "NETGEAR11";
 static const char *WIFI_PASS_DEFAULT = "breezypiano838";
@@ -43,7 +47,7 @@ static const char *HOSTNAME = "esp32-thermo";
 // Intervals
 const uint32_t HTTP_SYNC_INTERVAL = 30000;
 const uint32_t BLE_SCAN_INTERVAL = 5000;
-const uint32_t LOGIC_INTERVAL = 2000;
+const uint32_t LOGIC_INTERVAL = 10000;
 
 const char *ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 3600;
@@ -60,14 +64,11 @@ static float g_fixedSetpoint = 19.0f;
 static String g_fixedPreset = "on";
 static const float HYST_BAND_C = 0.5f;
 const uint32_t PHONE_ABSENCE_TIMEOUT_MS = 60000;
-const uint32_t TIMEOUT_HEATER_ON = 300000;
-const uint32_t TIMEOUT_HEATER_OFF = 60000;
 
 // ======================================================================================
 // GLOBALS
 // ======================================================================================
-OneWire oneWire(ONE_WIRE_BUS);
-DallasTemperature sensors(&oneWire);
+Adafruit_BME280 bme; // Replacement for DallasTemperature
 WebServer server(80);
 NimBLEScan *pBLEScan = nullptr;
 Adafruit_NeoPixel pixels(1, RGB_PIN, NEO_GRB + NEO_KHZ800);
@@ -77,7 +78,9 @@ uint8_t TARGET[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 esp_now_peer_info_t peerInfo;
 
 volatile float g_lastTempC = NAN;
-volatile uint8_t g_lastAction = 0; // 1 = Heater ON, 0 = Heater OFF
+volatile float g_lastHumidity = NAN; // BME280 can also provide humidity
+volatile float g_lastPressure = NAN;
+volatile uint8_t g_lastAction = 0;
 bool g_phoneDetected = false;
 int g_currentHits = 0;
 bool g_otaInProgress = false;
@@ -89,8 +92,8 @@ unsigned long g_detectionHistory[20] = {0};
 int g_historyIndex = 0;
 bool g_malfunctionState = false;
 
-uint32_t g_lastRelayChangeMs = 0;       // Memorizza l'ultimo cambio di stato
-const uint32_t MIN_RELAY_TIME = 180000; // Tempo minimo di 3 minuti (180.000 ms) tra i cambi
+uint32_t g_lastRelayChangeMs = 0;
+const uint32_t MIN_RELAY_TIME = 180000;
 
 esp_task_wdt_config_t twdt_config = {
     .timeout_ms = WDT_TIMEOUT_MS,
@@ -108,13 +111,12 @@ esp_task_wdt_config_t twdt_config = {
     TelnetStream.println(__VA_ARGS__); \
   }
 
-bool g_waitingForTimer = false;         // Stato: stiamo aspettando il timer di sicurezza?
+bool g_waitingForTimer = false;
 
-
-// Variabili per il nuovo comportamento del Ticker
 uint32_t g_colorA = 0;
 uint32_t g_colorB = 0;
 float g_currentBlinkRate = 0.5;
+
 // ======================================================================================
 // HELPERS
 // ======================================================================================
@@ -162,45 +164,38 @@ void toggleLed()
   pixels.show();
 }
 
-// Function to calculate and apply LED status
 void updateLedDisplay()
 {
   if (g_otaInProgress)
     return;
-
   uint32_t nextColorA = 0;
   uint32_t nextColorB = 0;
   float nextRate = 0.5;
 
   if (g_waitingForTimer)
   {
-    // STATO: Vorrei cambiare ma il timer me lo impedisce -> ROSSO lampeggiante
     nextColorA = pixels.Color(150, 0, 0);
-    nextColorB = 0; // Rosso / Spento
+    nextColorB = 0;
     nextRate = 0.5;
   }
   else if (g_lastAction == 1)
   {
-    // STATO: Caldaia ACCESA -> Verde / Blu alternato veloce
-    nextColorA = pixels.Color(0, 150, 0); // Verde
-    nextColorB = pixels.Color(0, 0, 150); // Blu
-    nextRate = 0.1;                       // 100ms
+    nextColorA = pixels.Color(0, 150, 0);
+    nextColorB = pixels.Color(0, 0, 150);
+    nextRate = 0.1;
   }
   else if (g_currentHits > 0)
   {
-    // STATO: Caldaia spenta, ma telefono rilevato o in ricerca
     nextColorA = g_phoneDetected ? pixels.Color(0, 150, 0) : pixels.Color(0, 0, 150);
     nextColorB = 0;
     nextRate = 0.5;
   }
 
-  // Applica i cambiamenti al Ticker solo se necessario
   if (nextColorA != g_colorA || nextColorB != g_colorB || nextRate != g_currentBlinkRate)
   {
     g_colorA = nextColorA;
     g_colorB = nextColorB;
     g_currentBlinkRate = nextRate;
-
     ledBlinker.detach();
     if (g_colorA > 0 || g_colorB > 0)
     {
@@ -220,7 +215,6 @@ void runBleScan()
 {
   if (g_otaInProgress || pBLEScan == nullptr)
     return;
-
   NimBLEScanResults foundDevices = pBLEScan->start(BLE_SCAN_TIME, false);
   int nearbyCount = 0;
   for (int i = 0; i < (int)foundDevices.getCount(); i++)
@@ -228,13 +222,11 @@ void runBleScan()
     if (foundDevices.getDevice(i).getRSSI() > BLE_RSSI_THRESHOLD)
       nearbyCount++;
   }
-
   if (nearbyCount > 0)
   {
     g_detectionHistory[g_historyIndex] = millis();
     g_historyIndex = (g_historyIndex + 1) % 20;
   }
-
   int validHits = 0;
   unsigned long now = millis();
   for (int i = 0; i < 20; i++)
@@ -243,7 +235,6 @@ void runBleScan()
       validHits++;
   }
   g_currentHits = validHits;
-
   if (validHits >= REQUIRED_HITS)
   {
     g_phoneDetected = true;
@@ -253,8 +244,7 @@ void runBleScan()
   {
     g_phoneDetected = false;
   }
-
-  updateLedDisplay(); // Refresh LED color based on new hits
+  updateLedDisplay();
   pBLEScan->clearResults();
 }
 
@@ -265,10 +255,8 @@ static bool cesanaReportAndFetch(float tempC, bool heating, float realSp, bool i
   struct tm t_now;
   if (!getLocalTime(&t_now))
     return false;
-
   bool isMorningGap = (t_now.tm_hour >= 6 && t_now.tm_hour < 10);
   bool isWeekend = (t_now.tm_wday == 0 || t_now.tm_wday == 6);
-
   WiFiClientSecure client;
   client.setInsecure();
   client.setTimeout(4000);
@@ -277,7 +265,6 @@ static bool cesanaReportAndFetch(float tempC, bool heating, float realSp, bool i
                "&cald=" + (heating ? "1" : "0") +
                "&phone=" + (g_phoneDetected ? "1" : "0") +
                "&real=" + String(realSp, 1);
-
   if (https.begin(client, url))
   {
     int code = https.GET();
@@ -311,7 +298,8 @@ void setupOTA()
   ArduinoOTA.onStart([]()
                      {
     g_otaInProgress = true;
-    esp_task_wdt_delete(NULL); esp_task_wdt_deinit();
+    esp_task_wdt_delete(NULL); 
+    esp_task_wdt_deinit();
     if(pBLEScan) pBLEScan->stop();
     NimBLEDevice::deinit(true);
     pBLEScan = nullptr;
@@ -335,9 +323,15 @@ void setup()
   loadFixedSetpoint();
   pixels.begin();
   pixels.show();
-  oneWire.begin(ONE_WIRE_BUS);
-  sensors.begin();
-  sensors.setResolution(12);
+
+  // Initialize I2C for BME280 on SDA 7, SCL 6
+  Wire.begin(I2C_SDA, I2C_SCL);
+  if (!bme.begin(0x76))
+  { // 0x76 is common, try 0x77 if it fails
+    LOG_PRINTLN("Could not find a valid BME280 sensor, check wiring!");
+    g_malfunctionState = true;
+  }
+
   NimBLEDevice::init(HOSTNAME);
   pBLEScan = NimBLEDevice::getScan();
   pBLEScan->setActiveScan(true);
@@ -358,7 +352,7 @@ void setup()
   esp_now_add_peer(&peerInfo);
   esp_task_wdt_init(&twdt_config);
   esp_task_wdt_add(NULL);
-  LOG_PRINTLN(">>> SYSTEM READY. Heater LED priority set to RED.");
+  LOG_PRINTLN(">>> SYSTEM READY. BME280 Active.");
 }
 
 void loop()
@@ -370,7 +364,7 @@ void loop()
   server.handleClient();
   uint32_t now = millis();
 
-  // 1. BLE SCAN (Every 5 Seconds)
+  // 1. BLE SCAN
   static uint32_t lastBle = 0;
   if (now - lastBle > BLE_SCAN_INTERVAL)
   {
@@ -378,15 +372,21 @@ void loop()
     runBleScan();
   }
 
-  // 2. THERMOSTAT LOGIC (Every 2 Seconds)
+  // 2. THERMOSTAT LOGIC
   static uint32_t lastLogic = 0;
   if (now - lastLogic > LOGIC_INTERVAL)
   {
     lastLogic = now;
-    sensors.requestTemperatures();
-    float t = sensors.getTempCByIndex(0)-1;
-    if (t > -50 && t < 100)
-      g_lastTempC = t;
+
+    // Updated Sensor Reading for BME280
+    float t = bme.readTemperature();
+    g_lastHumidity = bme.readHumidity();
+    g_lastPressure = bme.readPressure() / 100.0F; // Pressure in hPa (hectopascals)
+
+    if (t > -40 && t < 85)
+    {                         // BME280 range
+      g_lastTempC = t - 1.0f; // Kept the -1 offset from your original script
+    }
 
     struct tm timeinfo;
     bool timeKnown = getLocalTime(&timeinfo);
@@ -435,7 +435,6 @@ void loop()
       }
     }
 
-    // --- NUOVA LOGICA CON SAFETY TIMER E LED ---
     uint8_t desiredAction = g_lastAction;
     if (g_lastTempC < (g_fixedSetpoint - HYST_BAND_C / 2))
       desiredAction = 1;
@@ -444,37 +443,35 @@ void loop()
 
     if (desiredAction != g_lastAction)
     {
-      // Vorremmo cambiare stato... controlliamo il timer
       if (now - g_lastRelayChangeMs >= MIN_RELAY_TIME)
       {
         g_lastAction = desiredAction;
         g_lastRelayChangeMs = now;
-        g_waitingForTimer = false; // Cambio effettuato
-        LOG_PRINTF(">>> [HEATER] Safety OK. New State: %d\n", g_lastAction);
+        g_waitingForTimer = false;
       }
       else
       {
-        g_waitingForTimer = true; // Siamo in attesa del timer
+        g_waitingForTimer = true;
       }
     }
     else
     {
-      g_waitingForTimer = false; // Lo stato desiderato è quello attuale, niente attesa
+      g_waitingForTimer = false;
     }
 
-    // Aggiorna sempre il display LED a ogni ciclo di logica
     updateLedDisplay();
 
     JsonDocument jtx;
     jtx["heater"] = (g_lastAction == 1) ? "ON" : "OFF";
     jtx["temp"] = g_lastTempC;
+    jtx["hum"] = g_lastHumidity;
     jtx["id"] = 12;
     char buf[128];
     serializeJson(jtx, buf);
     esp_now_send(TARGET, (uint8_t *)buf, strlen(buf));
   }
 
-  // 3. HTTP SYNC (Every 30 Seconds)
+  // 3. HTTP SYNC
   static uint32_t lastHttp = 0;
   if (now - lastHttp > HTTP_SYNC_INTERVAL)
   {
@@ -485,8 +482,8 @@ void loop()
       getLocalTime(&t_sync);
       bool night = (t_sync.tm_hour >= 0 && t_sync.tm_hour < 6);
       cesanaReportAndFetch(g_lastTempC, (g_lastAction == 1), g_fixedSetpoint, night);
-      LOG_PRINTF("[%s] T:%.1f SP:%.1f Heat:%s Phone:%s Hits:%d\n",
-                 getLogTime().c_str(), g_lastTempC, g_fixedSetpoint,
+      LOG_PRINTF("[%s] T:%.1f H:%.1f SP:%.1f Heat:%s Phone:%s Hits:%d\n",
+                 getLogTime().c_str(), g_lastTempC, g_lastHumidity, g_fixedSetpoint,
                  (g_lastAction == 1) ? "ON" : "OFF", g_phoneDetected ? "YES" : "NO", g_currentHits);
     }
   }
