@@ -9,7 +9,7 @@ date_default_timezone_set('Europe/Rome');
 
 $file_path = rtrim($_SERVER['DOCUMENT_ROOT'] ?? '', '/') . "/icache.html";
 
-// Simple cache check
+// Simple cache check (disabled)
 if (is_file($file_path) && filemtime($file_path) > (time() - 60)) {
   // readfile($file_path);
   // exit;
@@ -130,43 +130,45 @@ $safePortata0 = ($portata[0] !== null) ? (float) $portata[0] : 0.0;
 /** ---------- 3b. PRESSURE & WEATHER FORECAST ---------- */
 $stateFile = '/dev/shm/thermo_data/state.json';
 $presHistoryFile = '/dev/shm/thermo_data/pres_history.csv';
-$safePres0 = 1013.0; 
+$safePres0 = 1013.0;
 $presTrend3h = 0.0;
 
 if (file_exists($stateFile)) {
-    $stateJson = json_decode(file_get_contents($stateFile), true);
-    if (isset($stateJson['pres'])) $safePres0 = (float)$stateJson['pres'];
+  $stateJson = json_decode((string) file_get_contents($stateFile), true);
+  if (isset($stateJson['pres'])) $safePres0 = (float) $stateJson['pres'];
 }
 
 if (file_exists($presHistoryFile)) {
-    $pRows = file($presHistoryFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-    $targetTs = time() - 10800; // 3 hours ago
-    $oldP = null;
-    foreach (array_reverse($pRows) as $pr) {
-        $pParts = explode(',', $pr);
-        if ((int)$pParts[0] <= $targetTs) { $oldP = (float)$pParts[1]; break; }
+  $pRows = file($presHistoryFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+  $targetTs = time() - 10800; // 3 hours ago
+  $oldP = null;
+  foreach (array_reverse($pRows) as $pr) {
+    $pParts = explode(',', $pr);
+    if ((int) $pParts[0] <= $targetTs) {
+      $oldP = (float) $pParts[1];
+      break;
     }
-    if ($oldP !== null) $presTrend3h = $safePres0 - $oldP;
+  }
+  if ($oldP !== null) $presTrend3h = $safePres0 - $oldP;
 }
 
 // Altitude Correction for 264m (+31.8 hPa)
 $mslp = $safePres0 + 31.8;
 
-// Weather Logic
+// Weather Logic (FIXED + TEXTS CORRECT)
 $forecast = ['icon' => 'cloud', 'text' => 'Variabile', 'color' => 'var(--text-muted)'];
 if ($presTrend3h <= -1.5) {
-    $forecast = ['icon' => 'storm', 'text' => 'Temporale', 'color' => 'var(--accent-red)'];
+  $forecast = ['icon' => 'storm', 'text' => 'Temporale', 'color' => 'var(--accent-red)'];
 } elseif ($presTrend3h <= -0.5) {
-    $forecast = ['icon' => 'rain', 'text' => 'Pioggia', 'color' => 'var(--accent-blue)'];
+  $forecast = ['icon' => 'rain', 'text' => 'Pioggia', 'color' => 'var(--accent-blue)'];
 } elseif ($mslp > 1022) {
-    $forecast = ['icon' => 'sun', 'text' => 'Sereno', 'color' => 'var(--accent-orange)'];
+  $forecast = ['icon' => 'sun', 'text' => 'Sereno', 'color' => 'var(--accent-orange)'];
 } elseif ($mslp > 1016 && $presTrend3h > -0.2) {
-    $forecast = ['icon' => 'partly_cloudy', 'text' => 'Poco Nuvoloso', 'color' => 'var(--accent-orange)'];
+  $forecast = ['icon' => 'partly_cloudy', 'text' => 'Poco Nuvoloso', 'color' => 'var(--accent-orange)'];
 } elseif ($presTrend3h >= 0.5) {
-    $forecast = ['icon' => 'partly_cloudy', 'text' => 'In Miglioramento', 'color' => 'var(--accent-orange)'];
-}
- elseif ($mslp < 1008) {
-    $forecast = ['icon' => 'rain', 'text' => 'Instabile', 'color' => 'var(--accent-blue)'];
+  $forecast = ['icon' => 'partly_cloudy', 'text' => 'In Miglioramento', 'color' => 'var(--accent-orange)'];
+} elseif ($mslp < 1008) {
+  $forecast = ['icon' => 'rain', 'text' => 'Instabile', 'color' => 'var(--accent-blue)'];
 }
 
 /** ---------- 4. TREND CALCULATION (30 mins) ---------- */
@@ -180,7 +182,8 @@ $queryTrend = "SELECT `temperatura`, `tombra`, `tMobile`, `portata`, `data`
 $resTrend = $link->query($queryTrend);
 $trendData = ($resTrend && $resTrend->num_rows > 0) ? $resTrend->fetch_assoc() : null;
 
-function calculateTrend($current, $old) {
+function calculateTrend($current, $old)
+{
   if ($current === null || $old === null || $current <= -50) return null;
   return ($current - (float) $old) * 2;
 }
@@ -193,9 +196,9 @@ $trend_piave = calculateTrend($safePortata0, $trendData['portata'] ?? null);
 /** ---------- 4b. RIVER STATUS LOGIC ---------- */
 $waterStatus = 'normal';
 if ($safePortata0 <= 17.0) {
-    $waterStatus = 'dry';
+  $waterStatus = 'dry';
 } elseif ($trend_piave !== null && $trend_piave >= 1.0) {
-    $waterStatus = 'increasing';
+  $waterStatus = 'increasing';
 }
 
 /** ---------- 5. FREEZING TIME PREDICTION ---------- */
@@ -234,8 +237,14 @@ $showTemp1 = ($safeTemp0 > -99) ? '' : 'style="display:none"';
 $showTemp2 = ($safeTombra0 > -99) ? '' : 'style="display:none"';
 $showTemp3 = ($safeTMobile0 > -99) ? '' : 'style="display:none"';
 
-function getTempClass($val) { return ($val < 1) ? 'freezing' : ''; }
-function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
+function getTempClass($val)
+{
+  return ($val < 1) ? 'freezing' : '';
+}
+function getPowerClass($val)
+{
+  return ($val <= 0) ? 'night-mode' : '';
+}
 ?>
 <!doctype html>
 <html lang="it">
@@ -335,6 +344,44 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
     .border-temp { border-top: 5px solid var(--accent-red); }
     .border-pres { border-top: 5px solid var(--accent-purple); }
     footer { text-align: center; margin-top: 40px; font-size: 0.8rem; color: var(--text-muted); }
+
+    /* Legend */
+    .weather-legend {
+      max-width: 1200px;
+      margin: 40px auto 20px;
+      background: var(--card-bg);
+      border-radius: 16px;
+      padding: 20px;
+      box-shadow: var(--shadow);
+    }
+    .weather-legend h3 {
+      text-align: center;
+      margin-bottom: 15px;
+      font-size: 1rem;
+      font-weight: 800;
+      color: var(--text-main);
+    }
+    .legend-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 15px;
+    }
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 0.8rem;
+      color: var(--text-muted);
+    }
+    .legend-item strong { color: var(--text-main); }
+    .legend-icon { width: 28px; height: 28px; fill: currentColor; }
+
+    .legend-icon.sun { color: var(--accent-orange); }
+    .legend-icon.partly,
+    .legend-icon.improve { color: var(--accent-orange); }
+    .legend-icon.rain { color: var(--accent-blue); }
+    .legend-icon.storm { color: var(--accent-red); }
+    .legend-icon.var { color: var(--text-muted); }
   </style>
 
   <script async src="https://www.googletagmanager.com/gtag/js?id=G-0TX9BGLRNC"></script>
@@ -391,7 +438,6 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
         <div><span class="card-value" id="temperatura"><?php echo $safeTemp0; ?></span><span class="card-unit">°C</span></div>
       </a>
       <div class="minmax-row">
-        <!-- AGGIUNTO MIN/MAX QUI -->
         <div class="minmax-item">
           <span class="minmax-label">Min 24h</span>
           <span class="minmax-val val-min"><?php echo $mm_min_temp; ?>°</span>
@@ -425,21 +471,64 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
     <div class="card border-pres" id="pres_card">
       <div class="card-content">
         <?php if ($forecast['icon'] == 'sun'): ?>
-            <svg viewBox="0 0 24 24" class="card-icon" style="color:var(--accent-orange)" fill="currentColor"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4" stroke="currentColor" stroke-width="2"/></svg>
+          <!-- Sun -->
+          <svg viewBox="0 0 24 24" class="card-icon" style="color:var(--accent-orange)" fill="currentColor">
+            <circle cx="12" cy="12" r="5"/>
+            <path d="M12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"
+                  stroke="currentColor" stroke-width="2" fill="none"/>
+          </svg>
+
         <?php elseif ($forecast['icon'] == 'partly_cloudy'): ?>
-            <svg viewBox="0 0 24 24" class="card-icon" fill="currentColor"><circle cx="17" cy="9" r="3" style="color:var(--accent-orange)"/><path d="M15.5 19c-3.037 0-5.5-2.463-5.5-5.5 0-3.037 2.463-5.5 5.5-5.5.38 0 .75.039 1.107.111C17.706 5.826 15.081 4 12 4 8.134 4 5 7.134 5 11c0 .138.004.276.012.412C3.289 12.288 2 13.992 2 16c0 2.761 2.239 5 5 5h10.5c2.485 0 4.5-2.015 4.5-4.5S19.985 12 17.5 12z" style="color:var(--text-muted)"/></svg>
-        <?php elseif ($forecast['icon'] == 'rain' || $forecast['icon'] == 'storm'): ?>
-            <svg viewBox="0 0 24 24" class="card-icon" style="color:var(--accent-blue)" fill="currentColor"><path d="M17.5 19c-3.037 0-5.5-2.463-5.5-5.5 0-3.037 2.463-5.5 5.5-5.5.38 0 .75.039 1.107.111C17.706 5.826 15.081 4 12 4 8.134 4 5 7.134 5 11c0 .138.004.276.012.412C3.289 12.288 2 13.992 2 16c0 2.761 2.239 5 5 5h10.5c2.485 0 4.5-2.015 4.5-4.5S19.985 12 17.5 12z"/><path d="M9 13v3M12 13v3M15 13v3" stroke="white" stroke-width="2"/></svg>
+          <!-- Sun + Cloud -->
+          <svg viewBox="0 0 24 24" class="card-icon" style="color:var(--accent-orange)" fill="currentColor">
+            <circle cx="17" cy="7" r="3"/>
+            <path d="M17 1v2M17 11v2M11 7h2M21 7h2
+                     M12.5 2.5l1.4 1.4
+                     M19.1 9.1l1.4 1.4
+                     M12.5 11.5l1.4-1.4
+                     M19.1 4.9l1.4-1.4"
+                  stroke="currentColor" stroke-width="1.5" fill="none"/>
+            <path d="M6.5 19
+                     C4 19 2 17.2 2 14.9
+                     c0-2 1.4-3.7 3.3-4.1
+                     C5.3 7.8 7.8 6 10.7 6
+                     c2.8 0 5.2 1.7 6 4.2
+                     h.3
+                     c2.3 0 4.2 1.8 4.2 4
+                     s-1.9 4-4.2 4
+                     H6.5z"
+                  style="color:var(--text-muted)"/>
+          </svg>
+
+        <?php elseif ($forecast['icon'] == 'rain'): ?>
+          <!-- Rain -->
+          <svg viewBox="0 0 24 24" class="card-icon" style="color:var(--accent-blue)" fill="currentColor">
+            <path d="M17.5 19c-3.037 0-5.5-2.463-5.5-5.5 0-3.037 2.463-5.5 5.5-5.5.38 0 .75.039 1.107.111C17.706 5.826 15.081 4 12 4 8.134 4 5 7.134 5 11c0 .138.004.276.012.412C3.289 12.288 2 13.992 2 16c0 2.761 2.239 5 5 5h10.5c2.485 0 4.5-2.015 4.5-4.5S19.985 12 17.5 12z"/>
+            <path d="M9 13v3M12 13v3M15 13v3" stroke="white" stroke-width="2" fill="none"/>
+          </svg>
+
+        <?php elseif ($forecast['icon'] == 'storm'): ?>
+          <!-- Storm (distinct from rain) -->
+          <svg viewBox="0 0 24 24" class="card-icon" style="color:var(--accent-red)" fill="currentColor">
+            <path d="M17.5 19c-3.037 0-5.5-2.463-5.5-5.5 0-3.037 2.463-5.5 5.5-5.5.38 0 .75.039 1.107.111C17.706 5.826 15.081 4 12 4 8.134 4 5 7.134 5 11c0 .138.004.276.012.412C3.289 12.288 2 13.992 2 16c0 2.761 2.239 5 5 5h10.5c2.485 0 4.5-2.015 4.5-4.5S19.985 12 17.5 12z"/>
+            <path d="M9 13v3M12 13v3" stroke="white" stroke-width="2" fill="none"/>
+            <path d="M14 12l-2 4h3l-2 4" stroke="white" stroke-width="2" fill="none"/>
+          </svg>
+
         <?php else: ?>
-            <svg viewBox="0 0 24 24" class="card-icon" style="color:var(--text-muted)" fill="currentColor"><path d="M17.5 19c-3.037 0-5.5-2.463-5.5-5.5 0-3.037 2.463-5.5 5.5-5.5.38 0 .75.039 1.107.111C17.706 5.826 15.081 4 12 4 8.134 4 5 7.134 5 11c0 .138.004.276.012.412C3.289 12.288 2 13.992 2 16c0 2.761 2.239 5 5 5h10.5c2.485 0 4.5-2.015 4.5-4.5S19.985 12 17.5 12z"/></svg>
+          <!-- Cloud -->
+          <svg viewBox="0 0 24 24" class="card-icon" style="color:var(--text-muted)" fill="currentColor">
+            <path d="M17.5 19c-3.037 0-5.5-2.463-5.5-5.5 0-3.037 2.463-5.5 5.5-5.5.38 0 .75.039 1.107.111C17.706 5.826 15.081 4 12 4 8.134 4 5 7.134 5 11c0 .138.004.276.012.412C3.289 12.288 2 13.992 2 16c0 2.761 2.239 5 5 5h10.5c2.485 0 4.5-2.015 4.5-4.5S19.985 12 17.5 12z"/>
+          </svg>
         <?php endif; ?>
+
         <div class="card-label">Pressione</div>
         <div><span class="card-value" id="actualPres"><?php echo number_format($safePres0, 1); ?></span><span class="card-unit">hPa</span></div>
         <div class="forecast-tag" style="color: <?php echo $forecast['color']; ?>"><?php echo $forecast['text']; ?></div>
       </div>
       <div class="minmax-row">
-          <div class="minmax-item"><span class="minmax-label">Sea Lvl</span><span class="minmax-val"><?php echo number_format($mslp, 1); ?></span></div>
-          <div class="minmax-item"><span class="minmax-label">Tend (3h)</span><span class="minmax-val <?php echo ($presTrend3h < 0 ? 'trend-down' : 'trend-up'); ?>"><?php echo ($presTrend3h > 0 ? '+': '') . number_format($presTrend3h, 1); ?></span></div>
+        <div class="minmax-item"><span class="minmax-label">Sea Lvl</span><span class="minmax-val"><?php echo number_format($mslp, 1); ?></span></div>
+        <div class="minmax-item"><span class="minmax-label">Tend (3h)</span><span class="minmax-val <?php echo ($presTrend3h < 0 ? 'trend-down' : 'trend-up'); ?>"><?php echo ($presTrend3h > 0 ? '+': '') . number_format($presTrend3h, 1); ?></span></div>
       </div>
     </div>
 
@@ -468,20 +557,20 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
     <div class="card border-water <?php echo ($waterStatus == 'dry' ? 'river-dry' : ''); ?>">
       <a href="grafico.php?var=portata" class="card-content">
         <?php if ($waterStatus == 'dry'): ?>
-            <svg viewBox="0 0 24 24" class="card-icon icon-water-dry" fill="currentColor"><path d="M2 13h20v2H2v-2zm2-4h16v2H4V9zm4-4h8v2H8V5z" opacity="0.3"/><path d="M12 22a9 9 0 0 1-9-9c0-1.5.5-3 1.5-4l1.5 1.5c-.6.7-1 1.6-1 2.5 0 3.9 3.1 7 7 7s7-3.1 7-7c0-.9-.4-1.8-1-2.5l1.5-1.5c1 1 1.5 2.5 1.5 4a9 9 0 0 1-9 9z"/><path d="M7 12h10v1H7z"/></svg>
+          <svg viewBox="0 0 24 24" class="card-icon icon-water-dry" fill="currentColor"><path d="M2 13h20v2H2v-2zm2-4h16v2H4V9zm4-4h8v2H8V5z" opacity="0.3"/><path d="M12 22a9 9 0 0 1-9-9c0-1.5.5-3 1.5-4l1.5 1.5c-.6.7-1 1.6-1 2.5 0 3.9 3.1 7 7 7s7-3.1 7-7c0-.9-.4-1.8-1-2.5l1.5-1.5c1 1 1.5 2.5 1.5 4a9 9 0 0 1-9 9z"/><path d="M7 12h10v1H7z"/></svg>
         <?php elseif ($waterStatus == 'increasing'): ?>
-            <svg viewBox="0 0 24 24" class="card-icon icon-water" fill="currentColor"><path d="M3.5 18c0-1.5 1-2.5 2.5-2.5s2.5 1 2.5 2.5-1 2.5-2.5 2.5-2.5-1-2.5-2.5zM15.5 18c0-1.5 1-2.5 2.5-2.5s2.5 1 2.5 2.5-1 2.5-2.5 2.5-2.5-1-2.5-2.5z"/><path d="M3 14c2 0 3-1 3-3s1-3 3-3 3 1 3 3 1 3 3 3 3-1 3-3 1-3 3-3 3 1 3 3-1 3-3 3H3z"/><path d="M12 2l-3 3h6l-3-3z" fill="var(--accent-red)"/></svg>
+          <svg viewBox="0 0 24 24" class="card-icon icon-water" fill="currentColor"><path d="M3.5 18c0-1.5 1-2.5 2.5-2.5s2.5 1 2.5 2.5-1 2.5-2.5 2.5-2.5-1-2.5-2.5zM15.5 18c0-1.5 1-2.5 2.5-2.5s2.5 1 2.5 2.5-1 2.5-2.5 2.5-2.5-1-2.5-2.5z"/><path d="M3 14c2 0 3-1 3-3s1-3 3-3 3 1 3 3 1 3 3 3 3-1 3-3 1-3 3-3 3 1 3 3-1 3-3 3H3z"/><path d="M12 2l-3 3h6l-3-3z" fill="var(--accent-red)"/></svg>
         <?php else: ?>
-            <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-water" viewBox="0 0 24 24" fill="currentColor"><path d="M3.75 6h15M3.75 12h15M3.75 18h15"/></svg>
+          <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-water" viewBox="0 0 24 24" fill="currentColor"><path d="M3.75 6h15M3.75 12h15M3.75 18h15"/></svg>
         <?php endif; ?>
         <div class="card-label">Piave</div>
         <div><span class="card-value" id="piave_portata"><?php echo number_format($safePortata0, 2); ?></span><span class="card-unit">m³/s</span></div>
         <div class="forecast-tag" style="color: <?php echo ($waterStatus == 'dry' ? 'var(--accent-dry)' : ($waterStatus == 'increasing' ? 'var(--accent-red)' : 'var(--accent-blue)')); ?>">
-            <?php echo ($waterStatus == 'dry' ? 'Secca' : ($waterStatus == 'increasing' ? 'In Piena' : 'Regolare')); ?>
+          <?php echo ($waterStatus == 'dry' ? 'Secca' : ($waterStatus == 'increasing' ? 'In Piena' : 'Regolare')); ?>
         </div>
       </a>
       <div class="minmax-row">
-          <div class="minmax-item"><span class="minmax-label">Trend</span><span class="minmax-val"><?php echo getTrendHtml($trend_piave, 'm³/s/h'); ?></span></div>
+        <div class="minmax-item"><span class="minmax-label">Trend</span><span class="minmax-val"><?php echo getTrendHtml($trend_piave, 'm³/s/h'); ?></span></div>
       </div>
     </div>
 
@@ -499,11 +588,103 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
     </div>
   </div>
 
+  <!-- Legend -->
+  <div class="weather-legend">
+    <h3>Legenda Meteo</h3>
+
+    <div class="legend-grid">
+      <div class="legend-item">
+        <!-- Sereno -->
+        <svg viewBox="0 0 24 24" class="legend-icon sun" fill="currentColor">
+          <circle cx="12" cy="12" r="5"/>
+          <path d="M12 1v2M12 21v2M4.2 4.2l1.4 1.4M18.4 18.4l1.4 1.4M1 12h2M21 12h2M4.2 19.8l1.4-1.4M18.4 5.6l1.4-1.4"
+                stroke="currentColor" stroke-width="2" fill="none"/>
+        </svg>
+        <span><strong>Sereno</strong><br>Alta pressione stabile</span>
+      </div>
+
+      <div class="legend-item">
+        <!-- Poco nuvoloso -->
+        <svg viewBox="0 0 24 24" class="legend-icon partly" fill="currentColor">
+          <circle cx="17" cy="7" r="3"/>
+          <path d="M17 1v2M17 11v2M11 7h2M21 7h2
+                   M12.5 2.5l1.4 1.4
+                   M19.1 9.1l1.4 1.4
+                   M12.5 11.5l1.4-1.4
+                   M19.1 4.9l1.4-1.4"
+                stroke="currentColor" stroke-width="1.5" fill="none"/>
+          <path d="M6.5 19
+                   C4 19 2 17.2 2 14.9
+                   c0-2 1.4-3.7 3.3-4.1
+                   C5.3 7.8 7.8 6 10.7 6
+                   c2.8 0 5.2 1.7 6 4.2
+                   h.3
+                   c2.3 0 4.2 1.8 4.2 4
+                   s-1.9 4-4.2 4
+                   H6.5z"/>
+        </svg>
+        <span><strong>Poco nuvoloso</strong><br>Tempo stabile</span>
+      </div>
+
+      <div class="legend-item">
+        <!-- In miglioramento -->
+        <svg viewBox="0 0 24 24" class="legend-icon improve" fill="currentColor">
+          <circle cx="17" cy="7" r="3"/>
+          <path d="M17 1v2M17 11v2M11 7h2M21 7h2
+                   M12.5 2.5l1.4 1.4
+                   M19.1 9.1l1.4 1.4
+                   M12.5 11.5l1.4-1.4
+                   M19.1 4.9l1.4-1.4"
+                stroke="currentColor" stroke-width="1.5" fill="none"/>
+          <path d="M6.5 19
+                   C4 19 2 17.2 2 14.9
+                   c0-2 1.4-3.7 3.3-4.1
+                   C5.3 7.8 7.8 6 10.7 6
+                   c2.8 0 5.2 1.7 6 4.2
+                   h.3
+                   c2.3 0 4.2 1.8 4.2 4
+                   s-1.9 4-4.2 4
+                   H6.5z"/>
+        </svg>
+        <span><strong>In miglioramento</strong><br>Pressione in aumento</span>
+      </div>
+
+      <div class="legend-item">
+        <!-- Pioggia -->
+        <svg viewBox="0 0 24 24" class="legend-icon rain" fill="currentColor">
+          <path d="M17.5 19c-3.037 0-5.5-2.463-5.5-5.5 0-3.037 2.463-5.5 5.5-5.5.38 0 .75.039 1.107.111C17.706 5.826 15.081 4 12 4 8.134 4 5 7.134 5 11c0 .138.004.276.012.412C3.289 12.288 2 13.992 2 16c0 2.761 2.239 5 5 5h10.5c2.485 0 4.5-2.015 4.5-4.5S19.985 12 17.5 12z"/>
+          <path d="M9 13v3M12 13v3M15 13v3" stroke="white" stroke-width="2" fill="none"/>
+        </svg>
+        <span><strong>Pioggia</strong><br>Pressione in calo</span>
+      </div>
+
+      <div class="legend-item">
+        <!-- Temporale -->
+        <svg viewBox="0 0 24 24" class="legend-icon storm" fill="currentColor">
+          <path d="M17.5 19c-3.037 0-5.5-2.463-5.5-5.5 0-3.037 2.463-5.5 5.5-5.5.38 0 .75.039 1.107.111C17.706 5.826 15.081 4 12 4 8.134 4 5 7.134 5 11c0 .138.004.276.012.412C3.289 12.288 2 13.992 2 16c0 2.761 2.239 5 5 5h10.5c2.485 0 4.5-2.015 4.5-4.5S19.985 12 17.5 12z"/>
+          <path d="M9 13v3M12 13v3" stroke="white" stroke-width="2" fill="none"/>
+          <path d="M14 12l-2 4h3l-2 4" stroke="white" stroke-width="2" fill="none"/>
+        </svg>
+        <span><strong>Temporale</strong><br>Forte instabilità</span>
+      </div>
+
+      <div class="legend-item">
+        <!-- Variabile -->
+        <svg viewBox="0 0 24 24" class="legend-icon var" fill="currentColor">
+          <path d="M17.5 19c-3.037 0-5.5-2.463-5.5-5.5 0-3.037 2.463-5.5 5.5-5.5.38 0 .75.039 1.107.111C17.706 5.826 15.081 4 12 4 8.134 4 5 7.134 5 11c0 .138.004.276.012.412C3.289 12.288 2 13.992 2 16c0 2.761 2.239 5 5 5h10.5c2.485 0 4.5-2.015 4.5-4.5S19.985 12 17.5 12z"/>
+        </svg>
+        <span><strong>Variabile</strong><br>Condizioni miste</span>
+      </div>
+    </div>
+  </div>
+
   <footer style="margin-top:20px; text-align:center;">&copy; <?php echo date("Y"); ?> Cesana Beach | Alt: 264m slm</footer>
 </body>
 </html>
 <?php
 $output = ob_get_contents();
 ob_end_flush();
-if ($output !== false) { file_put_contents($file_path, $output); }
+if ($output !== false) {
+  file_put_contents($file_path, $output);
+}
 ?>
