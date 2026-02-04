@@ -317,69 +317,82 @@ def main():
 
         if now - urltime > 60:
             urltime = now
-            # read weather stations
             data_valid = False
+            dati = None
+
+            # 1. Try to read from the current known station
             try:
                 dati = ow.get_station_data(current_main_station)
-                temp = dati[0] / 10.0
                 lastChangeStation = dati[7]
-                if lastChangeStation > 1200:
-                    temp = -100
-                    raise ValueError("Data too old")
+
+                # Check if data is fresh (less than 20 mins old)
+                if lastChangeStation < 1200:
+                    temp = dati[0] / 10.0
+                    data_valid = True
+                    print(
+                        f"Main station {current_main_station} updated {lastChangeStation}s ago."
+                    )
+                else:
+                    print(
+                        f"Main station {current_main_station} data is too old ({lastChangeStation}s)."
+                    )
             except Exception as e:
-                print(f"Main station {current_main_station} error: {e}")
-                # Scan for new station
+                print(f"Main station {current_main_station} not responding.")
+
+            # 2. If current station failed or is old, scan for a new one
+            if not data_valid:
                 new_id = scan_for_active_station(ow)
                 if new_id:
                     current_main_station = new_id
-                    print(f"Switching to new main station: {current_main_station}")
-                    # Attempt to fetch again with new ID
                     try:
                         dati = ow.get_station_data(current_main_station)
+                        temp = dati[0] / 10.0
                         data_valid = True
+                        print(f"Switched to active station: {current_main_station}")
                     except:
                         data_valid = False
-            if data_valid:
-                temp = dati[0] / 10.0
-            else:
+
+            # 3. Final Fallback if everything failed
+            if not data_valid:
                 temp = -100
-                dati = None  # Ensure subsequent accesses handle this gracefully
-            # sensor 2
+                print("No active weather station found.")
+
+            # --- Sensor 2 (Mobile) ---
             try:
                 tMobile = ow.get_sensor_data(sensoreTemperatura2)
                 temp2 = tMobile[0] / 10.0
-                if tMobile[2] > 1200:
+                if tMobile[2] > 1200:  # data too old
                     temp2 = -100
-            except Exception as e:
-                print("Sensor 2 error:", e)
+            except:
                 temp2 = -100
 
-            # sensor 1 (ombra)
+            # --- Sensor 1 (Ombra) ---
             try:
                 ombra = ow.get_sensor_data(sensoreTemperatura)
                 temp1 = ombra[0] / 10.0
+                hum_ombra = ombra[1]
                 if ombra[2] > 1200:
                     temp1 = -100
-                hum_ombra = ombra[1]
-            except Exception as e:
-                print("Ombra error:", e)
+            except:
                 temp1 = -100
                 hum_ombra = -1
 
-            # fan / cpu temp
+            # --- fan / cpu temp ---
             tempCpu = temperature_of_raspberry_pi()
 
+            # --- Build and send URL ---
+            # We use 'dati' only if data_valid is True, otherwise use fallback values
             url_string = (
                 "https://cesana.steplab.net/carica_dati.php"
                 f"?tMobile={temp2}"
                 f"&fan={fanMode}"
                 f"&tempCpu={tempCpu}"
                 f"&temp={temp}"
-                f"&humi={dati[1] if dati else humidity}"
-                f"&wind={dati[2]/10.0 if dati else 0}"
-                f"&gust={dati[3]/10.0 if dati else 0}"
-                f"&rain={dati[4]/10.0 if dati else 0}"
-                f"&wdir={dati[5] if dati else 0}"
+                f"&humi={dati[1] if data_valid else humidity}"
+                f"&wind={dati[2]/10.0 if data_valid else 0}"
+                f"&gust={dati[3]/10.0 if data_valid else 0}"
+                f"&rain={dati[4]/10.0 if data_valid else 0}"
+                f"&wdir={dati[5] if data_valid else 0}"
                 f"&tombra={temp1}"
                 f"&hombra={hum_ombra}"
                 f"&chip={temperature}"
@@ -389,9 +402,9 @@ def main():
             print(url_string)
             try:
                 weburl = urllib.request.urlopen(url_string, timeout=5)
-                print("result code:", weburl.getcode())
+                print("Server response code:", weburl.getcode())
             except Exception as e:
-                print("Connection Error:", e)
+                print("Network Connection Error:", e)
 
     ipcon.disconnect()
 
