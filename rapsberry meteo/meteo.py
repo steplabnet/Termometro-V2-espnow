@@ -57,6 +57,24 @@ powerPrev = 0
 fanHistory = np.array([48] * 10, dtype=float)  # moving avg of CPU temp
 
 
+def scan_for_active_station(ow, start_id=1, end_id=255):
+    """
+    Scans for a station ID that returns valid, recent data.
+    Returns the first valid station ID found, or None if none found.
+    """
+    print(f"Scanning for new station ID between {start_id} and {end_id}...")
+    for station_id in range(start_id, end_id + 1):
+        try:
+            dati = ow.get_station_data(station_id)
+            # Check if data is recent (last change < 1200 seconds)
+            if dati[7] < 1200:
+                print(f"Found active station: {station_id}")
+                return station_id
+        except:
+            continue
+    return None
+
+
 def left_shift(arr, value):
     for i in range(len(arr) - 1):
         arr[i] = arr[i + 1]
@@ -253,6 +271,7 @@ def autogain_read():
 
 def main():
     global tb, urltime, tensioni, powerPrev
+    current_main_station = 193
 
     # connect once
     ipcon = IPConnection()
@@ -299,16 +318,32 @@ def main():
         if now - urltime > 60:
             urltime = now
             # read weather stations
+            data_valid = False
             try:
-                dati = ow.get_station_data(mainStation)
+                dati = ow.get_station_data(current_main_station)
                 temp = dati[0] / 10.0
                 lastChangeStation = dati[7]
                 if lastChangeStation > 1200:
                     temp = -100
+                    raise ValueError("Data too old")
             except Exception as e:
-                print("Main station error:", e)
+                print(f"Main station {current_main_station} error: {e}")
+                # Scan for new station
+                new_id = scan_for_active_station(ow)
+                if new_id:
+                    current_main_station = new_id
+                    print(f"Switching to new main station: {current_main_station}")
+                    # Attempt to fetch again with new ID
+                    try:
+                        dati = ow.get_station_data(current_main_station)
+                        data_valid = True
+                    except:
+                        data_valid = False
+            if data_valid:
+                temp = dati[0] / 10.0
+            else:
                 temp = -100
-
+                dati = None  # Ensure subsequent accesses handle this gracefully
             # sensor 2
             try:
                 tMobile = ow.get_sensor_data(sensoreTemperatura2)
@@ -340,11 +375,11 @@ def main():
                 f"&fan={fanMode}"
                 f"&tempCpu={tempCpu}"
                 f"&temp={temp}"
-                f"&humi={dati[1] if 'dati' in locals() else humidity}"
-                f"&wind={dati[2]/10.0 if 'dati' in locals() else 0}"
-                f"&gust={dati[3]/10.0 if 'dati' in locals() else 0}"
-                f"&rain={dati[4]/10.0 if 'dati' in locals() else 0}"
-                f"&wdir={dati[5] if 'dati' in locals() else 0}"
+                f"&humi={dati[1] if dati else humidity}"
+                f"&wind={dati[2]/10.0 if dati else 0}"
+                f"&gust={dati[3]/10.0 if dati else 0}"
+                f"&rain={dati[4]/10.0 if dati else 0}"
+                f"&wdir={dati[5] if dati else 0}"
                 f"&tombra={temp1}"
                 f"&hombra={hum_ombra}"
                 f"&chip={temperature}"

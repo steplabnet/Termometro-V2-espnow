@@ -56,7 +56,7 @@ if ($resMinMax && $rowMM = $resMinMax->fetch_assoc()) {
 // Format Helper
 function fmt($val, $decimals = 1, $default = '--')
 {
-  return (isset($val) && $val !== null && $val !== '') ? round((float) $val, $decimals) : $default;
+  return (isset($val) && $val !== null && $val !== '' && (float)$val > -99) ? round((float) $val, $decimals) : $default;
 }
 
 $mm_min_temp = fmt($mm['min_temp'] ?? null);
@@ -214,7 +214,7 @@ else {
 function getFreezingTime($currentTemp, $trendPerHour)
 {
   // Se uno dei due valori è null, non possiamo calcolare nulla
-  if ($currentTemp === null || $trendPerHour === null) {
+  if ($currentTemp === null || $trendPerHour === null || $currentTemp <= -50) {
     return null;
   }
 
@@ -254,7 +254,7 @@ $showTemp3 = ($safeTMobile0 > -99) ? '' : 'style="display:none"';
 
 function getTempClass($val)
 {
-  return ($val < 1) ? 'freezing' : '';
+  return ($val < 1 && $val > -99) ? 'freezing' : '';
 }
 function getPowerClass($val)
 {
@@ -414,9 +414,9 @@ function getPowerClass($val)
         if (this.readyState === 4 && this.status === 200) {
           var res = String(this.responseText).split("#");
           if (res[4]) document.getElementById("dataora").textContent = res[4];
-          if (document.getElementById("temperatura")) document.getElementById("temperatura").textContent = res[0];
-          if (document.getElementById("tombra")) document.getElementById("tombra").textContent = res[7];
-          if (document.getElementById("tMobile")) document.getElementById("tMobile").textContent = res[14];
+          if (document.getElementById("temperatura")) document.getElementById("temperatura").textContent = (parseFloat(res[0]) <= -99) ? "--" : res[0];
+          if (document.getElementById("tombra")) document.getElementById("tombra").textContent = (parseFloat(res[7]) <= -99) ? "--" : res[7];
+          if (document.getElementById("tMobile")) document.getElementById("tMobile").textContent = (parseFloat(res[14]) <= -99) ? "--" : res[14];
           if (document.getElementById("power")) document.getElementById("power").textContent = res[10];
           if (document.getElementById("hombra")) document.getElementById("hombra").textContent = res[8];
           if (document.getElementById("piave_portata")) document.getElementById("piave_portata").textContent = res[15];
@@ -450,7 +450,7 @@ function getPowerClass($val)
         <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-temp icon-warm" viewBox="0 0 24 24" fill="currentColor"><path d="M14 2a5 5 0 0 0-5 5v8a5 5 0 0 0-2.15 4.096A5 5 0 0 0 12 24a5 5 0 0 0 5.15-4.904A5 5 0 0 0 15 15V7a5 5 0 0 0-1-3Z"/></svg>
         <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-cold" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12h20M12 2v20M20 4l-8 8-8-8M4 20l8-8 8 8"/></svg>
         <div class="card-label">Temp (Sole)</div>
-        <div><span class="card-value" id="temperatura"><?php echo $safeTemp0; ?></span><span class="card-unit">°C</span></div>
+        <div><span class="card-value" id="temperatura"><?php echo ($safeTemp0 <= -99 ? '--' : $safeTemp0); ?></span><span class="card-unit">°C</span></div>
       </a>
       <div class="minmax-row">
         <div class="minmax-item">
@@ -474,7 +474,7 @@ function getPowerClass($val)
         <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-temp icon-warm" viewBox="0 0 24 24" fill="currentColor"><path d="M14 2a5 5 0 0 0-5 5v8a5 5 0 0 0-2.15 4.096A5 5 0 0 0 12 24a5 5 0 0 0 5.15-4.904A5 5 0 0 0 15 15V7a5 5 0 0 0-1-3Z"/></svg>
         <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-cold" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M2 12h20M12 2v20M20 4l-8 8-8-8M4 20l8-8 8 8"/></svg>
         <div class="card-label">Temp (Ombra)</div>
-        <div><span class="card-value" id="tMobile"><?php echo $safeTMobile0; ?></span><span class="card-unit">°C</span></div>
+        <div><span class="card-value" id="tMobile"><?php echo ($safeTMobile0 <= -99 ? '--' : $safeTMobile0); ?></span><span class="card-unit">°C</span></div>
       </a>
       <div class="minmax-row">
         <div class="minmax-item"><span class="minmax-label">Min 24h</span><span class="minmax-val val-min"><?php echo $mm_min_tMobile; ?>°</span></div>
@@ -617,7 +617,7 @@ function getPowerClass($val)
       <a href="grafico.php?var=tombra" class="card-content">
         <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-temp icon-warm" viewBox="0 0 24 24" fill="currentColor"><path d="M14 2a5 5 0 0 0-5 5v8a5 5 0 0 0-2.15 4.096A5 5 0 0 0 12 24a5 5 0 0 0 5.15-4.904A5 5 0 0 0 15 15V7a5 5 0 0 0-1-3Z"/></svg>
         <div class="card-label">Temp (Interno)</div>
-        <div><span class="card-value" id="tombra"><?php echo $safeTombra0; ?></span><span class="card-unit">°C</span></div>
+        <div><span class="card-value" id="tombra"><?php echo ($safeTombra0 <= -99 ? '--' : $safeTombra0); ?></span><span class="card-unit">°C</span></div>
       </a>
       <div class="minmax-row">
         <div class="minmax-item"><span class="minmax-label">Min 24h</span><span class="minmax-val val-min"><?php echo $mm_min_tombra; ?>°</span></div>
