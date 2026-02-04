@@ -153,7 +153,8 @@ if (file_exists($presHistoryFile)) {
 }
 
 // Altitude Correction for 264m (+31.8 hPa)
-$mslp = $safePres0 + 31.8;
+$offsetPress = 2.5;
+$mslp = $safePres0 + 31.8 -$offsetPress;
 
 // Weather Logic (FIXED + TEXTS CORRECT)
 $forecast = ['icon' => 'cloud', 'text' => 'Variabile', 'color' => 'var(--text-muted)'];
@@ -195,17 +196,31 @@ $trend_piave = calculateTrend($safePortata0, $trendData['portata'] ?? null);
 
 /** ---------- 4b. RIVER STATUS LOGIC ---------- */
 $waterStatus = 'normal';
-if ($safePortata0 <= 17.0) {
-  $waterStatus = 'dry';
-} elseif ($trend_piave !== null && $trend_piave >= 1.0) {
-  $waterStatus = 'increasing';
+
+// Trigger "In Piena" if flow > 100 OR if trend is fast AND flow is > 100
+if ($safePortata0 > 100.0) {
+    $waterStatus = 'increasing';
+} 
+// Trigger "Secca" if flow <= 17 (keeping your original low-water logic)
+elseif ($safePortata0 <= 17.0) {
+    $waterStatus = 'dry';
+} 
+// Otherwise, it is "Normale"
+else {
+    $waterStatus = 'normal';
 }
 
 /** ---------- 5. FREEZING TIME PREDICTION ---------- */
 function getFreezingTime($currentTemp, $trendPerHour)
 {
+  // Se uno dei due valori è null, non possiamo calcolare nulla
+  if ($currentTemp === null || $trendPerHour === null) {
+    return null;
+  }
+
+  // Procediamo solo se la temperatura è sopra zero e il trend è in calo
   if ($currentTemp > 0 && $trendPerHour < -0.1) {
-    $hoursToZero = $currentTemp / abs($trendPerHour);
+    $hoursToZero = $currentTemp / abs((float)$trendPerHour);
     if ($hoursToZero < 24) {
       $secondsToZero = (int) ($hoursToZero * 3600);
       $targetTime = time() + $secondsToZero;
@@ -553,24 +568,47 @@ function getPowerClass($val)
       <div class="minmax-row"><div class="minmax-item"><span class="minmax-label">Range 24h</span><span class="minmax-val"><?php echo $mm_min_humi; ?>-<?php echo $mm_max_humi; ?>%</span></div></div>
     </div>
 
-    <!-- 6. Piave -->
+   
+<!-- 6. Piave -->
     <div class="card border-water <?php echo ($waterStatus == 'dry' ? 'river-dry' : ''); ?>">
       <a href="grafico.php?var=portata" class="card-content">
         <?php if ($waterStatus == 'dry'): ?>
+          <!-- Icona Secca (Marrone) -->
           <svg viewBox="0 0 24 24" class="card-icon icon-water-dry" fill="currentColor"><path d="M2 13h20v2H2v-2zm2-4h16v2H4V9zm4-4h8v2H8V5z" opacity="0.3"/><path d="M12 22a9 9 0 0 1-9-9c0-1.5.5-3 1.5-4l1.5 1.5c-.6.7-1 1.6-1 2.5 0 3.9 3.1 7 7 7s7-3.1 7-7c0-.9-.4-1.8-1-2.5l1.5-1.5c1 1 1.5 2.5 1.5 4a9 9 0 0 1-9 9z"/><path d="M7 12h10v1H7z"/></svg>
         <?php elseif ($waterStatus == 'increasing'): ?>
-          <svg viewBox="0 0 24 24" class="card-icon icon-water" fill="currentColor"><path d="M3.5 18c0-1.5 1-2.5 2.5-2.5s2.5 1 2.5 2.5-1 2.5-2.5 2.5-2.5-1-2.5-2.5zM15.5 18c0-1.5 1-2.5 2.5-2.5s2.5 1 2.5 2.5-1 2.5-2.5 2.5-2.5-1-2.5-2.5z"/><path d="M3 14c2 0 3-1 3-3s1-3 3-3 3 1 3 3 1 3 3 3 3-1 3-3 1-3 3-3 3 1 3 3-1 3-3 3H3z"/><path d="M12 2l-3 3h6l-3-3z" fill="var(--accent-red)"/></svg>
+          <!-- Icona In Piena (Rossa con freccia se il trend è forte) -->
+          <svg viewBox="0 0 24 24" class="card-icon icon-water" fill="currentColor">
+            <path d="M3 14c2 0 3-1 3-3s1-3 3-3 3 1 3 3 1 3 3 3 3-1 3-3 1-3 3-3 3 1 3 3-1 3-3 3H3z"/>
+            <?php if ($trend_piave > 1.5): ?>
+              <path d="M12 2l-4 4h8l-4-4z" fill="var(--accent-red)"/> <!-- Freccia allerta trend -->
+            <?php endif; ?>
+            <path d="M3.5 18c0-1.5 1-2.5 2.5-2.5s2.5 1 2.5 2.5-1 2.5-2.5 2.5-2.5-1-2.5-2.5zM15.5 18c0-1.5 1-2.5 2.5-2.5s2.5 1 2.5 2.5-1 2.5-2.5 2.5-2.5-1-2.5-2.5z" opacity="0.5"/>
+          </svg>
         <?php else: ?>
+          <!-- Icona Normale (Blu) -->
           <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-water" viewBox="0 0 24 24" fill="currentColor"><path d="M3.75 6h15M3.75 12h15M3.75 18h15"/></svg>
         <?php endif; ?>
-        <div class="card-label">Piave</div>
+
+        <div class="card-label">Fiume Piave</div>
         <div><span class="card-value" id="piave_portata"><?php echo number_format($safePortata0, 2); ?></span><span class="card-unit">m³/s</span></div>
-        <div class="forecast-tag" style="color: <?php echo ($waterStatus == 'dry' ? 'var(--accent-dry)' : ($waterStatus == 'increasing' ? 'var(--accent-red)' : 'var(--accent-blue)')); ?>">
-          <?php echo ($waterStatus == 'dry' ? 'Secca' : ($waterStatus == 'increasing' ? 'In Piena' : 'Regolare')); ?>
+        
+        <div class="forecast-tag" style="color: <?php 
+          if ($waterStatus == 'dry') echo 'var(--accent-dry)';
+          elseif ($waterStatus == 'increasing') echo 'var(--accent-red)';
+          else echo 'var(--accent-blue)';
+        ?>">
+          <?php 
+            if ($waterStatus == 'dry') echo 'Secca';
+            elseif ($waterStatus == 'increasing') echo 'In Piena';
+            else echo 'Normale';
+          ?>
         </div>
       </a>
       <div class="minmax-row">
-        <div class="minmax-item"><span class="minmax-label">Trend</span><span class="minmax-val"><?php echo getTrendHtml($trend_piave, 'm³/s/h'); ?></span></div>
+        <div class="minmax-item">
+          <span class="minmax-label">Trend Orario</span>
+          <span class="minmax-val"><?php echo getTrendHtml($trend_piave, 'm³/s/h'); ?></span>
+        </div>
       </div>
     </div>
 
