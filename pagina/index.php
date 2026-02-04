@@ -194,6 +194,13 @@ $trend_tombra = calculateTrend($safeTombra0, $trendData['tombra'] ?? null);
 $trend_tMobile = calculateTrend($safeTMobile0, $trendData['tMobile'] ?? null);
 $trend_piave = calculateTrend($safePortata0, $trendData['portata'] ?? null);
 
+// --- FILTRO SANITY CHECK: Se il trend è > 20°C/h (probabile errore sensore), mostra --
+if ($trend_temp1 !== null && abs($trend_temp1) > 20) $trend_temp1 = null;
+if ($trend_tombra !== null && abs($trend_tombra) > 20) $trend_tombra = null;
+if ($trend_tMobile !== null && abs($trend_tMobile) > 20) $trend_tMobile = null;
+// Nota: Non applichiamo il filtro al Piave perché in caso di piena estrema 
+// variazioni repentine di portata sono fisicamente possibili.
+
 /** ---------- 4b. RIVER STATUS LOGIC ---------- */
 $waterStatus = 'normal';
 
@@ -248,7 +255,7 @@ function getTrendHtml($val, $unit = '°C/h', $icePrediction = null)
   return $html;
 }
 
-$showTemp1 = ($safeTemp0 > -99) ? '' : 'style="display:none"';
+$showTemp1 = '';// ($safeTemp0 > -99) ? '' : 'style="display:none"';
 $showTemp2 = ($safeTombra0 > -99) ? '' : 'style="display:none"';
 $showTemp3 = ($safeTMobile0 > -99) ? '' : 'style="display:none"';
 
@@ -477,9 +484,19 @@ function getPowerClass($val)
         <div><span class="card-value" id="tMobile"><?php echo ($safeTMobile0 <= -99 ? '--' : $safeTMobile0); ?></span><span class="card-unit">°C</span></div>
       </a>
       <div class="minmax-row">
-        <div class="minmax-item"><span class="minmax-label">Min 24h</span><span class="minmax-val val-min"><?php echo $mm_min_tMobile; ?>°</span></div>
-        <div class="minmax-item"><span class="minmax-label">Max 24h</span><span class="minmax-val val-max"><?php echo $mm_max_tMobile; ?>°</span></div>
-      </div>
+  <div class="minmax-item">
+    <span class="minmax-label">Min 24h</span>
+    <span class="minmax-val val-min"><?php echo $mm_min_tMobile; ?>°</span>
+  </div>
+  <div class="minmax-item">
+    <span class="minmax-label">Trend</span>
+    <span class="minmax-val"><?php echo getTrendHtml($trend_tMobile, '°C/h', $iceTime_tMobile); ?></span>
+  </div>
+  <div class="minmax-item">
+    <span class="minmax-label">Max 24h</span>
+    <span class="minmax-val val-max"><?php echo $mm_max_tMobile; ?>°</span>
+  </div>
+</div>
     </div>
 
     <!-- 3. Pressione & Previsioni -->
@@ -620,9 +637,19 @@ function getPowerClass($val)
         <div><span class="card-value" id="tombra"><?php echo ($safeTombra0 <= -99 ? '--' : $safeTombra0); ?></span><span class="card-unit">°C</span></div>
       </a>
       <div class="minmax-row">
-        <div class="minmax-item"><span class="minmax-label">Min 24h</span><span class="minmax-val val-min"><?php echo $mm_min_tombra; ?>°</span></div>
-        <div class="minmax-item"><span class="minmax-label">Max 24h</span><span class="minmax-val val-max"><?php echo $mm_max_tombra; ?>°</span></div>
-      </div>
+  <div class="minmax-item">
+    <span class="minmax-label">Min 24h</span>
+    <span class="minmax-val val-min"><?php echo $mm_min_tombra; ?>°</span>
+  </div>
+  <div class="minmax-item">
+    <span class="minmax-label">Trend</span>
+    <span class="minmax-val"><?php echo getTrendHtml($trend_tombra, '°C/h', $iceTime_tombra); ?></span>
+  </div>
+  <div class="minmax-item">
+    <span class="minmax-label">Max 24h</span>
+    <span class="minmax-val val-max"><?php echo $mm_max_tombra; ?>°</span>
+  </div>
+</div>
     </div>
   </div>
 
