@@ -1,10 +1,7 @@
 /*
  * ======================================================================================
  * PROJECT: ESP32-C3 Smart Office Thermostat (BME280 VERSION)
- * LOGIC:
- *   - LED RED/BLINK: Safety Timer Active
- *   - LED GREEN/BLUE FLASH: Heater ON
- *   - SENSOR: BME280 (SDA: 7, SCL: 6)
+ * TARGET TEMPERATURE: 17.0°C (Comfort Mode)
  * ======================================================================================
  */
 
@@ -12,9 +9,9 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <ArduinoJson.h>
-#include <Wire.h>            // Added for I2C
-#include <Adafruit_Sensor.h> // Added for BME280
-#include <Adafruit_BME280.h> // Added for BME280
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_BME280.h>
 #include <LittleFS.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
@@ -33,8 +30,6 @@
 // ======================================================================================
 #define WDT_TIMEOUT_MS 15000
 #define RGB_PIN 8
-
-// BME280 I2C Pins
 #define I2C_SDA 7
 #define I2C_SCL 6
 
@@ -44,7 +39,6 @@ static const char *AP_SSID = "termometroUff";
 static const char *AP_PASS = "12345678";
 static const char *HOSTNAME = "esp32-thermo";
 
-// Intervals
 const uint32_t HTTP_SYNC_INTERVAL = 30000;
 const uint32_t BLE_SCAN_INTERVAL = 5000;
 const uint32_t LOGIC_INTERVAL = 10000;
@@ -53,14 +47,13 @@ const char *ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 3600;
 const int daylightOffset_sec = 3600;
 
-// BLE Settings
 const int BLE_RSSI_THRESHOLD = -75;
 const int BLE_SCAN_TIME = 1;
 #define REQUIRED_HITS 3
 #define HIT_WINDOW_MS 60000
 
 // Logic Settings
-static float g_fixedSetpoint = 19.0f;
+static float g_fixedSetpoint = 17.0f; // UPDATED TO 17
 static String g_fixedPreset = "on";
 static const float HYST_BAND_C = 0.5f;
 const uint32_t PHONE_ABSENCE_TIMEOUT_MS = 60000;
@@ -68,7 +61,7 @@ const uint32_t PHONE_ABSENCE_TIMEOUT_MS = 60000;
 // ======================================================================================
 // GLOBALS
 // ======================================================================================
-Adafruit_BME280 bme; // Replacement for DallasTemperature
+Adafruit_BME280 bme;
 WebServer server(80);
 NimBLEScan *pBLEScan = nullptr;
 Adafruit_NeoPixel pixels(1, RGB_PIN, NEO_GRB + NEO_KHZ800);
@@ -78,7 +71,7 @@ uint8_t TARGET[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 esp_now_peer_info_t peerInfo;
 
 volatile float g_lastTempC = NAN;
-volatile float g_lastHumidity = NAN; // BME280 can also provide humidity
+volatile float g_lastHumidity = NAN;
 volatile float g_lastPressure = NAN;
 volatile uint8_t g_lastAction = 0;
 bool g_phoneDetected = false;
@@ -112,13 +105,12 @@ esp_task_wdt_config_t twdt_config = {
   }
 
 bool g_waitingForTimer = false;
-
 uint32_t g_colorA = 0;
 uint32_t g_colorB = 0;
 float g_currentBlinkRate = 0.5;
 
 // ======================================================================================
-// HELPERS
+// HELPERS & STORAGE
 // ======================================================================================
 
 String getLogTime()
@@ -149,7 +141,7 @@ static void loadFixedSetpoint()
   JsonDocument doc;
   if (!deserializeJson(doc, f))
   {
-    g_fixedSetpoint = doc["setpoint"] | 19.0;
+    g_fixedSetpoint = doc["setpoint"] | 17.0; // Updated fallback to 17
     g_fixedPreset = doc["preset"] | "on";
   }
   f.close();
@@ -174,7 +166,7 @@ void updateLedDisplay()
 
   if (g_waitingForTimer)
   {
-    nextColorA = pixels.Color(150, 0, 0);
+    nextColorA = pixels.Color(150, 0, 0); // Safety Timer Red
     nextColorB = 0;
     nextRate = 0.5;
   }
@@ -252,17 +244,9 @@ static bool cesanaReportAndFetch(float tempC, bool heating, float realSp, bool i
 {
   if (WiFi.status() != WL_CONNECTED || g_otaInProgress)
     return false;
-
-  struct tm t_now;
-  if (!getLocalTime(&t_now))
-    return false;
-
   WiFiClientSecure client;
   client.setInsecure();
-  client.setTimeout(4000);
   HTTPClient https;
-
-  // Added &humi= and &pres= to the URL
   String url = "https://cesana.steplab.net/get_setpoint.php?temp=" + String(tempC, 1) +
                "&cald=" + (heating ? "1" : "0") +
                "&phone=" + (g_phoneDetected ? "1" : "0") +
@@ -273,17 +257,8 @@ static bool cesanaReportAndFetch(float tempC, bool heating, float realSp, bool i
   if (https.begin(client, url))
   {
     int code = https.GET();
-    if (code == HTTP_CODE_OK)
-    {
-      JsonDocument doc;
-      if (!deserializeJson(doc, https.getString()))
-      {
-        float remoteSp = doc["setpoint"] | -1.0;
-        // ... (rest of the logic remains same)
-      }
-    }
     https.end();
-    return true;
+    return (code == HTTP_CODE_OK);
   }
   return false;
 }
@@ -298,17 +273,9 @@ void setupOTA()
     esp_task_wdt_deinit();
     if(pBLEScan) pBLEScan->stop();
     NimBLEDevice::deinit(true);
-    pBLEScan = nullptr;
     esp_now_deinit();
-    server.stop();
-    WiFi.softAPdisconnect(true);
-    WiFi.mode(WIFI_STA);
     ledBlinker.detach();
     pixels.setPixelColor(0, pixels.Color(150, 0, 255)); pixels.show(); });
-  ArduinoOTA.onEnd([]()
-                   { ESP.restart(); });
-  ArduinoOTA.onError([](ota_error_t error)
-                     { ESP.restart(); });
   ArduinoOTA.begin();
 }
 
@@ -320,11 +287,10 @@ void setup()
   pixels.begin();
   pixels.show();
 
-  // Initialize I2C for BME280 on SDA 7, SCL 6
   Wire.begin(I2C_SDA, I2C_SCL);
   if (!bme.begin(0x76))
-  { // 0x76 is common, try 0x77 if it fails
-    LOG_PRINTLN("Could not find a valid BME280 sensor, check wiring!");
+  {
+    LOG_PRINTLN("BME280 error!");
     g_malfunctionState = true;
   }
 
@@ -332,23 +298,24 @@ void setup()
   pBLEScan = NimBLEDevice::getScan();
   pBLEScan->setActiveScan(true);
   WiFi.mode(WIFI_AP_STA);
-  WiFi.setSleep(false);
   WiFi.begin(WIFI_SSID_DEFAULT, WIFI_PASS_DEFAULT);
+
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - start < 8000)
     delay(500);
+
   if (WiFi.status() == WL_CONNECTED)
   {
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
     TelnetStream.begin();
     setupOTA();
   }
+
   esp_now_init();
   memcpy(peerInfo.peer_addr, TARGET, 6);
   esp_now_add_peer(&peerInfo);
   esp_task_wdt_init(&twdt_config);
   esp_task_wdt_add(NULL);
-  LOG_PRINTLN(">>> SYSTEM READY. BME280 Active.");
 }
 
 void loop()
@@ -374,14 +341,13 @@ void loop()
   {
     lastLogic = now;
 
-    // Updated Sensor Reading for BME280
     float t = bme.readTemperature();
     g_lastHumidity = bme.readHumidity();
-    g_lastPressure = bme.readPressure() / 100.0F; // Pressure in hPa (hectopascals)
+    g_lastPressure = bme.readPressure() / 100.0F;
 
     if (t > -40 && t < 85)
-    {                         // BME280 range
-      g_lastTempC = t - 1.0f; // Kept the -1 offset from your original script
+    {
+      g_lastTempC = t - 1.0f; // Manual calibration offset
     }
 
     struct tm timeinfo;
@@ -402,12 +368,13 @@ void loop()
       }
       else if (isMorningGap)
       {
-        if (g_phoneDetected && g_fixedSetpoint < 18.0)
+        // If phone is here between 6-10AM, set to 17.0
+        if (g_phoneDetected && g_fixedSetpoint < 16.0)
         {
-          g_fixedSetpoint = 18.0;
+          g_fixedSetpoint = 17.0f;
           saveFixedSetpoint();
         }
-        else if (isWeekend && g_fixedSetpoint != 14.0f)
+        else if (isWeekend && !g_phoneDetected && g_fixedSetpoint != 14.0f)
         {
           g_fixedSetpoint = 14.0f;
           saveFixedSetpoint();
@@ -415,22 +382,25 @@ void loop()
       }
       else
       {
-        if (g_phoneDetected && g_fixedSetpoint < 18.0)
+        // Comfort mode: Phone detected -> 17.0
+        if (g_phoneDetected && g_fixedSetpoint < 16.0)
         {
-          g_fixedSetpoint = 18.0;
+          g_fixedSetpoint = 17.0f;
           saveFixedSetpoint();
         }
-        else if (timeKnown && !g_phoneDetected && g_fixedSetpoint > 15.0)
+        // Economy mode: Phone gone -> 15.0
+        else if (timeKnown && !g_phoneDetected && g_fixedSetpoint > 15.5)
         {
           if (now - g_lastPhoneSeenMs > PHONE_ABSENCE_TIMEOUT_MS)
           {
-            g_fixedSetpoint = 15.0;
+            g_fixedSetpoint = 15.0f;
             saveFixedSetpoint();
           }
         }
       }
     }
 
+    // Hysteresis calculation
     uint8_t desiredAction = g_lastAction;
     if (g_lastTempC < (g_fixedSetpoint - HYST_BAND_C / 2))
       desiredAction = 1;
@@ -457,6 +427,7 @@ void loop()
 
     updateLedDisplay();
 
+    // Send ESP-NOW message to relay
     JsonDocument jtx;
     jtx["heater"] = (g_lastAction == 1) ? "ON" : "OFF";
     jtx["temp"] = g_lastTempC;
@@ -468,7 +439,6 @@ void loop()
   }
 
   // 3. HTTP SYNC
-  // 3. HTTP SYNC (Every 30 Seconds)
   static uint32_t lastHttp = 0;
   if (now - lastHttp > HTTP_SYNC_INTERVAL)
   {
@@ -478,13 +448,7 @@ void loop()
       struct tm t_sync;
       getLocalTime(&t_sync);
       bool night = (t_sync.tm_hour >= 0 && t_sync.tm_hour < 6);
-
-      // Pass g_lastHumidity and g_lastPressure here
       cesanaReportAndFetch(g_lastTempC, (g_lastAction == 1), g_fixedSetpoint, night, g_lastHumidity, g_lastPressure);
-
-      LOG_PRINTF("[%s] T:%.1f H:%.1f P:%.1f SP:%.1f Heat:%s Phone:%s\n",
-                 getLogTime().c_str(), g_lastTempC, g_lastHumidity, g_lastPressure,
-                 g_fixedSetpoint, (g_lastAction == 1) ? "ON" : "OFF", g_phoneDetected ? "YES" : "NO");
     }
   }
 }
