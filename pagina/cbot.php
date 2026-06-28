@@ -2,7 +2,11 @@
 /*************************************************
  * Telegram Bot Configuration
  *************************************************/
+<<<<<<< HEAD
 define('BOT_TOKEN', 'xxx');
+=======
+define('BOT_TOKEN', '8589110198:AAETPSIWj0VXXXXXXXXXXXXXXXXXX');
+>>>>>>> 3be72a65d9d3d329d1729ce2609bcb31769267ef
 define('CHAT_ID', 5629087724);
 
 /*************************************************
