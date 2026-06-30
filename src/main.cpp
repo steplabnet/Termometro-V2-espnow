@@ -17,11 +17,11 @@
 #include <ESPmDNS.h>
 #include <HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <PubSubClient.h>
 #include <Ticker.h>
 #include <time.h>
 #include <Adafruit_NeoPixel.h>
 #include <ArduinoOTA.h>
-#include <NimBLEDevice.h>
 #include <TelnetStream.h>
 #include <esp_task_wdt.h>
 
@@ -40,30 +40,32 @@ static const char *AP_PASS = "12345678";
 static const char *HOSTNAME = "esp32-thermo";
 
 const uint32_t HTTP_SYNC_INTERVAL = 30000;
-const uint32_t BLE_SCAN_INTERVAL = 5000;
 const uint32_t LOGIC_INTERVAL = 10000;
+
+// MQTT Settings
+static const char *MQTT_HOST = "stazionemeteo.local";
+static const uint16_t MQTT_PORT = 1883;
+static const char *MQTT_USER = "stzionemeteo";
+static const char *MQTT_PASS = "78f25d_78";
+static const char *MQTT_TOPIC_OUT = "casa/ufficio/data";
+static const char *MQTT_TOPIC_IN = "casa/ufficio/command";
+const uint32_t MQTT_PUBLISH_INTERVAL = 30000;
 
 const char *ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 3600;
 const int daylightOffset_sec = 3600;
 
-const int BLE_RSSI_THRESHOLD = -75;
-const int BLE_SCAN_TIME = 1;
-#define REQUIRED_HITS 3
-#define HIT_WINDOW_MS 60000
-
 // Logic Settings
 static float g_fixedSetpoint = 17.0f; // UPDATED TO 17
 static String g_fixedPreset = "on";
-static const float HYST_BAND_C = 0.5f;
-const uint32_t PHONE_ABSENCE_TIMEOUT_MS = 60000;
 
 // ======================================================================================
 // GLOBALS
 // ======================================================================================
 Adafruit_BME280 bme;
 WebServer server(80);
-NimBLEScan *pBLEScan = nullptr;
+WiFiClient mqttWifiClient;
+PubSubClient mqtt(mqttWifiClient);
 Adafruit_NeoPixel pixels(1, RGB_PIN, NEO_GRB + NEO_KHZ800);
 Ticker ledBlinker;
 
@@ -74,15 +76,10 @@ volatile float g_lastTempC = NAN;
 volatile float g_lastHumidity = NAN;
 volatile float g_lastPressure = NAN;
 volatile uint8_t g_lastAction = 0;
-bool g_phoneDetected = false;
-int g_currentHits = 0;
 bool g_otaInProgress = false;
 bool g_ledState = false;
 bool g_isBlinking = false;
 uint32_t g_blinkColor = 0;
-uint32_t g_lastPhoneSeenMs = 0;
-unsigned long g_detectionHistory[20] = {0};
-int g_historyIndex = 0;
 bool g_malfunctionState = false;
 
 uint32_t g_lastRelayChangeMs = 0;
@@ -176,12 +173,6 @@ void updateLedDisplay()
     nextColorB = pixels.Color(0, 0, 150);
     nextRate = 0.1;
   }
-  else if (g_currentHits > 0)
-  {
-    nextColorA = g_phoneDetected ? pixels.Color(0, 150, 0) : pixels.Color(0, 0, 150);
-    nextColorB = 0;
-    nextRate = 0.5;
-  }
 
   if (nextColorA != g_colorA || nextColorB != g_colorB || nextRate != g_currentBlinkRate)
   {
@@ -203,43 +194,6 @@ void updateLedDisplay()
   }
 }
 
-void runBleScan()
-{
-  if (g_otaInProgress || pBLEScan == nullptr)
-    return;
-  NimBLEScanResults foundDevices = pBLEScan->start(BLE_SCAN_TIME, false);
-  int nearbyCount = 0;
-  for (int i = 0; i < (int)foundDevices.getCount(); i++)
-  {
-    if (foundDevices.getDevice(i).getRSSI() > BLE_RSSI_THRESHOLD)
-      nearbyCount++;
-  }
-  if (nearbyCount > 0)
-  {
-    g_detectionHistory[g_historyIndex] = millis();
-    g_historyIndex = (g_historyIndex + 1) % 20;
-  }
-  int validHits = 0;
-  unsigned long now = millis();
-  for (int i = 0; i < 20; i++)
-  {
-    if (g_detectionHistory[i] != 0 && (now - g_detectionHistory[i] <= HIT_WINDOW_MS))
-      validHits++;
-  }
-  g_currentHits = validHits;
-  if (validHits >= REQUIRED_HITS)
-  {
-    g_phoneDetected = true;
-    g_lastPhoneSeenMs = millis();
-  }
-  else if (validHits == 0)
-  {
-    g_phoneDetected = false;
-  }
-  updateLedDisplay();
-  pBLEScan->clearResults();
-}
-
 static bool cesanaReportAndFetch(float tempC, bool heating, float realSp, bool isNightMode, float hum, float pres)
 {
   if (WiFi.status() != WL_CONNECTED || g_otaInProgress)
@@ -249,7 +203,6 @@ static bool cesanaReportAndFetch(float tempC, bool heating, float realSp, bool i
   HTTPClient https;
   String url = "https://cesana.steplab.net/get_setpoint.php?temp=" + String(tempC, 1) +
                "&cald=" + (heating ? "1" : "0") +
-               "&phone=" + (g_phoneDetected ? "1" : "0") +
                "&real=" + String(realSp, 1) +
                "&humi=" + String(hum, 1) +
                "&pres=" + String(pres, 1);
@@ -263,16 +216,127 @@ static bool cesanaReportAndFetch(float tempC, bool heating, float realSp, bool i
   return false;
 }
 
+static void sendRelayState()
+{
+  JsonDocument jtx;
+  jtx["heater"] = (g_lastAction == 1) ? "ON" : "OFF";
+  jtx["temp"] = g_lastTempC;
+  jtx["hum"] = g_lastHumidity;
+  jtx["id"] = 12;
+  char buf[128];
+  serializeJson(jtx, buf);
+  esp_now_send(TARGET, (uint8_t *)buf, strlen(buf));
+}
+
+static void mqttCallback(char *topic, byte *payload, unsigned int length)
+{
+  JsonDocument doc;
+  if (deserializeJson(doc, payload, length))
+  {
+    LOG_PRINTLN("MQTT command: bad JSON");
+    return;
+  }
+
+  // Heater (caldaia) ON/OFF — controlled exclusively via MQTT.
+  if (!doc["heater"].isNull())
+  {
+    JsonVariant h = doc["heater"];
+    bool on;
+    if (h.is<bool>())
+      on = h.as<bool>();
+    else
+    {
+      String s = h.as<String>();
+      on = (s.equalsIgnoreCase("ON") || s == "1" || s.equalsIgnoreCase("true"));
+    }
+    g_lastAction = on ? 1 : 0;
+    g_lastRelayChangeMs = millis();
+    updateLedDisplay();
+    sendRelayState(); // push to relay immediately for responsiveness
+    LOG_PRINTF("MQTT heater command: %s\n", on ? "ON" : "OFF");
+  }
+
+  bool changed = false;
+  if (!doc["setpoint"].isNull())
+  {
+    g_fixedSetpoint = doc["setpoint"].as<float>();
+    changed = true;
+  }
+  if (!doc["preset"].isNull())
+  {
+    g_fixedPreset = doc["preset"].as<String>();
+    changed = true;
+  }
+
+  if (changed)
+  {
+    saveFixedSetpoint();
+    LOG_PRINTF("MQTT command applied: setpoint=%.1f preset=%s\n",
+               g_fixedSetpoint, g_fixedPreset.c_str());
+  }
+}
+
+static bool mqttEnsureConnected()
+{
+  if (WiFi.status() != WL_CONNECTED || g_otaInProgress)
+    return false;
+  if (mqtt.connected())
+    return true;
+
+  // Throttle reconnect attempts so we never block the loop for long.
+  static uint32_t lastAttempt = 0;
+  uint32_t now = millis();
+  if (lastAttempt != 0 && now - lastAttempt < 5000)
+    return false;
+  lastAttempt = now;
+
+  String clientId = String(HOSTNAME) + "-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+  if (mqtt.connect(clientId.c_str(), MQTT_USER, MQTT_PASS))
+  {
+    LOG_PRINTLN("MQTT connected");
+    mqtt.subscribe(MQTT_TOPIC_IN);
+    return true;
+  }
+  LOG_PRINTF("MQTT connect failed, rc=%d\n", mqtt.state());
+  return false;
+}
+
+static void mqttPublishState()
+{
+  if (!mqttEnsureConnected())
+    return;
+
+  JsonDocument doc;
+  doc["temp"] = g_lastTempC;
+  doc["hum"] = g_lastHumidity;
+  doc["pres"] = g_lastPressure;
+  doc["setpoint"] = g_fixedSetpoint;
+  doc["heater"] = (g_lastAction == 1) ? "ON" : "OFF";
+  doc["preset"] = g_fixedPreset;
+  doc["malfunction"] = g_malfunctionState;
+  doc["time"] = getLogTime();
+
+  char buf[256];
+  size_t n = serializeJson(doc, buf);
+
+  if (mqtt.publish(MQTT_TOPIC_OUT, buf, n))
+  {
+    LOG_PRINTLN("MQTT state published");
+  }
+  else
+  {
+    LOG_PRINTLN("MQTT publish failed");
+  }
+}
+
 void setupOTA()
 {
   ArduinoOTA.setHostname(HOSTNAME);
   ArduinoOTA.onStart([]()
                      {
     g_otaInProgress = true;
-    esp_task_wdt_delete(NULL); 
+    esp_task_wdt_delete(NULL);
     esp_task_wdt_deinit();
-    if(pBLEScan) pBLEScan->stop();
-    NimBLEDevice::deinit(true);
     esp_now_deinit();
     ledBlinker.detach();
     pixels.setPixelColor(0, pixels.Color(150, 0, 255)); pixels.show(); });
@@ -294,9 +358,6 @@ void setup()
     g_malfunctionState = true;
   }
 
-  NimBLEDevice::init(HOSTNAME);
-  pBLEScan = NimBLEDevice::getScan();
-  pBLEScan->setActiveScan(true);
   WiFi.mode(WIFI_AP_STA);
   WiFi.begin(WIFI_SSID_DEFAULT, WIFI_PASS_DEFAULT);
 
@@ -309,6 +370,9 @@ void setup()
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
     TelnetStream.begin();
     setupOTA();
+    mqtt.setServer(MQTT_HOST, MQTT_PORT);
+    mqtt.setBufferSize(256);
+    mqtt.setCallback(mqttCallback);
   }
 
   esp_now_init();
@@ -325,17 +389,13 @@ void loop()
     return;
   esp_task_wdt_reset();
   server.handleClient();
+  mqtt.loop();
   uint32_t now = millis();
 
-  // 1. BLE SCAN
-  static uint32_t lastBle = 0;
-  if (now - lastBle > BLE_SCAN_INTERVAL)
-  {
-    lastBle = now;
-    runBleScan();
-  }
-
-  // 2. THERMOSTAT LOGIC
+  // 1. SENSOR READ + RELAY REFRESH
+  //    The heater (caldaia) is controlled exclusively via MQTT commands
+  //    (see mqttCallback). Here we only refresh sensor readings and
+  //    periodically re-send the current heater state to the relay.
   static uint32_t lastLogic = 0;
   if (now - lastLogic > LOGIC_INTERVAL)
   {
@@ -350,95 +410,11 @@ void loop()
       g_lastTempC = t - 1.0f; // Manual calibration offset
     }
 
-    struct tm timeinfo;
-    bool timeKnown = getLocalTime(&timeinfo);
-    bool isNightMode = (timeKnown && timeinfo.tm_hour >= 0 && timeinfo.tm_hour < 6);
-    bool isMorningGap = (timeKnown && timeinfo.tm_hour >= 6 && timeinfo.tm_hour < 10);
-    bool isWeekend = (timeKnown && (timeinfo.tm_wday == 0 || timeinfo.tm_wday == 6));
-
-    if (!g_malfunctionState)
-    {
-      if (isNightMode)
-      {
-        if (g_fixedSetpoint != 10.0f)
-        {
-          g_fixedSetpoint = 10.0f;
-          saveFixedSetpoint();
-        }
-      }
-      else if (isMorningGap)
-      {
-        // If phone is here between 6-10AM, set to 17.0
-        if (g_phoneDetected && g_fixedSetpoint < 16.0)
-        {
-          g_fixedSetpoint = 17.0f;
-          saveFixedSetpoint();
-        }
-        else if (isWeekend && !g_phoneDetected && g_fixedSetpoint != 14.0f)
-        {
-          g_fixedSetpoint = 14.0f;
-          saveFixedSetpoint();
-        }
-      }
-      else
-      {
-        // Comfort mode: Phone detected -> 17.0
-        if (g_phoneDetected && g_fixedSetpoint < 16.0)
-        {
-          g_fixedSetpoint = 17.0f;
-          saveFixedSetpoint();
-        }
-        // Economy mode: Phone gone -> 15.0
-        else if (timeKnown && !g_phoneDetected && g_fixedSetpoint > 15.5)
-        {
-          if (now - g_lastPhoneSeenMs > PHONE_ABSENCE_TIMEOUT_MS)
-          {
-            g_fixedSetpoint = 15.0f;
-            saveFixedSetpoint();
-          }
-        }
-      }
-    }
-
-    // Hysteresis calculation
-    uint8_t desiredAction = g_lastAction;
-    if (g_lastTempC < (g_fixedSetpoint - HYST_BAND_C / 2))
-      desiredAction = 1;
-    else if (g_lastTempC > (g_fixedSetpoint + HYST_BAND_C / 2))
-      desiredAction = 0;
-
-    if (desiredAction != g_lastAction)
-    {
-      if (now - g_lastRelayChangeMs >= MIN_RELAY_TIME)
-      {
-        g_lastAction = desiredAction;
-        g_lastRelayChangeMs = now;
-        g_waitingForTimer = false;
-      }
-      else
-      {
-        g_waitingForTimer = true;
-      }
-    }
-    else
-    {
-      g_waitingForTimer = false;
-    }
-
     updateLedDisplay();
-
-    // Send ESP-NOW message to relay
-    JsonDocument jtx;
-    jtx["heater"] = (g_lastAction == 1) ? "ON" : "OFF";
-    jtx["temp"] = g_lastTempC;
-    jtx["hum"] = g_lastHumidity;
-    jtx["id"] = 12;
-    char buf[128];
-    serializeJson(jtx, buf);
-    esp_now_send(TARGET, (uint8_t *)buf, strlen(buf));
+    sendRelayState();
   }
 
-  // 3. HTTP SYNC
+  // 2. HTTP SYNC
   static uint32_t lastHttp = 0;
   if (now - lastHttp > HTTP_SYNC_INTERVAL)
   {
@@ -450,5 +426,13 @@ void loop()
       bool night = (t_sync.tm_hour >= 0 && t_sync.tm_hour < 6);
       cesanaReportAndFetch(g_lastTempC, (g_lastAction == 1), g_fixedSetpoint, night, g_lastHumidity, g_lastPressure);
     }
+  }
+
+  // 3. MQTT PUBLISH
+  static uint32_t lastMqtt = 0;
+  if (now - lastMqtt > MQTT_PUBLISH_INTERVAL)
+  {
+    lastMqtt = now;
+    mqttPublishState();
   }
 }

@@ -94,15 +94,26 @@ function computeAutoSetpoint($schedule, $manualSetpoint) {
     return (float)($chosen['setpoint'] ?? $manualSetpoint);
 }
 
-// Generic function to append history and keep backups in sync
-function append_history_log($file, $backup, $val, $minDelta = 600) {
+// Generic function to append history and keep backups in sync.
+// $minDelta: min seconds between logged points. $maxLines: if >0, trim the
+// CSV to the most recent N rows after appending (bounds unbounded growth).
+function append_history_log($file, $backup, $val, $minDelta = 600, $maxLines = 0) {
     $now = time();
-    // Only log if the file hasn't been updated in the last 10 minutes (600s)
+    // Only log if the file hasn't been updated within $minDelta seconds.
     if (file_exists($file) && filemtime($file) > $now - $minDelta) return;
-    
+
     $line = "$now," . number_format($val, 2, '.', '') . "\n";
     file_put_contents($file, $line, FILE_APPEND);
-    
+
+    // Keep the file bounded when requested.
+    if ($maxLines > 0) {
+        $rows = file($file, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
+        if ($rows !== false && count($rows) > $maxLines) {
+            $rows = array_slice($rows, -$maxLines);
+            file_put_contents($file, implode("\n", $rows) . "\n");
+        }
+    }
+
     // Periodically sync the CSV to disk backup
     copy($file, $backup);
 }
@@ -153,7 +164,10 @@ if ($humiParam !== null) {
 if ($presParam !== null) {
     $val = round((float)$presParam, 1);
     $state['pres'] = $val;
-    append_history_log($presHistoryFile, $presHistoryBackup, $val);
+    // Log every ~60s (board reports every 30s) so the 3h trend has enough
+    // samples to median-average. Far finer than the 600s default.
+    // Cap at 2000 rows (~33h at 60s) -> plenty for the 3h trend + a day of graph.
+    append_history_log($presHistoryFile, $presHistoryBackup, $val, 60, 2000);
     $updated = true;
 }
 

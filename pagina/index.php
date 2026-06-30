@@ -76,41 +76,80 @@ $stateFile = '/dev/shm/thermo_data/state.json';
 $presHistoryFile = '/dev/shm/thermo_data/pres_history.csv';
 $safePres0 = 1013.0;
 $presTrend3h = 0.0;
+$presTrendValid = false;   // true only when both endpoints are trustworthy
 
+// Displayed "current" pressure (from the live state file).
 if (file_exists($stateFile)) {
   $stateJson = json_decode((string) file_get_contents($stateFile), true);
   if (isset($stateJson['pres'])) $safePres0 = (float) $stateJson['pres'];
 }
 
+// --- Robust 3h trend ---------------------------------------------------------
+// Parse the history CSV ("timestamp,pressure") into a clean list.
+$pHist = [];
 if (file_exists($presHistoryFile)) {
-  $pRows = file($presHistoryFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES);
-  $targetTs = time() - 10800;
-  $oldP = null;
-  foreach (array_reverse($pRows) as $pr) {
+  foreach (file($presHistoryFile, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) as $pr) {
     $pParts = explode(',', $pr);
-    if ((int) $pParts[0] <= $targetTs) { $oldP = (float) $pParts[1]; break; }
+    if (count($pParts) >= 2 && is_numeric($pParts[0]) && is_numeric($pParts[1])) {
+      $pHist[] = [(int) $pParts[0], (float) $pParts[1]];
+    }
   }
-  if ($oldP !== null) $presTrend3h = $safePres0 - $oldP;
+}
+
+// Median pressure of all samples within +/- $halfWin seconds of $centerTs.
+// Median (not mean) rejects single spikes; the window averages out sensor jitter.
+$presMedianAround = function (int $centerTs, int $halfWin) use ($pHist) {
+  $vals = [];
+  foreach ($pHist as $row) {
+    if (abs($row[0] - $centerTs) <= $halfWin) $vals[] = $row[1];
+  }
+  if (!$vals) return null;
+  sort($vals);
+  $n = count($vals);
+  return ($n % 2) ? $vals[intdiv($n, 2)] : ($vals[$n / 2 - 1] + $vals[$n / 2]) / 2.0;
+};
+
+if ($pHist) {
+  $nowTs = time();
+  // Both endpoints come from the SAME series (shared calibration).
+  // Logger cadence is ~10 min, so windows are sized to hold a few samples and
+  // tolerate one missed tick:
+  //   "now": median of the last ~20 min -> also rejects a stale/dead logger.
+  //   "3h ago": median within +/- 30 min of the 3h mark, else we don't trust it.
+  $pNow = $presMedianAround($nowTs, 1200);
+  $pOld = $presMedianAround($nowTs - 10800, 1800);
+  if ($pNow !== null && $pOld !== null) {
+    $presTrend3h = $pNow - $pOld;
+    $presTrendValid = true;
+  }
 }
 
 $mslp = $safePres0 + 31.8 - 2.5;
 
-// >>> USE TEMPERATURA SOLE as reference for snow/precip type <<<
-$outTemp = $safeTemp0;
+// >>> USE TEMPERATURA OMBRA (shade air temp) as reference; fall back to sun sensor <<<
+// The shade sensor is the true air temperature; the sun-exposed probe over-reads.
+$outTemp = ($safeTMobile0 > -99) ? $safeTMobile0 : $safeTemp0;
 
 // humidity numeric
 $humi = is_numeric($safeHombra0) ? (float)$safeHombra0 : 0.0;
+$humiValid = ($humi > 0);
+
+// Humidity gating: precipitation needs moisture in the air.
+// If the sensor is invalid we don't block (treat as "moist enough").
+$moistAir = (!$humiValid || $humi >= 70);
+$dryAir   = ($humiValid && $humi < 55);
 
 // default
 $forecast = ['icon' => 'cloud', 'text' => 'Variabile', 'color' => 'var(--text-muted)'];
 
-// snow heuristics
+// snow heuristics (shade temp + falling pressure + high humidity)
 $snowLikely = false;
 if ($outTemp > -99) {
   if ($outTemp <= 1.5 && $presTrend3h <= -0.3 && $humi >= 75) $snowLikely = true;
   if ($outTemp <= 0.0 && $presTrend3h <= -0.2 && $humi >= 65) $snowLikely = true;
 }
-$stormLikely = ($presTrend3h <= -1.5);
+// A storm needs both a sharp pressure drop AND moisture.
+$stormLikely = ($presTrend3h <= -1.5 && $moistAir);
 
 if ($snowLikely) {
   $forecast = ['icon' => 'snow', 'text' => 'Neve', 'color' => 'var(--accent-ice)'];
@@ -122,15 +161,28 @@ elseif ($stormLikely) {
     $forecast = ['icon' => 'storm', 'text' => 'Temporale', 'color' => 'var(--accent-red)'];
   }
 }
-elseif ($presTrend3h <= -0.5) {
+elseif ($presTrend3h <= -0.5 && $moistAir) {
   if ($outTemp <= 1.0) {
     $forecast = ['icon' => 'sleet', 'text' => 'Nevischio', 'color' => 'var(--accent-ice)'];
   } else {
     $forecast = ['icon' => 'rain', 'text' => 'Pioggia', 'color' => 'var(--accent-blue)'];
   }
 }
-elseif ($mslp > 1022) {
+elseif ($presTrend3h <= -0.5 && $dryAir) {
+  // Pressure dropping but the air is dry -> clouds building, not rain yet.
+  $forecast = ['icon' => 'cloud', 'text' => 'Nuvoloso', 'color' => 'var(--text-muted)'];
+}
+elseif ($humiValid && $humi >= 95 && abs($presTrend3h) < 0.4 && $mslp <= 1022 && $outTemp <= 8.0) {
+  // Saturated, calm and cool -> fog / mist.
+  $forecast = ['icon' => 'cloud', 'text' => 'Nebbia', 'color' => 'var(--text-muted)'];
+}
+elseif ($mslp > 1022 && $dryAir) {
+  // High pressure + dry air -> confidently clear.
   $forecast = ['icon' => 'sun', 'text' => 'Sereno', 'color' => 'var(--accent-orange)'];
+}
+elseif ($mslp > 1022) {
+  // High pressure but humid -> hazy / veiled sun.
+  $forecast = ['icon' => 'partly_cloudy', 'text' => 'Velato', 'color' => 'var(--accent-orange)'];
 }
 elseif ($mslp > 1016 && $presTrend3h > -0.2) {
   $forecast = ['icon' => 'partly_cloudy', 'text' => 'Poco Nuvoloso', 'color' => 'var(--accent-orange)'];
@@ -139,14 +191,95 @@ elseif ($presTrend3h >= 0.5) {
   $forecast = ['icon' => 'partly_cloudy', 'text' => 'In Miglioramento', 'color' => 'var(--accent-orange)'];
 }
 elseif ($mslp < 1008) {
-  if ($outTemp <= 1.0) {
+  if (!$moistAir) {
+    // Low pressure but dry -> unsettled/cloudy rather than wet.
+    $forecast = ['icon' => 'cloud', 'text' => 'Nuvoloso', 'color' => 'var(--text-muted)'];
+  } elseif ($outTemp <= 1.0) {
     $forecast = ['icon' => 'sleet', 'text' => 'Instabile (freddo)', 'color' => 'var(--accent-ice)'];
   } else {
     $forecast = ['icon' => 'rain', 'text' => 'Instabile', 'color' => 'var(--accent-blue)'];
   }
 }
 
+/** ---------- PV AS SOLAR-IRRADIANCE / SKY-NOW PROXY ---------- */
+// Photovoltaic output is a direct read of how much sun is hitting the panel.
+// To judge cloud cover we compare it against the CLEAR-SKY output expected for
+// THIS time of day, estimated from the best output seen at the same clock hour
+// over the past 7 days. This normalises for sun elevation, so a clear morning
+// or evening is no longer mistaken for cloud, and night falls out for free
+// (no historical output at this hour -> no reference -> no classification).
+$pvNow = $safePower0;
+
+$hourWindows = [];
+for ($k = 1; $k <= 7; $k++) {
+  $lo = $now - ($k * 86400) - 1800;   // same clock time k days ago, +/- 30 min
+  $hi = $now - ($k * 86400) + 1800;
+  $hourWindows[] = "(data BETWEEN {$lo} AND {$hi})";
+}
+$qHourPeak = "SELECT MAX(power + 0) AS hour_peak FROM dati_meteo WHERE (" . implode(' OR ', $hourWindows) . ")";
+$resHP = $link->query($qHourPeak);
+$hourPeak = ($resHP && $rHP = $resHP->fetch_assoc()) ? (float) ($rHP['hour_peak'] ?? 0) : 0.0;
+
+// Fraction of the clear-sky reference we are actually producing right now.
+// Need a meaningful reference (>20 W) or we can't tell (deep night / no data).
+$sunFrac = ($hourPeak > 20 && $pvNow >= 0) ? min(1.0, $pvNow / $hourPeak) : null;
+$sunPct  = ($sunFrac !== null) ? (int) round($sunFrac * 100) : null;
+
+$skyNow = null; // ['text' => ..., 'color' => ...]
+if ($sunFrac !== null) {
+  if ($sunFrac >= 0.70) {
+    $skyNow = ['text' => 'Sereno',        'color' => 'var(--accent-orange)'];
+  } elseif ($sunFrac >= 0.40) {
+    $skyNow = ['text' => 'Poco Nuvoloso', 'color' => 'var(--accent-orange)'];
+  } elseif ($sunFrac >= 0.15) {
+    $skyNow = ['text' => 'Nuvoloso',      'color' => 'var(--text-muted)'];
+  } else {
+    $skyNow = ['text' => 'Coperto',       'color' => 'var(--text-muted)'];
+  }
+}
+
 $iceWarning = ($outTemp > -99 && $outTemp <= 0.0);
+
+/**
+ * Estimate WHEN the forecast change is expected, from the rate of the
+ * 3h pressure trend. A steeper drop/rise means the system is closer.
+ * Returns '' for stable conditions (nothing to time).
+ */
+function getForecastTiming(array $forecast, float $presTrend3h): string {
+  $worsening = ['snow', 'snow_storm', 'storm', 'sleet', 'rain'];
+
+  if (in_array($forecast['icon'], $worsening, true)) {
+    $drop = abs($presTrend3h);
+    if      ($drop >= 1.5) { $lo = 1; $hi = 2;  }   // very rapid -> imminent
+    elseif  ($drop >= 0.8) { $lo = 2; $hi = 4;  }
+    elseif  ($drop >= 0.5) { $lo = 4; $hi = 8;  }
+    else                   { $lo = 8; $hi = 14; }   // slow drift
+    $eta = date('H:i', time() + (int)((($lo + $hi) / 2) * 3600));
+    return "tra ~{$lo}-{$hi} h (verso le {$eta})";
+  }
+
+  // Clouds building on a falling barometer -> time the expected worsening.
+  if ($forecast['text'] === 'Nuvoloso' && $presTrend3h <= -0.3) {
+    $drop = abs($presTrend3h);
+    if      ($drop >= 1.5) { $lo = 1; $hi = 2;  }
+    elseif  ($drop >= 0.8) { $lo = 2; $hi = 4;  }
+    elseif  ($drop >= 0.5) { $lo = 4; $hi = 8;  }
+    else                   { $lo = 6; $hi = 12; }
+    $eta = date('H:i', time() + (int)((($lo + $hi) / 2) * 3600));
+    return "peggioramento tra ~{$lo}-{$hi} h (verso le {$eta})";
+  }
+
+  if ($forecast['text'] === 'In Miglioramento') {
+    $rise = abs($presTrend3h);
+    if ($rise >= 1.0) { $lo = 2; $hi = 4; } else { $lo = 4; $hi = 8; }
+    $eta = date('H:i', time() + (int)((($lo + $hi) / 2) * 3600));
+    return "schiarite tra ~{$lo}-{$hi} h (verso le {$eta})";
+  }
+
+  return '';
+}
+
+$forecastTiming = getForecastTiming($forecast, $presTrend3h);
 
 /** ---------- 4. TRENDS & FILTERS ---------- */
 $time30mAgo = $now - 1800;
@@ -372,6 +505,12 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
           <?php echo $forecast['text']; ?>
         </div>
 
+        <?php if (!empty($forecastTiming)): ?>
+          <div style="margin-top:3px; font-size:0.68rem; color:var(--text-muted);">
+            &#128337; <?php echo $forecastTiming; ?>
+          </div>
+        <?php endif; ?>
+
         <?php if (!empty($iceWarning)): ?>
           <div style="margin-top:4px; font-size:0.7rem; font-weight:700; color:var(--accent-ice);">
             &#10052; Rischio gelo
@@ -380,7 +519,7 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
 
         <div class="minmax-row">
             <div class="minmax-item"><span class="minmax-label">Liv. Mare</span><span class="minmax-val"><?php echo number_format($mslp, 1); ?></span></div>
-            <div class="minmax-item"><span class="minmax-label">Trend 3h</span><span class="minmax-val <?php echo ($presTrend3h < 0 ? 'trend-down' : 'trend-up'); ?>"><?php echo ($presTrend3h > 0 ? '+': '') . number_format($presTrend3h, 1); ?></span></div>
+            <div class="minmax-item"><span class="minmax-label">Trend 3h</span><span class="minmax-val <?php echo ($presTrendValid ? ($presTrend3h < 0 ? 'trend-down' : 'trend-up') : ''); ?>"><?php echo $presTrendValid ? (($presTrend3h > 0 ? '+' : '') . number_format($presTrend3h, 1)) : 'n/d'; ?></span></div>
         </div>
       </div>
     </div>
@@ -416,10 +555,20 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
     <div class="card-label">Potenza Fotovoltaico</div>
     <div class="card-value"><?php echo $safePower0; ?><span class="card-unit">W</span></div>
 
+    <?php if ($skyNow !== null): ?>
+      <div style="font-weight:800; font-size:0.75rem; color:<?php echo $skyNow['color']; ?>; margin-top:5px; text-transform:uppercase;">
+        &#9728; <?php echo $skyNow['text']; ?>
+      </div>
+    <?php endif; ?>
+
     <div class="minmax-row">
       <div class="minmax-item">
         <span class="minmax-label">Picco 24h</span>
         <span class="minmax-val"><?php echo $mm_max_power; ?> W</span>
+      </div>
+      <div class="minmax-item">
+        <span class="minmax-label">Irraggiamento</span>
+        <span class="minmax-val"><?php echo ($sunPct !== null ? $sunPct . '%' : '--'); ?></span>
       </div>
     </div>
   </a>
