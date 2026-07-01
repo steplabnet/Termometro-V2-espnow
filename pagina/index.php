@@ -414,6 +414,8 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
     .border-humi { border-top-color: var(--accent-teal); }
     .border-water { border-top-color: var(--accent-blue); }
     .river-dry { border-top-color: var(--accent-dry); }
+    .border-feedback { border-top-color: var(--accent-purple); }
+    .icon-feedback { color: var(--accent-purple); }
   </style>
 </head>
 <body>
@@ -615,6 +617,21 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
             <div class="minmax-item"><span class="minmax-label">Min</span><span class="minmax-val val-min"><?php echo $mm_min_tombra; ?>°</span></div>
             <div class="minmax-item"><span class="minmax-label">Trend</span><?php echo getTrendHtml($trend_tombra, '°C/h', $iceTime_tombra); ?></div>
             <div class="minmax-item"><span class="minmax-label">Max</span><span class="minmax-val val-max"><?php echo $mm_max_tombra; ?>°</span></div>
+        </div>
+      </a>
+    </div>
+
+    <!-- 8. Feedback Previsioni -->
+    <div class="card border-feedback">
+      <a href="feedback.php">
+        <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-feedback" viewBox="0 0 24 24" fill="currentColor"><path d="M20 2H4a2 2 0 0 0-2 2v18l4-4h14a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2zM9.5 12.5l-2.5-3 1.4-1.1 1 1.3 3.2-3.9 1.4 1.2-4.5 5.5z"/></svg>
+        <div class="card-label">Feedback Previsioni</div>
+        <div class="card-value" style="font-size:1.3rem; margin-top:6px;">Com'è il cielo?</div>
+        <div style="font-weight:600; font-size:0.78rem; color:var(--text-muted); margin-top:8px; text-align:center;">
+          Segnala il meteo reale<br>per tarare l'algoritmo
+        </div>
+        <div class="minmax-row">
+            <div class="minmax-item"><span class="minmax-label">Previsto ora</span><span class="minmax-val" style="color:<?php echo $forecast['color']; ?>"><?php echo $forecast['text']; ?></span></div>
         </div>
       </a>
     </div>
