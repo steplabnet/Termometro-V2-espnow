@@ -111,6 +111,7 @@ if (isset($_GET['ok'])) {
 $in       = gatherForecastInputs($link);
 $forecast = computeForecast($in);
 $skyNow   = computeSkyNow($in['sun_frac'] !== null ? (float)$in['sun_frac'] : null);
+$fb       = computeForecastFeedback($link, $in, $forecast);   // calcolo + feedback
 
 function f($v, $d = 1, $na = '--') {
     return is_numeric($v) ? number_format((float)$v, $d) : $na;
@@ -188,6 +189,10 @@ $pvAccuracy = $pvTotal > 0 ? round(100 * $pvHits / $pvTotal) : null;
     .pred{text-align:center;margin-bottom:6px}
     .pred .lbl{font-size:.7rem;text-transform:uppercase;color:var(--text-muted);letter-spacing:.5px}
     .pred .val{font-size:1.5rem;font-weight:800}
+    .corr{font-size:.72rem;color:var(--text-muted);margin-top:8px;line-height:1.4}
+    .corr b{color:var(--text-main)}
+    .corr.ok{color:#059669}
+    .corr.faint{opacity:.7}
     .prompt{text-align:center;font-weight:700;margin:18px 0 12px}
     .opts{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:12px}
     .opt{border:0;cursor:pointer;background:var(--bg-color);border-radius:14px;padding:16px 8px;font-family:inherit;font-size:.85rem;font-weight:700;color:var(--text-main);transition:transform .15s,box-shadow .15s;display:flex;flex-direction:column;align-items:center;gap:6px}
@@ -220,8 +225,22 @@ $pvAccuracy = $pvTotal > 0 ? round(100 * $pvHits / $pvTotal) : null;
   <!-- Submission form -->
   <div class="card">
     <div class="pred">
-      <div class="lbl">Previsione attuale dell'algoritmo</div>
-      <div class="val" style="color:<?php echo $forecast['color']; ?>"><?php echo htmlspecialchars($forecast['text']); ?></div>
+      <div class="lbl"><?php echo $fb['corrected'] ? 'Previsione (calcolo + feedback)' : 'Previsione attuale dell\'algoritmo'; ?></div>
+      <div class="val" style="color:<?php echo $fb['color']; ?>"><?php echo htmlspecialchars($fb['label']); ?></div>
+      <?php if ($fb['corrected']): ?>
+        <div class="corr">
+          🔄 Calcolo: «<?php echo htmlspecialchars($forecast['text']); ?>» → corretto dal feedback
+          <?php if ($fb['confidence'] !== null): ?> · fiducia <b><?php echo (int)$fb['confidence']; ?>%</b><?php endif; ?>
+          · <?php echo (int)$fb['neighbors']; ?> oss. simili
+        </div>
+      <?php elseif ($fb['neighbors'] >= 2): ?>
+        <div class="corr ok">
+          ✓ <?php echo htmlspecialchars($fb['reason']); ?>
+          <?php if ($fb['confidence'] !== null): ?> · fiducia <b><?php echo (int)$fb['confidence']; ?>%</b><?php endif; ?>
+        </div>
+      <?php else: ?>
+        <div class="corr faint"><?php echo htmlspecialchars($fb['reason']); ?></div>
+      <?php endif; ?>
     </div>
 
     <div class="now-grid">

@@ -183,3 +183,181 @@ function computeSkyNow(?float $sunFrac): ?array {
     if ($sunFrac >= 0.15) return ['text' => 'Nuvoloso',      'color' => 'var(--text-muted)'];
     return ['text' => 'Coperto', 'color' => 'var(--text-muted)'];
 }
+
+/* ==========================================================================
+ * FEEDBACK CORRECTION LAYER
+ * --------------------------------------------------------------------------
+ * Combines the rule ladder ("calculus") with the logged ground-truth
+ * observations to nudge the forecast. It does NOT retrain the rules; it is a
+ * lightweight weighted-analog (kernel kNN) vote:
+ *
+ *   1. Compare the current signals to every past feedback row and weight each
+ *      by similarity (Gaussian kernel over normalized mslp/trend/humi/temp/PV).
+ *   2. Vote on the observed outcome, weighted by that similarity.
+ *   3. Seed the vote with the rule's own prediction as a PRIOR pseudo-count,
+ *      so with little data the calculus dominates (shrinkage).
+ *   4. Override the rule ONLY when the similar-evidence and confidence both
+ *      clear conservative thresholds; otherwise return the rule unchanged.
+ *
+ * Tuned deliberately timid because the feedback set is tiny (<30 rows): it
+ * takes several genuinely-similar, agreeing observations to flip a label.
+ * ========================================================================== */
+
+/** Display color for an observed-vocabulary label (mirrors feedback.php $OPTIONS). */
+function observedColor(string $label): string {
+    static $m = [
+        'Sereno'        => 'var(--accent-orange)',
+        'Poco Nuvoloso' => 'var(--accent-orange)',
+        'Nuvoloso'      => 'var(--text-muted)',
+        'Coperto'       => 'var(--text-muted)',
+        'Nebbia'        => 'var(--text-muted)',
+        'Pioggia'       => 'var(--accent-blue)',
+        'Temporale'     => 'var(--accent-red)',
+        'Nevischio'     => 'var(--accent-ice)',
+        'Neve'          => 'var(--accent-ice)',
+    ];
+    return $m[$label] ?? 'var(--text-muted)';
+}
+
+/**
+ * Map a rule-engine label (richer vocabulary) down to the 9-label observed
+ * vocabulary, so the rule prediction can seed the feedback vote as a prior.
+ */
+function ruleToObserved(string $ruleText): string {
+    switch ($ruleText) {
+        case 'Sereno':             return 'Sereno';
+        case 'Velato':             return 'Poco Nuvoloso';
+        case 'Poco Nuvoloso':      return 'Poco Nuvoloso';
+        case 'In Miglioramento':   return 'Poco Nuvoloso';
+        case 'Variabile':          return 'Nuvoloso';
+        case 'Nuvoloso':           return 'Nuvoloso';
+        case 'Nebbia':             return 'Nebbia';
+        case 'Pioggia':            return 'Pioggia';
+        case 'Instabile':          return 'Pioggia';
+        case 'Instabile (freddo)': return 'Nevischio';
+        case 'Nevischio':          return 'Nevischio';
+        case 'Temporale':          return 'Temporale';
+        case 'Bufera':             return 'Neve';
+        case 'Neve':               return 'Neve';
+        default:                   return 'Nuvoloso';
+    }
+}
+
+/**
+ * Blend the rule forecast with the logged feedback.
+ *
+ * @param array $ruleForecast the output of computeForecast() (['icon','text','color'])
+ * @return array {
+ *   corrected:  bool    the feedback overrode the rule
+ *   label:      string  final label to show (observed vocab if corrected, else rule text)
+ *   color:      string  css color for `label`
+ *   confidence: ?int    0..100 share of the winning label, null if no signals scored
+ *   neighbors:  int     number of clearly-similar past rows
+ *   evidence:   float   total similarity weight gathered
+ *   reason:     string  short Italian explanation for the UI
+ * }
+ */
+function computeForecastFeedback(mysqli $link, array $in, array $ruleForecast): array {
+    // Tunables — conservative on purpose: the feedback set is tiny.
+    $SCALES     = ['mslp' => 8.0, 'trend3h' => 1.0, 'humi' => 15.0, 't_shade' => 8.0, 'sun_frac' => 0.25];
+    $KERNEL_MIN = 0.20;   // min kernel weight for a row to count as a "similar" neighbor
+    $PRIOR_W    = 2.5;    // pseudo-weight given to the rule prediction (shrinkage strength)
+    $MIN_EVID   = 1.5;    // total neighbor weight required before feedback is trusted at all
+    $MIN_NEIGH  = 2;      // and at least this many clearly-similar rows
+    $MIN_CONF   = 55;     // % confidence the winner must reach to override the rule
+
+    $ruleText   = (string)$ruleForecast['text'];
+    $ruleBucket = ruleToObserved($ruleText);
+
+    $out = [
+        'corrected'  => false,
+        'label'      => $ruleText,
+        'color'      => (string)$ruleForecast['color'],
+        'confidence' => null,
+        'neighbors'  => 0,
+        'evidence'   => 0.0,
+        'reason'     => 'Nessuna osservazione simile — solo calcolo',
+    ];
+
+    // Current signals.
+    $cMslp   = (float)$in['mslp'];
+    $cTrend  = (float)$in['trend3h'];
+    $cTrendV = !empty($in['trend_valid']);
+    $cHumi   = (float)$in['humi'];
+    $cTemp   = (float)$in['t_shade'];
+    $cSun    = ($in['sun_frac'] !== null) ? (float)$in['sun_frac'] : null;
+
+    $res = $link->query(
+        "SELECT observed, mslp, trend3h, trend_valid, humi, t_shade, sun_frac FROM forecast_feedback"
+    );
+    if (!($res instanceof mysqli_result)) return $out;
+
+    $scores    = [];    // observed label -> summed kernel weight
+    $evidence  = 0.0;   // total weight across all rows
+    $neighbors = 0;     // rows with weight >= KERNEL_MIN
+
+    while ($r = $res->fetch_assoc()) {
+        $obs = (string)$r['observed'];
+        if ($obs === '') continue;
+
+        // Mean squared normalized distance over the signals both rows share.
+        $d2 = 0.0; $dims = 0;
+        if ($r['mslp'] !== null) {
+            $d = ($cMslp - (float)$r['mslp']) / $SCALES['mslp'];       $d2 += $d * $d; $dims++;
+        }
+        if ($cTrendV && (int)$r['trend_valid'] === 1 && $r['trend3h'] !== null) {
+            $d = ($cTrend - (float)$r['trend3h']) / $SCALES['trend3h']; $d2 += $d * $d; $dims++;
+        }
+        if ($cHumi > 0 && $r['humi'] !== null && (float)$r['humi'] > 0) {
+            $d = ($cHumi - (float)$r['humi']) / $SCALES['humi'];        $d2 += $d * $d; $dims++;
+        }
+        if ($cTemp > -99 && $r['t_shade'] !== null && (float)$r['t_shade'] > -99) {
+            $d = ($cTemp - (float)$r['t_shade']) / $SCALES['t_shade'];  $d2 += $d * $d; $dims++;
+        }
+        if ($cSun !== null && $r['sun_frac'] !== null && $r['sun_frac'] !== '') {
+            $d = ($cSun - (float)$r['sun_frac']) / $SCALES['sun_frac']; $d2 += $d * $d; $dims++;
+        }
+        if ($dims === 0) continue;
+
+        $w = exp(-0.5 * ($d2 / $dims));   // Gaussian kernel: 1.0 at identical signals
+        if ($w < 0.05) continue;          // negligible, skip
+
+        $scores[$obs] = ($scores[$obs] ?? 0.0) + $w;
+        $evidence    += $w;
+        if ($w >= $KERNEL_MIN) $neighbors++;
+    }
+
+    // Seed the rule prediction as a prior so scarce data can't flip the label.
+    $scores[$ruleBucket] = ($scores[$ruleBucket] ?? 0.0) + $PRIOR_W;
+
+    // Argmax over the weighted vote.
+    $best = $ruleBucket; $bestScore = -1.0; $total = 0.0;
+    foreach ($scores as $lab => $sc) {
+        $total += $sc;
+        if ($sc > $bestScore) { $bestScore = $sc; $best = $lab; }
+    }
+
+    $out['neighbors']  = $neighbors;
+    $out['evidence']   = round($evidence, 2);
+    $out['confidence'] = $total > 0 ? (int)round(100 * $bestScore / $total) : null;
+
+    // Not enough trustworthy evidence → keep the pure calculus.
+    if ($evidence < $MIN_EVID || $neighbors < $MIN_NEIGH) {
+        $out['reason'] = $evidence > 0
+            ? "Feedback scarso ({$neighbors} oss. simili) — prevale il calcolo"
+            : 'Nessuna osservazione simile — solo calcolo';
+        return $out;
+    }
+
+    if ($best !== $ruleBucket && $out['confidence'] !== null && $out['confidence'] >= $MIN_CONF) {
+        $out['corrected'] = true;
+        $out['label']     = $best;
+        $out['color']     = observedColor($best);
+        $out['reason']    = "Corretto da {$neighbors} osservazioni simili";
+    } else {
+        // Feedback agrees with the rule (or doesn't clearly beat it): reinforce it.
+        $out['reason'] = "Confermato da {$neighbors} osservazioni simili";
+    }
+
+    return $out;
+}
