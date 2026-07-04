@@ -113,4 +113,17 @@ if ($resultStats) {
 }
 // ---------------------------------------------------------
 
+// ---------------------------------------------------------
+// --- REGENERATE THE STATIC DASHBOARD CACHE (icache.html) ---
+// The Raspberry Pi hits this endpoint every 60s, so requesting index.php here
+// keeps icache.html fresh once a minute (index.php rewrites it as a side effect)
+// with the data we just stored above — no separate cron job needed.
+// A loopback HTTP request keeps index.php as the single source of truth and
+// isolates it from this script's variables/connection.
+$scheme = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off') ? 'https' : 'http';
+$host = $_SERVER['HTTP_HOST'] ?? 'cesana.steplab.net';
+$ctx = stream_context_create(['http' => ['timeout' => 15]]);
+@file_get_contents("{$scheme}://{$host}/index.php", false, $ctx);
+// ---------------------------------------------------------
+
 ?>
