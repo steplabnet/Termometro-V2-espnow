@@ -31,6 +31,10 @@ $SOURCES = [
 
 $OPS = ['>', '<', '='];
 
+// Special source for a "Non trasmette" condition: matches ANY physical meteo.py
+// sensor. Must match STALE_ANY in alarm_watcher.py.
+define('STALE_ANY_SOURCE', '__any__');
+
 // Day-of-week presets exposed in the UI (bit 0=Mon … bit 6=Sun, matches Python).
 const DAYS_ALL    = 127;
 const DAYS_MONFRI = 31;   // 0b0011111
@@ -221,6 +225,16 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
               $cond_skipped++; continue;
             }
             $valid[] = ['kind' => 'compare', 'source' => $source, 'op' => $op, 'source2' => $source2];
+          } elseif ($kind === 'stale') {
+            // "Not transmitting": fires when the source is missing/sentinel, or the
+            // whole reading is older than `value` minutes (blank = watcher default).
+            $source = $c['source'] ?? '';
+            if ($source !== STALE_ANY_SOURCE && !isset($GLOBALS['SOURCES'][$source])) {
+              $cond_skipped++; continue;
+            }
+            $val     = trim($c['value'] ?? '');
+            $minutes = ($val === '' || !is_numeric($val)) ? null : max(1.0, (float)$val);
+            $valid[] = ['kind' => 'stale', 'source' => $source, 'value' => $minutes];
           } elseif ($kind === 'time_window') {
             $tf = trim($c['time_from'] ?? '');
             $tt = trim($c['time_to']   ?? '');
@@ -399,6 +413,39 @@ function compare_cond_html($SOURCES, $OPS, $i, $j, $c = null) {
   return ob_get_clean();
 }
 
+function stale_cond_html($SOURCES, $i, $j, $c = null) {
+  $source = $c['source'] ?? '';
+  // value holds the max-age threshold in minutes (blank = watcher default).
+  $mins   = (isset($c['value']) && $c['value'] !== null && $c['value'] !== '')
+            ? (string)(0 + $c['value']) : '';
+  ob_start(); ?>
+  <tr class="cond-row" data-kind="stale">
+    <td class="cond-kind">Non trasmette</td>
+    <td>
+      <input type="hidden" name="rule[<?= $i ?>][cond][<?= $j ?>][kind]" value="stale">
+      <select name="rule[<?= $i ?>][cond][<?= $j ?>][source]">
+        <option value="<?= STALE_ANY_SOURCE ?>" <?= $source === STALE_ANY_SOURCE ? 'selected' : '' ?>>
+          Qualsiasi sensore meteo
+        </option>
+        <?php foreach ($SOURCES as $k => $meta): ?>
+          <option value="<?= htmlspecialchars($k) ?>" <?= $k === $source ? 'selected' : '' ?>>
+            <?= htmlspecialchars($meta['label']) ?> (<?= htmlspecialchars($meta['unit']) ?>)
+          </option>
+        <?php endforeach; ?>
+      </select>
+    </td>
+    <td class="cond-op"><span class="cond-hint">ferma da &gt;</span></td>
+    <td class="cond-val">
+      <input type="number" step="1" min="1" placeholder="15 min"
+        name="rule[<?= $i ?>][cond][<?= $j ?>][value]" value="<?= htmlspecialchars($mins) ?>"
+        title="Minuti senza dati oltre i quali il sensore è considerato fermo (vuoto = predefinito)">
+    </td>
+    <td class="cond-act"><button type="button" class="btn-remove" title="Rimuovi">&times;</button></td>
+  </tr>
+  <?php
+  return ob_get_clean();
+}
+
 function days_toggle_html($i, $j, $mask) {
   $labels = ['Lun', 'Mar', 'Mer', 'Gio', 'Ven', 'Sab', 'Dom'];
   ob_start(); ?>
@@ -495,6 +542,7 @@ function rule_card_html($SOURCES, $OPS, $BOTS, $i, $r = null, $active = false) {
           <?php
           if     ($c['kind'] === 'value')       echo value_cond_html($SOURCES, $OPS, $i, $j, $c);
           elseif ($c['kind'] === 'compare')     echo compare_cond_html($SOURCES, $OPS, $i, $j, $c);
+          elseif ($c['kind'] === 'stale')       echo stale_cond_html($SOURCES, $i, $j, $c);
           elseif ($c['kind'] === 'time_window') echo time_window_cond_html($i, $j, $c);
           elseif ($c['kind'] === 'schedule')    echo schedule_cond_html($i, $j, $c);
           ?>
@@ -505,6 +553,7 @@ function rule_card_html($SOURCES, $OPS, $BOTS, $i, $r = null, $active = false) {
     <div class="cond-add">
       <button type="button" class="btn-add-cond" data-kind="value">+ Sensore</button>
       <button type="button" class="btn-add-cond" data-kind="compare">+ Confronto</button>
+      <button type="button" class="btn-add-cond" data-kind="stale">+ Non trasmette</button>
       <button type="button" class="btn-add-cond" data-kind="time_window">+ Finestra oraria</button>
       <button type="button" class="btn-add-cond" data-kind="schedule">+ Pianificazione</button>
       <span class="cond-hint">Le condizioni sono combinate in AND.</span>
@@ -518,6 +567,7 @@ function rule_card_html($SOURCES, $OPS, $BOTS, $i, $r = null, $active = false) {
 $tpl_rule           = rule_card_html($SOURCES, $OPS, $BOTS, '__I__');
 $tpl_cond_value     = value_cond_html($SOURCES, $OPS, '__I__', '__J__');
 $tpl_cond_compare   = compare_cond_html($SOURCES, $OPS, '__I__', '__J__');
+$tpl_cond_stale     = stale_cond_html($SOURCES, '__I__', '__J__');
 $tpl_cond_window    = time_window_cond_html('__I__', '__J__');
 $tpl_cond_schedule  = schedule_cond_html('__I__', '__J__');
 ?>
@@ -825,6 +875,12 @@ $tpl_cond_schedule  = schedule_cond_html('__I__', '__J__');
         Una condizione <em>Sensore</em> confronta una grandezza con un valore fisso;
         una condizione <em>Confronto</em> mette a confronto due grandezze tra loro
         (es. <code>Full Sun Temperatura &lt; Serra Temperatura</code>).
+        Una condizione <em>Non trasmette</em> scatta quando un sensore smette di
+        inviare dati: valore assente/non valido, oppure ultima lettura più vecchia
+        dei minuti indicati (lascia vuoto per il valore predefinito, 15 min).
+        Scegli <em>Qualsiasi sensore meteo</em> come sorgente per un allarme
+        generico che scatta se <strong>uno qualsiasi</strong> dei sensori gestiti
+        da <code>meteo.py</code> non trasmette (es. da oltre 30 minuti).
         Le regole senza pianificazione inviano il messaggio quando le condizioni
         diventano vere (anti-flapping di 2 letture) e si <strong>riarmano automaticamente</strong>
         quando tornano false: ogni nuovo fronte di salita genera un altro messaggio.
@@ -862,9 +918,10 @@ $tpl_cond_schedule  = schedule_cond_html('__I__', '__J__');
     const tplRule     = <?= json_encode($tpl_rule,          JSON_UNESCAPED_UNICODE | JSON_HEX_TAG) ?>;
     const tplValue    = <?= json_encode($tpl_cond_value,    JSON_UNESCAPED_UNICODE | JSON_HEX_TAG) ?>;
     const tplCompare  = <?= json_encode($tpl_cond_compare,  JSON_UNESCAPED_UNICODE | JSON_HEX_TAG) ?>;
+    const tplStale    = <?= json_encode($tpl_cond_stale,    JSON_UNESCAPED_UNICODE | JSON_HEX_TAG) ?>;
     const tplWindow   = <?= json_encode($tpl_cond_window,   JSON_UNESCAPED_UNICODE | JSON_HEX_TAG) ?>;
     const tplSchedule = <?= json_encode($tpl_cond_schedule, JSON_UNESCAPED_UNICODE | JSON_HEX_TAG) ?>;
-    const condTpls    = { value: tplValue, compare: tplCompare, time_window: tplWindow, schedule: tplSchedule };
+    const condTpls    = { value: tplValue, compare: tplCompare, stale: tplStale, time_window: tplWindow, schedule: tplSchedule };
 
     const container = document.getElementById('rules-container');
     let nextRuleIdx = <?= count($rules) ?>;

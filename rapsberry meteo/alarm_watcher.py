@@ -58,6 +58,27 @@ METRICS = {
 # can't keep firing alarms on a frozen last value.
 UFFICIO_STALE_S = 1200
 
+# Office sources are merged from a separate table and already nulled when stale
+# (see _merge_ufficio), so a "stale" condition on them relies purely on the
+# value being missing — not on the meteo row's own timestamp age.
+UFFICIO_KEYS = frozenset(("uff_temp", "uff_hum", "uff_pres", "uff_setpoint"))
+
+# Default max age for a "stale" (not-transmitting) condition when the rule
+# doesn't specify one. A source counts as not transmitting if the whole meteo
+# reading is older than this — the case where meteo.py died and the last row
+# froze with valid values, so no per-source sentinel ever appears. Individual
+# sensors that stop while meteo.py keeps running are caught immediately by their
+# sentinel value regardless of this threshold.
+STALE_DEFAULT_S = 900  # 15 minutes
+
+# Special "stale" source: fires if ANY physical meteo.py sensor stops. Those are
+# the METRICS entries that report absence via a sentinel (temp/tMobile/tombra →
+# -100, hMobile/hombra → -1); power/tempCpu are computed locally and never drop
+# out, so they carry no sentinel and are excluded. Must match the value used in
+# alarms.php.
+STALE_ANY = "__any__"
+STALE_ANY_SOURCES = tuple(k for k, m in METRICS.items() if m["sentinel"] is not None)
+
 # Virtual (derived) sources. Selectable in alarms.php and queryable via
 # /forecast. Kept in a separate dict so /status doesn't list them as sensor
 # readings — but ALL_METRICS below merges both for value-condition lookups.
@@ -409,6 +430,84 @@ def evaluate_compare_cond(cond, row):
     return None
 
 
+def _stale_max_age_s(cond):
+    """Max reading age (seconds) after which a source counts as not transmitting.
+    The rule stores the threshold in `value` as minutes; blank/invalid → default."""
+    v = cond.get("value")
+    if v is None:
+        return STALE_DEFAULT_S
+    try:
+        s = float(v) * 60.0
+        return s if s > 0 else STALE_DEFAULT_S
+    except (TypeError, ValueError):
+        return STALE_DEFAULT_S
+
+
+def evaluate_stale_cond(cond, row):
+    """A 'stale' condition is True when the chosen source is NOT transmitting.
+
+    Two independent signals, either of which makes it True:
+      • the source's latest value is missing/sentinel (the sensor itself
+        dropped out — meteo.py writes -100/-1 when a station goes silent, and
+        office readings are nulled when stale); or
+      • for meteo/forecast sources, the whole latest reading is older than the
+        configured max age — i.e. meteo.py stopped and the last row froze with
+        still-valid values, so no per-source sentinel ever appears.
+
+    The special source STALE_ANY covers "any meteo sensor": True if the whole
+    reading is too old, or any physical sensor has gone to its sentinel.
+
+    Never returns None: staleness is always decidable (no data at all is stale).
+    Returns None only for an unknown/misconfigured source so the rule holds."""
+    src = cond.get("source")
+
+    if src == STALE_ANY:
+        # No reading at all → not transmitting.
+        if not row:
+            return True
+        # Whole pipeline silent longer than the threshold (meteo.py died).
+        ts = row.get("timestamp")
+        if ts:
+            try:
+                age = (datetime.utcnow()
+                       - datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")).total_seconds()
+                if age > _stale_max_age_s(cond):
+                    return True
+            except ValueError:
+                pass
+        # Any single transmitter dropped (its value went to the sentinel).
+        for s in STALE_ANY_SOURCES:
+            if is_missing(row.get(s), METRICS[s]["sentinel"]):
+                return True
+        return False
+
+    meta = ALL_METRICS.get(src)
+    if meta is None:
+        return None
+
+    # No reading at all → definitely not transmitting.
+    if not row:
+        return True
+
+    # Whole-pipeline staleness. Office sources carry their own freshness (the
+    # merge nulls stale values), so skip the meteo-row age check for them.
+    if src not in UFFICIO_KEYS:
+        ts = row.get("timestamp")
+        if ts:
+            try:
+                age = (datetime.utcnow()
+                       - datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")).total_seconds()
+                if age > _stale_max_age_s(cond):
+                    return True
+            except ValueError:
+                pass  # unparseable timestamp — fall through to the value check
+
+    value = row.get(src)
+    if is_missing(value, meta["sentinel"]):
+        return True
+    return False
+
+
 def is_scheduled_rule(rule):
     return any(c["kind"] == "schedule" for c in rule.get("conditions", []))
 
@@ -424,6 +523,17 @@ def rule_describe(rule):
             m1 = ALL_METRICS.get(c.get("source"),  {"label": c.get("source"),  "unit": ""})
             m2 = ALL_METRICS.get(c.get("source2"), {"label": c.get("source2"), "unit": ""})
             parts.append(f"{m1['label']} {c['op']} {m2['label']}")
+        elif c["kind"] == "stale":
+            src = c.get("source")
+            if src == STALE_ANY:
+                label = "Qualsiasi sensore meteo"
+            else:
+                label = ALL_METRICS.get(src, {"label": src})["label"]
+            mins = c.get("value")
+            if mins:
+                parts.append(f"{label} non trasmette (>{int(mins)} min)")
+            else:
+                parts.append(f"{label} non trasmette")
         elif c["kind"] == "time_window":
             days = format_days_mask(c.get("days_mask"))
             tail = "" if days == "ogni giorno" else f" ({days})"
@@ -464,6 +574,12 @@ def _eval_non_schedule_conditions(rule, row, now_t, today_bit):
                 return False
         elif kind == "compare":
             res = evaluate_compare_cond(c, row)
+            if res is None:
+                return None
+            if not res:
+                return False
+        elif kind == "stale":
+            res = evaluate_stale_cond(c, row)
             if res is None:
                 return None
             if not res:
