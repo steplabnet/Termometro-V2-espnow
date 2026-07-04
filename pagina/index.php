@@ -340,7 +340,7 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <meta http-equiv="refresh" content="600">
+  <meta http-equiv="refresh" content="60">
   <title>Dashboard Meteo Cesana</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
@@ -416,6 +416,8 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
     .river-dry { border-top-color: var(--accent-dry); }
     .border-feedback { border-top-color: var(--accent-purple); }
     .icon-feedback { color: var(--accent-purple); }
+    .border-multi { border-top-color: var(--accent-teal); }
+    .icon-multi { color: var(--accent-teal); }
   </style>
 </head>
 <body>
@@ -457,7 +459,7 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
 
     <!-- 3. Pressione / Forecast -->
     <div class="card border-pres">
-      <div style="display: flex; flex-direction: column; align-items: center; width: 100%; height: 100%;">
+      <a href="grafico.php?var=press">
 
         <?php if ($forecast['icon'] == 'sun'): ?>
           <svg viewBox="0 0 24 24" class="card-icon" style="color:var(--accent-orange)" fill="currentColor"><circle cx="12" cy="12" r="5"/><g stroke="currentColor" stroke-width="2" stroke-linecap="round"><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></g></svg>
@@ -523,7 +525,7 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
             <div class="minmax-item"><span class="minmax-label">Liv. Mare</span><span class="minmax-val"><?php echo number_format($mslp, 1); ?></span></div>
             <div class="minmax-item"><span class="minmax-label">Trend 3h</span><span class="minmax-val <?php echo ($presTrendValid ? ($presTrend3h < 0 ? 'trend-down' : 'trend-up') : ''); ?>"><?php echo $presTrendValid ? (($presTrend3h > 0 ? '+' : '') . number_format($presTrend3h, 1)) : 'n/d'; ?></span></div>
         </div>
-      </div>
+      </a>
     </div>
 
  <!-- 4. Potenza Fotovoltaico (istantanea) -->
@@ -632,6 +634,21 @@ function getPowerClass($val) { return ($val <= 0) ? 'night-mode' : ''; }
         </div>
         <div class="minmax-row">
             <div class="minmax-item"><span class="minmax-label">Previsto ora</span><span class="minmax-val" style="color:<?php echo $forecast['color']; ?>"><?php echo $forecast['text']; ?></span></div>
+        </div>
+      </a>
+    </div>
+
+    <!-- 9. Multi Plot -->
+    <div class="card border-multi">
+      <a href="grafico.php?var=multi">
+        <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-multi" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3v18h18"/><path d="M7 15l3-4 3 3 4-6"/></svg>
+        <div class="card-label">Multi Plot</div>
+        <div class="card-value" style="font-size:1.3rem; margin-top:6px;">Confronta dati</div>
+        <div style="font-weight:600; font-size:0.78rem; color:var(--text-muted); margin-top:8px; text-align:center;">
+          Sovrapponi più variabili<br>sullo stesso grafico
+        </div>
+        <div class="minmax-row">
+            <div class="minmax-item"><span class="minmax-label">Grafico</span><span class="minmax-val" style="color:var(--accent-teal)">Comparativo</span></div>
         </div>
       </a>
     </div>
