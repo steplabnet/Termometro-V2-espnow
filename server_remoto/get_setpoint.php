@@ -148,7 +148,8 @@ $updated = false;
 if ($tempParam !== null) {
     $val = round((float)$tempParam, 1);
     $state['actualTemp'] = $val;
-    append_history_log($historyFile, $historyBackup, $val);
+    // Log every ~60s so the trend/graph match the 1-min sensor cadence. Cap rows.
+    append_history_log($historyFile, $historyBackup, $val, 60, 2000);
     $updated = true;
 }
 
@@ -156,7 +157,8 @@ if ($tempParam !== null) {
 if ($humiParam !== null) {
     $val = round((float)$humiParam, 1);
     $state['humi'] = $val;
-    append_history_log($humiHistoryFile, $humiHistoryBackup, $val);
+    // Log every ~60s so the trend/graph match the 1-min sensor cadence. Cap rows.
+    append_history_log($humiHistoryFile, $humiHistoryBackup, $val, 60, 2000);
     $updated = true;
 }
 

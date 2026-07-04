@@ -14,6 +14,7 @@ import json
 import math
 import os
 import sqlite3
+import subprocess
 import sys
 import time
 from datetime import datetime, time as dt_time, timedelta
@@ -810,8 +811,30 @@ HELP_TEXT = (
     "/status — valori correnti\n"
     "/forecast — previsione 6am (cielo sereno)\n"
     "/alarms — soglie configurate e allarmi attivi\n"
+    "/reboot — riavvia il Raspberry\n"
     "/help — questo messaggio"
 )
+
+
+def do_reboot():
+    """Reboot the Raspberry after a short delay.
+
+    Launched detached with a small sleep so the confirmation message is safely
+    delivered (and the getUpdates offset is already advanced) before the box
+    goes down — otherwise the same /reboot could be replayed on next boot.
+    Runs `sudo reboot`, so the watcher's user needs a NOPASSWD sudoers entry for
+    it (e.g. `pi ALL=(ALL) NOPASSWD: /sbin/reboot`).
+    """
+    try:
+        subprocess.Popen(
+            ["sh", "-c", "sleep 3 && sudo reboot"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        return True
+    except Exception as e:
+        log(f"[cmd] reboot spawn error: {e}")
+        return False
 
 
 def handle_command(text):
@@ -833,6 +856,14 @@ def handle_command(text):
         return format_forecast()
     if cmd == "/alarms":
         return format_alarms_summary()
+    if cmd == "/reboot":
+        log("[cmd] /reboot requested")
+        # Send the confirmation synchronously first: do_reboot() detaches with a
+        # delay, so by the time the box goes down the reply is already delivered.
+        send_message("Riavvio del Raspberry in corso… 🔄")
+        if not do_reboot():
+            return "Impossibile avviare il riavvio (vedi log del watcher)."
+        return None  # confirmation already sent above
     return None  # silently ignore unknown commands
 
 
