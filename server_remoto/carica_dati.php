@@ -1,6 +1,6 @@
 <?php
 
-/** legge la portata del Piave */
+/** legge la portata del Piave  */
 // Read the JSON file  
 $json = file_get_contents('https://api.arpa.veneto.it/REST/v1/meteo_meteogrammi_tabella?codseqst=300001781&rnd=0.26636924190339917');
 
