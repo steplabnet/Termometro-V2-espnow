@@ -64,6 +64,12 @@ if ($api !== '') {
         echo json_encode($rows[0] ?? (object) []);
         break;
 
+      case 'sensor_status':
+        // Per-role station/sensor ids (main / mobile / ombra), upserted by meteo.py.
+        $rows = db_rows($db, "SELECT sensor_key, identifier, online, last_seen FROM sensor_status");
+        echo json_encode($rows);
+        break;
+
       case 'sensors':
         $limit = min((int) ($_GET['limit'] ?? SENSORS_LIMIT), 500);
         $rows = db_rows($db, "SELECT * FROM sensors ORDER BY id DESC LIMIT $limit");
@@ -279,6 +285,24 @@ if ($api !== '') {
       width: 1.1rem;
       height: 1.1rem;
       flex-shrink: 0;
+    }
+
+    .sensor-id {
+      margin-left: auto;
+      font-size: .7rem;
+      font-weight: 600;
+      letter-spacing: 0;
+      text-transform: none;
+      color: #64748b;
+      background: #f1f5f9;
+      border-radius: 999px;
+      padding: .1rem .55rem;
+      white-space: nowrap;
+    }
+
+    .sensor-id.offline {
+      color: #dc2626;
+      background: #fee2e2;
     }
 
     .icon-sun {
@@ -563,6 +587,7 @@ if ($api !== '') {
             d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41" />
         </svg>
         Full Sun
+        <span class="sensor-id" id="id-fullsun" title="ID stazione">ID —</span>
       </h2>
       <div class="group-stats">
         <div class="stat"><span class="label">Temperatura</span><span class="value c-blue" id="c-temp">—</span><span
@@ -582,6 +607,7 @@ if ($api !== '') {
           <path d="M2 21c0-3 1.85-5.36 5.08-6" />
         </svg>
         Parametri Serra
+        <span class="sensor-id" id="id-serra" title="ID sensore">ID —</span>
       </h2>
       <div class="group-stats">
         <div class="stat"><span class="label">Temperatura</span><span class="value c-teal" id="c-tombra">—</span><span
@@ -600,6 +626,7 @@ if ($api !== '') {
           <path d="M17.5 19a4.5 4.5 0 1 0 0-9h-1.8A7 7 0 1 0 4 15.5" />
         </svg>
         Ombra
+        <span class="sensor-id" id="id-ombra" title="ID sensore">ID —</span>
       </h2>
       <div class="group-stats">
         <div class="stat"><span class="label">Temperatura</span><span class="value c-green" id="c-tmobile">—</span><span
@@ -884,10 +911,13 @@ if ($api !== '') {
       // Cards
       setCard('c-temp', latest.temp);
       setCard('c-humi', nullIfNegative(latest.humi), 0);
-      setCard('c-tombra', latest.tombra);
-      setCard('c-hombra', nullIfNegative(latest.hombra), 0);
-      setCard('c-tmobile', latest.tMobile);
-      setCard('c-hmobile', nullIfNegative(latest.hMobile), 0);
+      // Serra panel = mobile sensor (tMobile/hMobile); Ombra panel = ombra sensor
+      // (tombra/hombra). Element ids are kept as-is, so c-tombra/c-tmobile no
+      // longer match the DB column they show — the panel each lives in is the guide.
+      setCard('c-tombra', latest.tMobile);
+      setCard('c-hombra', nullIfNegative(latest.hMobile), 0);
+      setCard('c-tmobile', latest.tombra);
+      setCard('c-hmobile', nullIfNegative(latest.hombra), 0);
       setCard('c-power', latest.power, 0);
       setCard('c-cpu', latest.tempCpu);
       setCard('c-station', latest.station_id, 0);
@@ -903,20 +933,20 @@ if ($api !== '') {
         rows.map(r => nullIfNegative(r.humi)),
       );
       updateChartData(charts.serra, labels,
-        rows.map(r => nullIfSentinel(r.tombra)),
-        rows.map(r => nullIfNegative(r.hombra)),
-      );
-      updateChartData(charts.ombra, labels,
         rows.map(r => nullIfSentinel(r.tMobile)),
         rows.map(r => nullIfNegative(r.hMobile)),
+      );
+      updateChartData(charts.ombra, labels,
+        rows.map(r => nullIfSentinel(r.tombra)),
+        rows.map(r => nullIfNegative(r.hombra)),
       );
       updateChartData(charts.power, labels, rows.map(r => r.power));
       updateChartData(charts.cpu, labels, rows.map(r => r.tempCpu));
 
       // 24h humidity averages (rows already cover the last ~24h at 1 sample/min)
       setText('c-humi-avg',    meanOf(rows, 'humi',    nullIfNegative));
-      setText('c-hombra-avg',  meanOf(rows, 'hombra',  nullIfNegative));
-      setText('c-hmobile-avg', meanOf(rows, 'hMobile', nullIfNegative));
+      setText('c-hombra-avg',  meanOf(rows, 'hMobile', nullIfNegative));  // Serra = mobile
+      setText('c-hmobile-avg', meanOf(rows, 'hombra',  nullIfNegative));  // Ombra = ombra
 
       // 24h peak photovoltaic power
       setText('c-power-peak', maxOf(rows, 'power'));
@@ -951,6 +981,33 @@ if ($api !== '') {
         rows.map(r => nullIfSentinel(r.temp)),
         rows.map(r => nullIfNegative(r.hum)),
       );
+    }
+
+    // ── Fetch & render per-role sensor ids ────────────────────────────────────────
+    // sensor_key -> group header span. Chips track role names (user preference):
+    //   main→Full Sun, ombra→Ombra, mobile→Parametri Serra.
+    // Note: the temp/humi DATA charted in each panel is unchanged — the Serra
+    // panel still plots tombra/hombra and the Ombra panel still plots tMobile/hMobile.
+    const SENSOR_ID_TARGETS = { main: 'id-fullsun', ombra: 'id-ombra', mobile: 'id-serra' };
+
+    async function loadSensorIds() {
+      let rows;
+      try {
+        const res = await fetch('?api=sensor_status');
+        rows = await res.json();
+      } catch (e) { return; }
+      if (!Array.isArray(rows)) return;
+
+      for (const r of rows) {
+        const elId = SENSOR_ID_TARGETS[r.sensor_key];
+        if (!elId) continue;
+        const el = document.getElementById(elId);
+        if (!el) continue;
+        el.textContent = 'ID ' + (r.identifier ?? '—');
+        el.classList.toggle('offline', Number(r.online) !== 1);
+        el.title = 'ID ' + (r.identifier ?? '—') +
+          (r.last_seen ? ' — visto: ' + romeFullDateTime(r.last_seen) : '');
+      }
     }
 
     // ── Fetch & render sensors ────────────────────────────────────────────────────
@@ -989,7 +1046,7 @@ if ($api !== '') {
 
     // ── Refresh loop ──────────────────────────────────────────────────────────────
     async function refresh() {
-      try { await Promise.all([loadMeteo(), loadSensors(), loadUfficio()]); }
+      try { await Promise.all([loadMeteo(), loadSensors(), loadUfficio(), loadSensorIds()]); }
       catch (e) { showError(e.message); }
     }
 
@@ -999,8 +1056,8 @@ if ($api !== '') {
     // ── Comparison modal (today vs yesterday) ───────────────────────────────────
     const COMPARE_CONFIG = {
       fullsun: { title: 'Full Sun', tempKey: 'temp',    humiKey: 'humi',    tempColor: 'rgb(2,132,199)',  humiColor: 'rgb(99,102,241)' },
-      serra:   { title: 'Parametri Serra', tempKey: 'tombra', humiKey: 'hombra', tempColor: 'rgb(13,148,136)', humiColor: 'rgb(99,102,241)' },
-      ombra:   { title: 'Ombra',   tempKey: 'tMobile', humiKey: 'hMobile', tempColor: 'rgb(22,163,74)',  humiColor: 'rgb(99,102,241)' },
+      serra:   { title: 'Parametri Serra', tempKey: 'tMobile', humiKey: 'hMobile', tempColor: 'rgb(13,148,136)', humiColor: 'rgb(99,102,241)' },
+      ombra:   { title: 'Ombra',   tempKey: 'tombra', humiKey: 'hombra', tempColor: 'rgb(22,163,74)',  humiColor: 'rgb(99,102,241)' },
     };
 
     let compareTempChart = null;
