@@ -65,6 +65,8 @@ fanHistory = np.array([48] * 10, dtype=float)  # moving avg of CPU temp
 
 
 DB_PATH = "/dev/shm/meteo.db"
+ROLES_PATH = "/var/www/html/sensor_roles.json"  # persisted role->id map; survives reboot
+ONLINE_THRESHOLD = 1200  # seconds; a sensor is "online" if it transmitted more recently than this
 
 
 def init_db():
@@ -87,6 +89,19 @@ def init_db():
         con.execute("ALTER TABLE meteo ADD COLUMN hMobile INTEGER")
     except sqlite3.OperationalError:
         pass
+
+    # Per-sensor transmission health: one row per remote sensor, upserted each cycle.
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS sensor_status (
+            sensor_key  TEXT PRIMARY KEY,   -- 'main' / 'mobile' / 'ombra'
+            kind        TEXT,               -- 'station' or 'sensor'
+            identifier  INTEGER,            -- Tinkerforge station/sensor id
+            last_change INTEGER,            -- seconds since last reading (as reported by Tinkerforge)
+            last_seen   TEXT,               -- absolute UTC time the sensor last transmitted
+            updated_at  TEXT,               -- when this row was last refreshed
+            online      INTEGER             -- 1 if last_change < ONLINE_THRESHOLD, else 0
+        )
+    """)
     con.commit()
     con.close()
 
@@ -113,22 +128,228 @@ def db_store_payload(payload):
         print("DB write error:", e)
 
 
-def scan_for_active_station(ow, start_id=1, end_id=255):
+def db_update_sensor_status(sensor_key, kind, identifier, last_change):
+    """Record when a remote sensor last transmitted to the Tinkerforge bricklet.
+
+    last_change is the "seconds since last reading" reported by Tinkerforge, so the
+    absolute last-seen time is (now - last_change). One row per sensor_key (upsert),
+    letting a monitor query whether each sensor is still transmitting.
     """
-    Scans for a station ID that returns valid, recent data.
-    Returns the first valid station ID found, or None if none found.
+    try:
+        now = datetime.datetime.utcnow()
+        last_seen = (now - datetime.timedelta(seconds=int(last_change))).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+        con = sqlite3.connect(DB_PATH)
+        con.execute("""
+            INSERT INTO sensor_status (
+                sensor_key, kind, identifier, last_change, last_seen, updated_at, online
+            ) VALUES (
+                :sensor_key, :kind, :identifier, :last_change, :last_seen, :updated_at, :online
+            )
+            ON CONFLICT(sensor_key) DO UPDATE SET
+                kind        = excluded.kind,
+                identifier  = excluded.identifier,
+                last_change = excluded.last_change,
+                last_seen   = excluded.last_seen,
+                updated_at  = excluded.updated_at,
+                online      = excluded.online
+        """, {
+            "sensor_key": sensor_key,
+            "kind": kind,
+            "identifier": identifier,
+            "last_change": int(last_change),
+            "last_seen": last_seen,
+            "updated_at": now.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "online": 1 if int(last_change) < ONLINE_THRESHOLD else 0,
+        })
+        con.commit()
+        con.close()
+    except Exception as e:
+        print("Sensor status write error:", e)
+
+
+def get_active_station_ids(ow):
+    """Return station ids that transmitted recently, freshest first.
+
+    Uses the bricklet's own list of heard-from stations; falls back to a 1-255
+    sweep if that call is unavailable on the installed firmware/bindings.
     """
-    print(f"Scanning for new station ID between {start_id} and {end_id}...")
-    for station_id in range(start_id, end_id + 1):
+    try:
+        candidates = list(ow.get_station_identifiers())
+    except Exception:
+        candidates = range(1, 256)
+
+    active = []
+    for sid in candidates:
         try:
-            dati = ow.get_station_data(station_id)
-            # Check if data is recent (last change < 1200 seconds)
-            if dati[7] < 1200:
-                print(f"Found active station: {station_id}")
-                return station_id
+            data = ow.get_station_data(sid)
+            if data[7] < ONLINE_THRESHOLD:  # data[7] = seconds since last reading
+                active.append((sid, data[7]))
         except Exception:
             continue
+    active.sort(key=lambda x: x[1])
+    return [sid for sid, _ in active]
+
+
+def get_active_sensor_ids(ow):
+    """Return sensor ids that transmitted recently, freshest first.
+
+    Uses the bricklet's own list of heard-from sensors; falls back to a 1-255
+    sweep if that call is unavailable on the installed firmware/bindings.
+    """
+    try:
+        candidates = list(ow.get_sensor_identifiers())
+    except Exception:
+        candidates = range(1, 256)
+
+    active = []
+    for sid in candidates:
+        try:
+            data = ow.get_sensor_data(sid)
+            if data[2] < ONLINE_THRESHOLD:  # data[2] = seconds since last reading
+                active.append((sid, data[2]))
+        except Exception:
+            continue
+    active.sort(key=lambda x: x[1])
+    return [sid for sid, _ in active]
+
+
+def scan_for_active_station(ow):
+    """Return the first station id returning fresh data, or None."""
+    ids = get_active_station_ids(ow)
+    if ids:
+        print(f"Found active station: {ids[0]}")
+        return ids[0]
     return None
+
+
+def load_sensor_roles():
+    """Load the persisted role->id map from the web dir.
+
+    Falls back to the hardcoded defaults for any role missing from the file (or
+    if the file does not yet exist / is unreadable). Returns {'main','mobile','ombra'}.
+    """
+    defaults = {
+        "main": mainStation,
+        "mobile": sensoreTemperatura2,
+        "ombra": sensoreTemperatura,
+    }
+    try:
+        with open(ROLES_PATH) as f:
+            data = json.load(f)
+    except Exception:
+        return dict(defaults)
+
+    roles = {}
+    for role, dflt in defaults.items():
+        entry = data.get(role)
+        if isinstance(entry, dict) and "id" in entry:
+            roles[role] = int(entry["id"])
+        elif isinstance(entry, int):
+            roles[role] = entry
+        else:
+            roles[role] = dflt
+    print("Loaded persisted sensor roles:", roles)
+    return roles
+
+
+def save_sensor_roles(roles):
+    """Persist the role->id map to the web dir (atomic write).
+
+    Each entry stores the id plus 'updated_at', which is refreshed only when the
+    id actually changes, so the file records when each role was last reassigned.
+    """
+    try:
+        now = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+        try:
+            with open(ROLES_PATH) as f:
+                prev = json.load(f)
+        except Exception:
+            prev = {}
+
+        payload = {}
+        for role, sid in roles.items():
+            prev_entry = prev.get(role) if isinstance(prev.get(role), dict) else {}
+            unchanged = prev_entry.get("id") == sid and "updated_at" in prev_entry
+            payload[role] = {
+                "id": sid,
+                "updated_at": prev_entry["updated_at"] if unchanged else now,
+            }
+
+        tmp = ROLES_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(payload, f, indent=2)
+        os.replace(tmp, ROLES_PATH)  # atomic: readers never see a half-written file
+    except Exception as e:
+        print("Sensor roles save error:", e)
+
+
+def update_role_if_changed(roles, role, sid):
+    """If a role's id changed, update the in-memory map and rewrite the file."""
+    if roles.get(role) != sid:
+        print(f"Role '{role}' id changed: {roles.get(role)} -> {sid}")
+        log_write(f"role {role} id {roles.get(role)}->{sid}")
+        roles[role] = sid
+        save_sensor_roles(roles)
+
+
+def identify_devices_on_boot(ow, preferred, wait_seconds=90):
+    """Auto-identify the station and both sensors at startup.
+
+    Waits up to wait_seconds for devices to transmit at least once (the bricklet
+    buffer is empty right after boot). The `preferred` map (persisted role->id)
+    is favoured so the physical mobile/ombra roles stay stable across reboots; a
+    role whose preferred id is silent is filled from a freshly discovered id
+    (e.g. after a battery swap re-randomised it). Returns a {role: id} dict.
+    """
+    print("Boot scan: waiting for stations/sensors to transmit...")
+    deadline = time() + wait_seconds
+    station_ids, sensor_ids = [], []
+    while True:
+        station_ids = get_active_station_ids(ow)
+        sensor_ids = get_active_sensor_ids(ow)
+        if (station_ids and sensor_ids) or time() >= deadline:
+            break
+        sleep(5)
+
+    print(f"Boot scan found -> stations: {station_ids}, sensors: {sensor_ids}")
+
+    pref_station = preferred["main"]
+    pref_mobile = preferred["mobile"]
+    pref_ombra = preferred["ombra"]
+
+    # Station: prefer the remembered id if active, else freshest active, else keep it.
+    if pref_station in station_ids:
+        station = pref_station
+    elif station_ids:
+        station = station_ids[0]
+    else:
+        station = pref_station
+        print("Boot scan: no active station, keeping", pref_station)
+
+    # Sensors: keep remembered ids where present, then fill missing roles from the pool.
+    remaining = [s for s in sensor_ids if s not in (pref_ombra, pref_mobile)]
+    if pref_mobile in sensor_ids:
+        mobile = pref_mobile
+    elif remaining:
+        mobile = remaining.pop(0)
+    else:
+        mobile = pref_mobile
+        print("Boot scan: no id for mobile, keeping", pref_mobile)
+
+    if pref_ombra in sensor_ids:
+        ombra = pref_ombra
+    elif remaining:
+        ombra = remaining.pop(0)
+    else:
+        ombra = pref_ombra
+        print("Boot scan: no id for ombra, keeping", pref_ombra)
+
+    result = {"main": station, "mobile": mobile, "ombra": ombra}
+    print("Boot scan: using", result)
+    log_write(f"boot scan station={station} mobile={mobile} ombra={ombra}")
+    return result
 
 
 def left_shift(arr, value):
@@ -270,6 +491,14 @@ def main():
     mqtt_client = mqtt_connect()
     init_db()
 
+    # Load persisted roles, auto-identify at boot, persist any changes
+    roles = load_sensor_roles()
+    roles = identify_devices_on_boot(ow, roles)
+    save_sensor_roles(roles)
+    current_main_station = roles["main"]
+    mobile_id = roles["mobile"]
+    ombra_id = roles["ombra"]
+
     # BME280 removed: use neutral fallback values
     temperature = 0.0
     pressure = 0
@@ -311,6 +540,9 @@ def main():
             try:
                 dati = ow.get_station_data(current_main_station)
                 lastChangeStation = dati[7]
+                db_update_sensor_status(
+                    "main", "station", current_main_station, lastChangeStation
+                )
 
                 # Check if data is fresh (less than 20 mins old)
                 if lastChangeStation < 1200:
@@ -335,6 +567,10 @@ def main():
                         dati = ow.get_station_data(current_main_station)
                         temp = dati[0] / 10.0
                         data_valid = True
+                        db_update_sensor_status(
+                            "main", "station", current_main_station, dati[7]
+                        )
+                        update_role_if_changed(roles, "main", current_main_station)
                         print(f"Switched to active station: {current_main_station}")
                     except Exception:
                         data_valid = False
@@ -346,7 +582,10 @@ def main():
 
             # --- Sensor 2 (Mobile) ---
             try:
-                tMobile = ow.get_sensor_data(sensoreTemperatura2)
+                tMobile = ow.get_sensor_data(mobile_id)
+                db_update_sensor_status(
+                    "mobile", "sensor", mobile_id, tMobile[2]
+                )
                 temp2 = tMobile[0] / 10.0
                 hum_mobile = tMobile[1]
                 if tMobile[2] > 1200:  # data too old
@@ -358,7 +597,10 @@ def main():
 
             # --- Sensor 1 (Ombra) ---
             try:
-                ombra = ow.get_sensor_data(sensoreTemperatura)
+                ombra = ow.get_sensor_data(ombra_id)
+                db_update_sensor_status(
+                    "ombra", "sensor", ombra_id, ombra[2]
+                )
                 temp1 = ombra[0] / 10.0
                 hum_ombra = ombra[1]
                 if ombra[2] > 1200:
