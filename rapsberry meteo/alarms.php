@@ -9,12 +9,15 @@ define('ALARM_STATE_FILE', '/dev/shm/alarm_state.json');
 $SOURCES = [
   'temp'    => ['label' => 'Full Sun — Temperatura', 'unit' => '°C'],
   'humi'    => ['label' => 'Full Sun — Umidità',     'unit' => '%'],
-  'tombra'  => ['label' => 'Serra — Temperatura',    'unit' => '°C'],
-  'hombra'  => ['label' => 'Serra — Umidità',        'unit' => '%'],
-  'tMobile' => ['label' => 'Ombra — Temperatura',    'unit' => '°C'],
-  'hMobile' => ['label' => 'Ombra — Umidità',        'unit' => '%'],
+  'tombra'  => ['label' => 'Ombra — Temperatura',    'unit' => '°C'],
+  'hombra'  => ['label' => 'Ombra — Umidità',        'unit' => '%'],
+  'tMobile' => ['label' => 'Interno — Temperatura',  'unit' => '°C'],
+  'hMobile' => ['label' => 'Interno — Umidità',      'unit' => '%'],
   'power'   => ['label' => 'Fotovoltaico — Potenza', 'unit' => 'W'],
   'tempCpu' => ['label' => 'CPU — Temperatura',      'unit' => '°C'],
+  // Raspberry cooling fan state (0 = spenta, 1 = accesa). Written by meteo.py.
+  // Use a value condition "Ventola = 1" for an alarm when the fan turns on.
+  'fan'     => ['label' => 'Raspberry — Ventola',    'unit' => '0/1'],
   // Office thermostat board (casa/ufficio/data → ufficio table). Merged into
   // the evaluated reading by alarm_watcher.py under these uff_* keys.
   'uff_temp'     => ['label' => 'Ufficio — Temperatura', 'unit' => '°C'],
@@ -25,8 +28,8 @@ $SOURCES = [
   // floored at the dew point). Useful for frost-warning rules combined with
   // a Pianificazione condition (e.g. fire at 23:00 if forecast 6am < 2°C).
   'forecast_temp_6am'    => ['label' => 'Previsione 6am — Full Sun', 'unit' => '°C'],
-  'forecast_tombra_6am'  => ['label' => 'Previsione 6am — Serra',    'unit' => '°C'],
-  'forecast_tMobile_6am' => ['label' => 'Previsione 6am — Ombra',    'unit' => '°C'],
+  'forecast_tombra_6am'  => ['label' => 'Previsione 6am — Ombra',    'unit' => '°C'],
+  'forecast_tMobile_6am' => ['label' => 'Previsione 6am — Interno',  'unit' => '°C'],
 ];
 
 $OPS = ['>', '<', '='];
@@ -874,7 +877,7 @@ $tpl_cond_schedule  = schedule_cond_html('__I__', '__J__');
         Una regola scatta quando <strong>tutte</strong> le sue condizioni sono vere.
         Una condizione <em>Sensore</em> confronta una grandezza con un valore fisso;
         una condizione <em>Confronto</em> mette a confronto due grandezze tra loro
-        (es. <code>Full Sun Temperatura &lt; Serra Temperatura</code>).
+        (es. <code>Full Sun Temperatura &lt; Ombra Temperatura</code>).
         Una condizione <em>Non trasmette</em> scatta quando un sensore smette di
         inviare dati: valore assente/non valido, oppure ultima lettura più vecchia
         dei minuti indicati (lascia vuoto per il valore predefinito, 15 min).

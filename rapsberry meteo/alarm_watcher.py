@@ -41,10 +41,10 @@ DEBOUNCE_COUNT = 2         # consecutive readings required to switch state
 METRICS = {
     "temp":    {"label": "Full Sun Temp",  "unit": "°C", "sentinel": -100, "decimals": 1},
     "humi":    {"label": "Full Sun Humi",  "unit": "%",  "sentinel": -1,   "decimals": 0},
-    "tombra":  {"label": "Serra Temp",     "unit": "°C", "sentinel": -100, "decimals": 1},
-    "hombra":  {"label": "Serra Humi",     "unit": "%",  "sentinel": -1,   "decimals": 0},
-    "tMobile": {"label": "Ombra Temp",     "unit": "°C", "sentinel": -100, "decimals": 1},
-    "hMobile": {"label": "Ombra Humi",     "unit": "%",  "sentinel": -1,   "decimals": 0},
+    "tombra":  {"label": "Ombra Temp",     "unit": "°C", "sentinel": -100, "decimals": 1},
+    "hombra":  {"label": "Ombra Humi",     "unit": "%",  "sentinel": -1,   "decimals": 0},
+    "tMobile": {"label": "Interno Temp",   "unit": "°C", "sentinel": -100, "decimals": 1},
+    "hMobile": {"label": "Interno Humi",   "unit": "%",  "sentinel": -1,   "decimals": 0},
     "power":   {"label": "Potenza",        "unit": "W",  "sentinel": None, "decimals": 0},
     "tempCpu": {"label": "CPU Temp",       "unit": "°C", "sentinel": None, "decimals": 1},
     # Office thermostat board — merged from the `ufficio` table by fetch_latest().
@@ -85,10 +85,16 @@ STALE_ANY_SOURCES = tuple(k for k, m in METRICS.items() if m["sentinel"] is not 
 # readings — but ALL_METRICS below merges both for value-condition lookups.
 FORECAST_METRICS = {
     "forecast_temp_6am":    {"label": "Forecast 6am Full Sun", "unit": "°C", "sentinel": None, "decimals": 1},
-    "forecast_tombra_6am":  {"label": "Forecast 6am Serra",    "unit": "°C", "sentinel": None, "decimals": 1},
-    "forecast_tMobile_6am": {"label": "Forecast 6am Ombra",    "unit": "°C", "sentinel": None, "decimals": 1},
+    "forecast_tombra_6am":  {"label": "Forecast 6am Ombra",    "unit": "°C", "sentinel": None, "decimals": 1},
+    "forecast_tMobile_6am": {"label": "Forecast 6am Interno",  "unit": "°C", "sentinel": None, "decimals": 1},
 }
-ALL_METRICS = {**METRICS, **FORECAST_METRICS}
+# Control/state sources exposed to value & compare conditions but kept out of
+# METRICS so /status doesn't double-list them (fan has its own ON/OFF line).
+# `fan` is 0/1 as written by meteo.py; a rule "fan = 1" fires when it turns on.
+CONTROL_METRICS = {
+    "fan": {"label": "Ventola Raspberry", "unit": "", "sentinel": None, "decimals": 0},
+}
+ALL_METRICS = {**METRICS, **FORECAST_METRICS, **CONTROL_METRICS}
 
 
 def log(msg):
@@ -96,6 +102,29 @@ def log(msg):
 
 
 # ── Telegram I/O ────────────────────────────────────────────────────────────
+def set_bot_commands():
+    """Register the command menu (the blue Menu / autocomplete list) with Telegram.
+
+    Called at startup so the menu always matches handle_command() — BotFather's
+    /setcommands would otherwise drift out of date. Idempotent: Telegram just
+    overwrites the previous list."""
+    commands = [
+        {"command": "status",   "description": "Valori correnti"},
+        {"command": "forecast", "description": "Previsione 6am (cielo sereno)"},
+        {"command": "alarms",   "description": "Soglie configurate e allarmi attivi"},
+        {"command": "reboot",   "description": "Riavvia il Raspberry"},
+        {"command": "help",     "description": "Elenco comandi"},
+    ]
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/setMyCommands"
+    try:
+        r = requests.post(url, json={"commands": commands}, timeout=10)
+        r.raise_for_status()
+        return r.json().get("ok", False)
+    except requests.exceptions.RequestException as e:
+        log(f"[commands] set error: {e}")
+        return False
+
+
 def send_message(text, token=None, chat_id=None):
     """Send via the given bot, or the default zbot.py bot when token/chat are None."""
     url = f"https://api.telegram.org/bot{token or BOT_TOKEN}/sendMessage"
@@ -931,7 +960,12 @@ def drain_pending_updates():
 
 def main():
     log("Alarm watcher starting…")
+    set_bot_commands()
     drain_pending_updates()
+    # Announce startup. The watcher is launched at boot (systemd/rc), so this
+    # doubles as a "Raspberry acceso" notification. Sent after draining pending
+    # updates so it isn't lost among queued messages.
+    send_message("🔌 Raspberry avviato — stazione meteo online.")
     last_alarm_check = 0.0
     while True:
         telegram_poll_once()

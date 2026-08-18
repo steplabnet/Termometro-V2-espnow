@@ -1,0 +1,421 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Stazione Meteo — Telegram Bot Reference</title>
+  <style>
+    :root {
+      --bg: #f6f7f9;
+      --card: #ffffff;
+      --text: #1f2937;
+      --muted: #6b7280;
+      --border: #e5e7eb;
+      --accent: #2563eb;
+      --accent-soft: #eff6ff;
+      --code-bg: #0f172a;
+      --code-text: #e2e8f0;
+      --in: #059669;
+      --out: #d97706;
+      --danger: #dc2626;
+    }
+
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #0b0f16;
+        --card: #141a23;
+        --text: #e5e7eb;
+        --muted: #9aa4b2;
+        --border: #263041;
+        --accent: #60a5fa;
+        --accent-soft: #16233a;
+        --code-bg: #0a0e15;
+        --code-text: #d7e0ea;
+        --in: #34d399;
+        --out: #fbbf24;
+        --danger: #f87171;
+      }
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .wrap {
+      max-width: 960px;
+      margin: 0 auto;
+      padding: 32px 20px 80px;
+    }
+
+    header.page {
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 20px;
+      margin-bottom: 32px;
+    }
+
+    header.page h1 {
+      margin: 0 0 6px;
+      font-size: 1.7rem;
+      font-weight: 800;
+    }
+
+    header.page p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    .meta {
+      margin-top: 12px;
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+
+    .meta code {
+      background: var(--accent-soft);
+      color: var(--accent);
+      padding: 1px 6px;
+      border-radius: 5px;
+    }
+
+    h2 {
+      font-size: 1.25rem;
+      margin: 40px 0 4px;
+      font-weight: 700;
+    }
+
+    h2 .num {
+      color: var(--accent);
+      font-weight: 800;
+      margin-right: 8px;
+    }
+
+    .section-sub {
+      color: var(--muted);
+      margin: 0 0 16px;
+      font-size: 0.92rem;
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 4px 0;
+      overflow: hidden;
+    }
+
+    .table-scroll {
+      overflow-x: auto;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.9rem;
+      min-width: 520px;
+    }
+
+    th, td {
+      text-align: left;
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+
+    th {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      color: var(--muted);
+      background: transparent;
+    }
+
+    tr:last-child td {
+      border-bottom: none;
+    }
+
+    td code, th code {
+      background: var(--accent-soft);
+      color: var(--accent);
+      padding: 2px 7px;
+      border-radius: 5px;
+      font-size: 0.86em;
+      white-space: nowrap;
+    }
+
+    .tag {
+      display: inline-block;
+      font-size: 0.68rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+      padding: 2px 8px;
+      border-radius: 999px;
+      border: 1px solid currentColor;
+      white-space: nowrap;
+    }
+
+    .tag.in { color: var(--in); }
+    .tag.out { color: var(--out); }
+    .tag.danger { color: var(--danger); }
+
+    pre {
+      background: var(--code-bg);
+      color: var(--code-text);
+      padding: 16px 18px;
+      border-radius: 10px;
+      overflow-x: auto;
+      font-size: 0.83rem;
+      line-height: 1.5;
+      margin: 14px 0;
+    }
+
+    pre code {
+      font-family: "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    }
+
+    .method {
+      display: inline-block;
+      font-weight: 700;
+      font-size: 0.72rem;
+      padding: 2px 8px;
+      border-radius: 6px;
+      margin-right: 8px;
+      vertical-align: middle;
+    }
+
+    .method.post { background: #dcfce7; color: #166534; }
+    .method.get  { background: #dbeafe; color: #1e40af; }
+
+    @media (prefers-color-scheme: dark) {
+      .method.post { background: #14351f; color: #6ee7a7; }
+      .method.get  { background: #172a4d; color: #93c5fd; }
+    }
+
+    .endpoint {
+      font-family: "SF Mono", Menlo, Consolas, monospace;
+      font-size: 0.85rem;
+      word-break: break-all;
+    }
+
+    .note {
+      background: var(--accent-soft);
+      border-left: 3px solid var(--accent);
+      border-radius: 8px;
+      padding: 12px 16px;
+      margin: 16px 0;
+      font-size: 0.9rem;
+    }
+
+    .note strong { color: var(--accent); }
+
+    .msg {
+      font-style: normal;
+      color: var(--text);
+    }
+
+    footer {
+      margin-top: 60px;
+      padding-top: 20px;
+      border-top: 1px solid var(--border);
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+
+    footer code {
+      background: var(--accent-soft);
+      color: var(--accent);
+      padding: 1px 6px;
+      border-radius: 5px;
+    }
+
+    a { color: var(--accent); }
+  </style>
+</head>
+
+<body>
+  <div class="wrap">
+    <header class="page">
+      <h1>Stazione Meteo — Telegram Bot Reference</h1>
+      <p>Incoming commands and outgoing Telegram API payloads served by the alarm watcher.</p>
+      <div class="meta">
+        Source of truth: <code>rapsberry meteo/alarm_watcher.py</code> &nbsp;·&nbsp;
+        Command menu registered on startup via <code>setMyCommands</code> &nbsp;·&nbsp;
+        Long-polling loop (<code>getUpdates</code>) for inbound commands.
+      </div>
+    </header>
+
+    <!-- ─────────────── 1. Incoming commands ─────────────── -->
+    <h2><span class="num">1</span>Supported commands <span class="tag in">inbound</span></h2>
+    <p class="section-sub">
+      Parsed by <code>handle_command()</code>. A trailing <code>@botname</code> (added by Telegram in
+      groups) is stripped before matching. Unknown commands are silently ignored. Only messages from the
+      configured <code>CHAT_ID</code> are processed — anything else is logged and dropped.
+    </p>
+    <div class="card">
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Command</th>
+              <th>Handler</th>
+              <th>Reply</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><code>/start</code><br><code>/help</code></td>
+              <td><code>HELP_TEXT</code></td>
+              <td>Static list of available commands.</td>
+            </tr>
+            <tr>
+              <td><code>/status</code></td>
+              <td><code>format_status()</code></td>
+              <td>Latest reading for every sensor (Full Sun, Ombra, Interno, Potenza, CPU…), fan state and station id.</td>
+            </tr>
+            <tr>
+              <td><code>/forecast</code></td>
+              <td><code>format_forecast()</code></td>
+              <td>Clear-sky 6&nbsp;AM temperature forecast (radiative cooling, floored at dew point) per outdoor sensor.</td>
+            </tr>
+            <tr>
+              <td><code>/alarms</code></td>
+              <td><code>format_alarms_summary()</code></td>
+              <td>All configured rules, their conditions, target bot, and which are currently firing.</td>
+            </tr>
+            <tr>
+              <td><code>/reboot</code></td>
+              <td><code>do_reboot()</code></td>
+              <td>Confirms, then reboots the Raspberry after a 3&nbsp;s delay (needs a NOPASSWD sudoers entry).</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="note">
+      <strong>Menu vs. handlers.</strong> The <em>menu</em> (the blue “/” list in the chat) is registered
+      separately from the <em>handlers</em>. The five menu entries are pushed to Telegram on every startup;
+      <code>/start</code> works as a handler but is intentionally not listed in the menu.
+    </div>
+
+    <!-- ─────────────── 2. Outgoing API payloads ─────────────── -->
+    <h2><span class="num">2</span>Outgoing API payloads <span class="tag out">outbound</span></h2>
+    <p class="section-sub">
+      Every call targets <code>https://api.telegram.org/bot&lt;TOKEN&gt;/&lt;method&gt;</code>. The default
+      token/chat come from <code>zbot.py</code> (<code>BOT_TOKEN</code>, <code>CHAT_ID</code>); alarm rules
+      may override them per-rule (see §4).
+    </p>
+
+    <h3 style="margin:24px 0 0;font-size:1rem;"><span class="method post">POST</span><span class="endpoint">/sendMessage</span></h3>
+    <p class="section-sub">Sends any bot message — command replies, boot notice, alarm text, reboot confirmation. Form-encoded body:</p>
+    <pre><code>POST https://api.telegram.org/bot&lt;TOKEN&gt;/sendMessage
+Content-Type: application/x-www-form-urlencoded
+timeout: 10s
+
+chat_id = &lt;CHAT_ID&gt;
+text    = &lt;message text&gt;</code></pre>
+
+    <h3 style="margin:24px 0 0;font-size:1rem;"><span class="method post">POST</span><span class="endpoint">/setMyCommands</span></h3>
+    <p class="section-sub">Registers the command menu once at startup. JSON body:</p>
+    <pre><code>POST https://api.telegram.org/bot&lt;TOKEN&gt;/setMyCommands
+Content-Type: application/json
+timeout: 10s
+
+{
+  "commands": [
+    { "command": "status",   "description": "Valori correnti" },
+    { "command": "forecast", "description": "Previsione 6am (cielo sereno)" },
+    { "command": "alarms",   "description": "Soglie configurate e allarmi attivi" },
+    { "command": "reboot",   "description": "Riavvia il Raspberry" },
+    { "command": "help",     "description": "Elenco comandi" }
+  ]
+}</code></pre>
+
+    <h3 style="margin:24px 0 0;font-size:1rem;"><span class="method get">GET</span><span class="endpoint">/getUpdates</span> — long poll</h3>
+    <p class="section-sub">Main loop; blocks up to <code>TG_POLL_TIMEOUT</code> (25&nbsp;s) waiting for inbound messages.</p>
+    <pre><code>GET https://api.telegram.org/bot&lt;TOKEN&gt;/getUpdates
+timeout (HTTP): 35s
+
+timeout = 25          # long-poll seconds
+offset  = &lt;last update_id + 1&gt;</code></pre>
+
+    <h3 style="margin:24px 0 0;font-size:1rem;"><span class="method get">GET</span><span class="endpoint">/getUpdates</span> — drain at boot</h3>
+    <p class="section-sub">Run once on startup to skip messages queued while the watcher was offline.</p>
+    <pre><code>GET https://api.telegram.org/bot&lt;TOKEN&gt;/getUpdates
+timeout (HTTP): 10s
+
+timeout = 0
+offset  = -1          # jump straight to the newest update</code></pre>
+
+    <!-- ─────────────── 3. Outgoing message texts ─────────────── -->
+    <h2><span class="num">3</span>Bot-initiated messages <span class="tag out">outbound</span></h2>
+    <p class="section-sub">Fixed-text messages the bot sends without being asked (all via <code>/sendMessage</code>).</p>
+    <div class="card">
+      <div class="table-scroll">
+        <table>
+          <thead>
+            <tr>
+              <th>Trigger</th>
+              <th>Message text</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Watcher startup / Raspberry boot</td>
+              <td class="msg">🔌 Raspberry avviato — stazione meteo online.</td>
+            </tr>
+            <tr>
+              <td><code>/reboot</code> accepted</td>
+              <td class="msg">Riavvio del Raspberry in corso… 🔄</td>
+            </tr>
+            <tr>
+              <td><code>/reboot</code> failed to spawn</td>
+              <td class="msg">Impossibile avviare il riavvio (vedi log del watcher).</td>
+            </tr>
+            <tr>
+              <td>Handler raised an exception</td>
+              <td class="msg">Errore interno durante l'esecuzione del comando.</td>
+            </tr>
+            <tr>
+              <td>Alarm rule fires</td>
+              <td class="msg">Rule's configured message, or <code>[ALARM] &lt;description&gt;</code> when blank.</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- ─────────────── 4. Multi-bot routing ─────────────── -->
+    <h2><span class="num">4</span>Multi-bot routing <span class="tag out">outbound</span></h2>
+    <p class="section-sub">
+      Alarm rules can send through a dedicated bot instead of the default one. Bots are stored in
+      <code>alarms.db</code> (<code>bots</code> table) and edited from <code>alarms.php</code>.
+    </p>
+    <div class="note">
+      <code>send_rule_message()</code> looks up the rule's <code>bot_id</code>. If that bot has both a
+      <code>token</code> and a <code>chat_id</code>, the alarm goes out on <em>that</em> bot/chat; otherwise it
+      falls back to the default <code>BOT_TOKEN</code> / <code>CHAT_ID</code>. Inbound command polling always
+      uses the default bot only.
+    </div>
+
+    <footer>
+      Generated from <code>rapsberry meteo/alarm_watcher.py</code>. Regenerate this doc when commands,
+      payloads, or message texts change. Tuning constants:
+      <code>ALARM_CHECK_INTERVAL = 60s</code>, <code>TG_POLL_TIMEOUT = 25s</code>,
+      <code>DEBOUNCE_COUNT = 2</code>.
+    </footer>
+  </div>
+</body>
+
+</html>
