@@ -1367,7 +1367,12 @@ if ($api !== '') {
       if (!Array.isArray(rows) || rows.error) return;
       latestEnergia = latest;
 
-      const pv = num(latest.pv_power);
+      // Below 10 W there is no real production (clamp/inverter noise) -> 0 W.
+      // mqtt_receiver.py stores it that way; this also covers rows logged
+      // before that rule existed.
+      const pvZero = (v) => (v !== null && Math.abs(v) < 10) ? 0 : v;
+
+      const pv = pvZero(num(latest.pv_power));
       const grid = num(latest.grid_power);
       const casa = num(latest.casa_power);
 
@@ -1403,7 +1408,7 @@ if ($api !== '') {
 
       const labels = rows.map(r => r.timestamp ? (romeHHMM(r.timestamp) ?? '') : '');
       updateChartData(charts.energia, labels,
-        rows.map(r => num(r.pv_power)),
+        rows.map(r => pvZero(num(r.pv_power))),
         rows.map(r => num(r.grid_power)),
         rows.map(r => num(r.casa_power)),
       );
