@@ -157,11 +157,26 @@ yesterday and the two-day total, while the grid chart shows **prelevato oggi**,
 
 ## Deploying
 
-1. Copy `mqtt_receiver.py` and `meteo.py` to the Pi and restart both services.
+The two Pi scripts do **not** live in the same directory — copying both to the
+web root looks right and silently leaves the old `meteo.py` running:
+
+| File | Path on the Pi |
+|------|----------------|
+| `mqtt_receiver.py` | `/var/www/html/mqtt_receiver.py` |
+| `meteo.py` | `/home/admin/Desktop/meteo/meteo.py` |
+| local dashboard `index.php` | `/var/www/html/index.php` |
+
+Confirm with `pgrep -af meteo.py` before copying, and check the deployed copy
+afterwards with `grep -c read_latest_energy <path>` (0 = still the old file).
+
+1. Copy `mqtt_receiver.py` and `meteo.py` to the paths above and restart both.
    The `energia` table is created automatically.
 2. Copy `index.php` to the Pi web root.
 3. Upload `carica_dati.php`, `index.php` and `grafico.php` to the remote server.
    The MySQL columns are added on the first `carica_dati.php` hit.
+
+`check_energy.py` (next to `mqtt_receiver.py` in this repo) verifies the whole
+chain hop by hop and prints what to fix; run it on the Pi after deploying.
 
 If the meter's MQTT prefix is not `centralino`, change `MQTT_TOPIC_EM_PV` /
 `MQTT_TOPIC_EM_GRID` at the top of `mqtt_receiver.py`.
