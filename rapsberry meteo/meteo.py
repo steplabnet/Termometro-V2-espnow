@@ -66,6 +66,7 @@ fanHistory = np.array([48] * 10, dtype=float)  # moving avg of CPU temp
 
 DB_PATH = "/dev/shm/meteo.db"
 ENERGY_MAX_AGE = 300  # seconds; older Shelly readings are not forwarded
+PV_ZERO_THRESHOLD = 10.0     # PV production below this is noise -> treated as 0 W
 ROLES_PATH = "/var/www/html/sensor_roles.json"  # persisted role->id map; survives reboot
 ONLINE_THRESHOLD = 1200  # seconds; a sensor is "online" if it transmitted more recently than this
 
@@ -154,7 +155,18 @@ def read_latest_energy(max_age=ENERGY_MAX_AGE):
         print("Energy data is stale, skipping:", row["timestamp"])
         return {}
 
-    return {k: row[k] for k in row.keys()}
+    energy = {k: row[k] for k in row.keys()}
+
+    # Same deadband mqtt_receiver.py applies when writing: anything under
+    # PV_ZERO_THRESHOLD is not real production. Re-applied here so older rows
+    # are cleaned too, and casa_power stays consistent with pv_power.
+    pv = energy.get("pv_power")
+    if pv is not None and abs(pv) < PV_ZERO_THRESHOLD:
+        energy["pv_power"] = 0.0
+        grid = energy.get("grid_power")
+        energy["casa_power"] = grid if grid is not None else energy.get("casa_power")
+
+    return energy
 
 
 def db_store_payload(payload):

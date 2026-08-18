@@ -137,6 +137,26 @@ if ($api !== '') {
     return ['available' => true, 'alarms' => $alarms];
   }
 
+  /**
+   * Apply the PV deadband to one energia row: production under 10 W is noise
+   * (clamp leakage / inverter standby), so it is reported as 0 W and
+   * casa_power is kept consistent with it. mqtt_receiver.py already clamps on
+   * write; this also cleans rows logged before that.
+   */
+  function pv_deadband($row)
+  {
+    if (!is_array($row) || !isset($row['pv_power']) || !is_numeric($row['pv_power'])) {
+      return $row;
+    }
+    if (abs((float) $row['pv_power']) < 10.0) {
+      $row['pv_power'] = 0.0;
+      if (isset($row['grid_power']) && is_numeric($row['grid_power'])) {
+        $row['casa_power'] = (float) $row['grid_power'];
+      }
+    }
+    return $row;
+  }
+
   try {
     switch ($api) {
       case 'meteo':
@@ -159,7 +179,7 @@ if ($api !== '') {
           'target'  => $targetTs,
           'meteo'   => row_near($db, 'meteo', $targetTs),
           'ufficio' => row_near($db, 'ufficio', $targetTs),
-          'energia' => row_near($db, 'energia', $targetTs),
+          'energia' => pv_deadband(row_near($db, 'energia', $targetTs)),
         ]);
         break;
 
@@ -179,12 +199,12 @@ if ($api !== '') {
         // mqtt_receiver.py. Same limits as the meteo series.
         $limit = min((int) ($_GET['limit'] ?? METEO_LIMIT), 2880);
         $rows = db_rows($db, "SELECT * FROM energia ORDER BY id DESC LIMIT $limit");
-        echo json_encode(array_reverse($rows));
+        echo json_encode(array_map('pv_deadband', array_reverse($rows)));
         break;
 
       case 'energia_latest':
         $rows = db_rows($db, "SELECT * FROM energia ORDER BY id DESC LIMIT 1");
-        echo json_encode($rows[0] ?? (object) []);
+        echo json_encode(isset($rows[0]) ? pv_deadband($rows[0]) : (object) []);
         break;
 
       case 'sensor_status':

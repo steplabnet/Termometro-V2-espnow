@@ -31,6 +31,7 @@ IN_SENSOR_KEYS = {"sensoreId", "sensorName", "temp", "pressure", "status"}
 ENERGY_WRITE_INTERVAL = 60   # seconds between energia rows
 ENERGY_MAX_AGE = 150         # a clamp's reading is ignored once this stale
 ENERGY_STARTUP_GRACE = 120   # wait this long for the second clamp before logging
+PV_ZERO_THRESHOLD = 10.0     # PV production below this is noise -> recorded as 0 W
 
 # Latest reading per clamp: channel -> (monotonic_seconds, payload dict).
 energy_latest = {}
@@ -178,6 +179,11 @@ def handle_energy(channel, payload):
         return
 
     pv_power = pv.get("act_power")
+    # Below the threshold the inverter is not really producing (clamp leakage,
+    # standby draw); record a clean 0 W so the series and the derived house
+    # load do not carry that noise.
+    if pv_power is not None and abs(pv_power) < PV_ZERO_THRESHOLD:
+        pv_power = 0.0
     grid_power = grid.get("act_power")
     # House load = what the panels make plus what the grid supplies (a negative
     # grid_power means surplus is being exported, so it subtracts).

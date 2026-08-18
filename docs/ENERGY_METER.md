@@ -30,6 +30,25 @@ casa_power = pv_power + grid_power
 
 (export is negative, so it subtracts — exactly what the house is not using.)
 
+### PV deadband
+
+Production below **10 W** is not production — it is clamp leakage and inverter
+standby — so it is recorded and displayed as **0 W**, and `casa_power` is
+derived from the clamped value. The rule is applied at every stage, so rows
+logged before it existed are cleaned on the way out:
+
+| Where | What it clamps |
+|-------|----------------|
+| `mqtt_receiver.py` (`PV_ZERO_THRESHOLD`) | on write to `energia` |
+| `meteo.py` (`read_latest_energy`) | what is forwarded to MQTT and to the server |
+| `rapsberry meteo/index.php` (`pv_deadband`) | every `energia` row served by the API |
+| `carica_dati.php` | the `pvPower` written to MySQL |
+| `server_remoto/index.php` | the live card value |
+| `server_remoto/grafico.php` (`pv_clean`) | chart series, multi-plot and kWh totals |
+
+The grid channel is **not** clamped: small import/export values around zero are
+real and the sign matters.
+
 ---
 
 ## Data flow
