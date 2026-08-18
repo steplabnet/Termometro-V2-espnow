@@ -72,6 +72,9 @@ $safePower0 = (float) ($row['power'] ?? 0);
 $safeData0 = (int) ($row['data'] ?? time());
 $safePortata0 = (float) ($row['portata'] ?? 0);
 
+/** PV production under this many watts is noise, not production. */
+const PV_ZERO_THRESHOLD = 10.0;
+
 /** ---------- 2b. SHELLY PRO EM-50 (PV PRODUCTION + GRID EXCHANGE) ----------
  * Queried apart from the main SELECTs so the dashboard still renders on a DB
  * where carica_dati.php has not yet added the two columns.
@@ -88,14 +91,23 @@ $emAvailable = false;
 try {
   $resEm = $link->query("SELECT `pvPower`,`gridPower` FROM `dati_instant` WHERE `id` = 1");
   if ($resEm instanceof mysqli_result && $rowEm = $resEm->fetch_assoc()) {
-    $emAvailable = true;
     $safePv0 = is_numeric($rowEm['pvPower']) ? (float) $rowEm['pvPower'] : null;
+    // Under 10 W the panels are not producing; show a clean 0 W.
+    if ($safePv0 !== null && abs($safePv0) < PV_ZERO_THRESHOLD) {
+      $safePv0 = 0.0;
+    }
     $safeGrid0 = is_numeric($rowEm['gridPower']) ? (float) $rowEm['gridPower'] : null;
   }
 } catch (Throwable $e) {
   // Columns not created yet (carica_dati.php adds them on its first run).
-  $emAvailable = false;
+  $safePv0 = null;
+  $safeGrid0 = null;
 }
+
+// The meter cards are shown only when a real reading is stored. The columns
+// existing is not enough: they are NULL until meteo.py forwards the first
+// pvPower/gridPower, and empty cards look broken.
+$emAvailable = ($safePv0 !== null || $safeGrid0 !== null);
 
 $safeCasa0 = ($safePv0 !== null && $safeGrid0 !== null) ? $safePv0 + $safeGrid0 : null;
 
@@ -902,6 +914,12 @@ function getPowerClass($val)
     // meter (or its DB columns) is not available, so the card is never empty.
     $pvMetered = ($safePv0 !== null);
     $pvValue = $pvMetered ? round($safePv0) : $safePower0;
+    // Below 10 W there is no real production (clamp/inverter noise) -> show 0.
+    // mqtt_receiver.py already stores it that way; this also covers rows logged
+    // before that rule existed and the ADC fallback above.
+    if ((float) $pvValue < 10.0) {
+      $pvValue = 0;
+    }
     $pvPeak = ($em_max_pv !== null) ? fmtW($em_max_pv) : ($mm_max_power . ' W');
     $pvLink = $pvMetered ? 'grafico.php?var=pvPower' : 'grafico.php?var=power';
     ?>
@@ -1025,47 +1043,8 @@ function getPowerClass($val)
       </a>
     </div>
 
-    <!-- 8. Feedback Previsioni -->
-    <div class="card border-feedback">
-      <a href="feedback.php">
-        <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-feedback" viewBox="0 0 24 24" fill="currentColor">
-          <path
-            d="M20 2H4a2 2 0 0 0-2 2v18l4-4h14a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2zM9.5 12.5l-2.5-3 1.4-1.1 1 1.3 3.2-3.9 1.4 1.2-4.5 5.5z" />
-        </svg>
-        <div class="card-label">Feedback Previsioni</div>
-        <div class="card-value" style="font-size:1.3rem; margin-top:6px;">Com'è il cielo?</div>
-        <div style="font-weight:600; font-size:0.78rem; color:var(--text-muted); margin-top:8px; text-align:center;">
-          Segnala il meteo reale<br>per tarare l'algoritmo
-        </div>
-        <div class="minmax-row">
-          <div class="minmax-item"><span class="minmax-label">Previsto ora</span><span class="minmax-val"
-              style="color:<?php echo $forecast['color']; ?>"><?php echo $forecast['text']; ?></span></div>
-        </div>
-      </a>
-    </div>
-
-    <!-- 9. Multi Plot -->
-    <div class="card border-multi">
-      <a href="grafico.php?var=multi">
-        <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-multi" viewBox="0 0 24 24" fill="none"
-          stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-          <path d="M3 3v18h18" />
-          <path d="M7 15l3-4 3 3 4-6" />
-        </svg>
-        <div class="card-label">Multi Plot</div>
-        <div class="card-value" style="font-size:1.3rem; margin-top:6px;">Confronta dati</div>
-        <div style="font-weight:600; font-size:0.78rem; color:var(--text-muted); margin-top:8px; text-align:center;">
-          Sovrapponi più variabili<br>sullo stesso grafico
-        </div>
-        <div class="minmax-row">
-          <div class="minmax-item"><span class="minmax-label">Grafico</span><span class="minmax-val"
-              style="color:var(--accent-teal)">Comparativo</span></div>
-        </div>
-      </a>
-    </div>
-
     <?php if ($emAvailable): ?>
-      <!-- 10. Scambio con la rete (canale em1:0): >0 prelievo, <0 immissione -->
+      <!-- 8. Scambio con la rete (canale em1:0): >0 prelievo, <0 immissione -->
       <?php
       $exporting = ($safeGrid0 !== null && $safeGrid0 < 0);
       $gridColor = $exporting ? 'var(--accent-green)' : 'var(--accent-blue)';
@@ -1102,7 +1081,7 @@ function getPowerClass($val)
         </a>
       </div>
 
-      <!-- 11. Consumo di casa = produzione + scambio rete -->
+      <!-- 9. Consumo di casa = produzione + scambio rete -->
       <div class="card border-house">
         <a href="grafico.php?var=casa">
           <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-house" viewBox="0 0 24 24" fill="currentColor">
@@ -1123,6 +1102,45 @@ function getPowerClass($val)
         </a>
       </div>
     <?php endif; ?>
+
+    <!-- 10. Feedback Previsioni -->
+    <div class="card border-feedback">
+      <a href="feedback.php">
+        <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-feedback" viewBox="0 0 24 24" fill="currentColor">
+          <path
+            d="M20 2H4a2 2 0 0 0-2 2v18l4-4h14a2 2 0 0 0 2-2V4a2 2 0 0 0-2-2zM9.5 12.5l-2.5-3 1.4-1.1 1 1.3 3.2-3.9 1.4 1.2-4.5 5.5z" />
+        </svg>
+        <div class="card-label">Feedback Previsioni</div>
+        <div class="card-value" style="font-size:1.3rem; margin-top:6px;">Com'è il cielo?</div>
+        <div style="font-weight:600; font-size:0.78rem; color:var(--text-muted); margin-top:8px; text-align:center;">
+          Segnala il meteo reale<br>per tarare l'algoritmo
+        </div>
+        <div class="minmax-row">
+          <div class="minmax-item"><span class="minmax-label">Previsto ora</span><span class="minmax-val"
+              style="color:<?php echo $forecast['color']; ?>"><?php echo $forecast['text']; ?></span></div>
+        </div>
+      </a>
+    </div>
+
+    <!-- 11. Multi Plot -->
+    <div class="card border-multi">
+      <a href="grafico.php?var=multi">
+        <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-multi" viewBox="0 0 24 24" fill="none"
+          stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 3v18h18" />
+          <path d="M7 15l3-4 3 3 4-6" />
+        </svg>
+        <div class="card-label">Multi Plot</div>
+        <div class="card-value" style="font-size:1.3rem; margin-top:6px;">Confronta dati</div>
+        <div style="font-weight:600; font-size:0.78rem; color:var(--text-muted); margin-top:8px; text-align:center;">
+          Sovrapponi più variabili<br>sullo stesso grafico
+        </div>
+        <div class="minmax-row">
+          <div class="minmax-item"><span class="minmax-label">Grafico</span><span class="minmax-val"
+              style="color:var(--accent-teal)">Comparativo</span></div>
+        </div>
+      </a>
+    </div>
   </div>
 
   <footer style="margin-top:40px; text-align:center; font-size:0.8rem; color:var(--text-muted);">

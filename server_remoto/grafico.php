@@ -105,10 +105,23 @@ $MULTI_CATALOG = [
   'casa'        => ['label' => 'Consumo Casa',  'unit' => 'W',    'color' => '#a855f7', 'src' => 'calc', 'signed' => true],
 ];
 
+/** PV production under this many watts is noise, not production. */
+const PV_ZERO_THRESHOLD = 10.0;
+
+/** Apply the PV deadband to a raw pvPower reading. */
+function pv_clean($val)
+{
+  if ($val === null || !is_numeric($val)) {
+    return null;
+  }
+  $val = (float) $val;
+  return (abs($val) < PV_ZERO_THRESHOLD) ? 0.0 : $val;
+}
+
 /** House load: what the panels make plus what the grid supplies (export is negative). */
 function casa_power(array $row)
 {
-  $pv = $row['pvPower'] ?? null;
+  $pv = pv_clean($row['pvPower'] ?? null);
   $grid = $row['gridPower'] ?? null;
   if (!is_numeric($pv) || !is_numeric($grid)) {
     return null;
@@ -194,7 +207,7 @@ if ($isMulti) {
       // everything else treats < -50 as a dead-sensor sentinel.
       $signed = !empty($meta['signed']);
       foreach ($rowsAsc as $rw) {
-        $v = $rw[$k] ?? null;
+        $v = ($k === 'pvPower') ? pv_clean($rw[$k] ?? null) : ($rw[$k] ?? null);
         $ok = is_numeric($v) && ($signed || (float) $v > -50);
         $data[] = $ok ? (float) $v : null;
       }
@@ -275,7 +288,7 @@ while ($row = $result->fetch_array(MYSQLI_ASSOC)) {
       continue;
     }
   } else {
-    $val = $row[$variable];
+    $val = ($variable === 'pvPower') ? pv_clean($row[$variable] ?? null) : $row[$variable];
   }
 
   // --- FILTER: Discard data < -50 (not for signed power channels) ---
@@ -307,7 +320,7 @@ while ($row = $result2->fetch_array(MYSQLI_ASSOC)) {
       continue;
     }
   } else {
-    $val = $row[$variable];
+    $val = ($variable === 'pvPower') ? pv_clean($row[$variable] ?? null) : $row[$variable];
   }
 
   // --- FILTER: Discard data < -50 (not for signed power channels) ---
@@ -533,7 +546,8 @@ if ($isMulti) {
       $prevT = null;
       $prevV = null;
       while ($row = $res->fetch_assoc()) {
-        $v = ($variable === 'casa') ? casa_power($row) : ($row[$variable] ?? null);
+        $v = ($variable === 'casa') ? casa_power($row)
+          : (($variable === 'pvPower') ? pv_clean($row[$variable] ?? null) : ($row[$variable] ?? null));
         if ($v === null || !is_numeric($v)) {
           continue;
         }

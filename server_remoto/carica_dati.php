@@ -44,6 +44,10 @@ $fanMode = $_GET['fan'];
 //   gridPower = grid exchange, W (> 0 importing, < 0 exporting surplus)
 // Both may be absent; null keeps the previous stored value instead of writing 0.
 $pvPower = isset($_GET['pvPower']) && is_numeric($_GET['pvPower']) ? (float) $_GET['pvPower'] : null;
+// Production under 10 W is noise (clamp leakage / inverter standby): store 0.
+if ($pvPower !== null && abs($pvPower) < 10.0) {
+    $pvPower = 0.0;
+}
 $gridPower = isset($_GET['gridPower']) && is_numeric($_GET['gridPower']) ? (float) $_GET['gridPower'] : null;
 
 /**

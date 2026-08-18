@@ -22,6 +22,11 @@ Payload (both channels share the shape):
  "aprt_power":190.1,"pf":0.63,"freq":50.0,"calibration":"factory"}
 ```
 
+Production below **10 W** is inverter/clamp noise, not real output, so
+`mqtt_receiver.py` stores it as a clean `0` (`PV_ZERO_THRESHOLD`). Both
+dashboards apply the same rule when displaying, which also covers rows logged
+before the threshold existed.
+
 House load is derived, never measured:
 
 ```
@@ -128,8 +133,8 @@ outage leaves the last known values on screen rather than showing 0 W.
   the card is never empty. The sky/irraggiamento readout below the value still
   comes from the ADC series, which is the one with seven days of history behind
   it.
-- **Scambio Rete** and **Consumo Casa** sit at the end of the grid, after all
-  the other widgets, and appear only once the DB columns exist.
+- **Scambio Rete** and **Consumo Casa** follow the Temperatura Interno card, and
+  appear only once a real reading has been stored.
 
 ### Charts (`server_remoto/grafico.php`)
 
