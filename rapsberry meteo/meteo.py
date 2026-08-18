@@ -65,6 +65,7 @@ fanHistory = np.array([48] * 10, dtype=float)  # moving avg of CPU temp
 
 
 DB_PATH = "/dev/shm/meteo.db"
+ENERGY_MAX_AGE = 300  # seconds; older Shelly readings are not forwarded
 ROLES_PATH = "/var/www/html/sensor_roles.json"  # persisted role->id map; survives reboot
 ONLINE_THRESHOLD = 1200  # seconds; a sensor is "online" if it transmitted more recently than this
 
@@ -102,8 +103,58 @@ def init_db():
             online      INTEGER             -- 1 if last_change < ONLINE_THRESHOLD, else 0
         )
     """)
+    # Shelly Pro EM-50 readings. Written by mqtt_receiver.py; created here too so
+    # read_latest_energy() works even before the receiver has run once.
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS energia (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp    TEXT,
+            pv_power     REAL,
+            grid_power   REAL,
+            casa_power   REAL,
+            pv_voltage   REAL,
+            pv_current   REAL,
+            pv_pf        REAL,
+            grid_voltage REAL,
+            grid_current REAL,
+            grid_pf      REAL,
+            freq         REAL
+        )
+    """)
     con.commit()
     con.close()
+
+
+def read_latest_energy(max_age=ENERGY_MAX_AGE):
+    """Latest Shelly Pro EM-50 snapshot, or {} when it is missing/stale.
+
+    mqtt_receiver.py owns the energia table; this only reads the freshest row so
+    the production/grid figures ride along to the remote server with the rest of
+    the telemetry.
+    """
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.row_factory = sqlite3.Row
+        row = con.execute(
+            "SELECT * FROM energia ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        con.close()
+    except Exception as e:
+        print("Energy read error:", e)
+        return {}
+
+    if row is None:
+        return {}
+
+    try:
+        stamp = datetime.datetime.strptime(row["timestamp"], "%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError):
+        return {}
+    if (datetime.datetime.utcnow() - stamp).total_seconds() > max_age:
+        print("Energy data is stale, skipping:", row["timestamp"])
+        return {}
+
+    return {k: row[k] for k in row.keys()}
 
 
 def db_store_payload(payload):
@@ -637,6 +688,15 @@ def main():
                 f"&pres={round(pressure)}"
                 f"&power={int(power)}"
             )
+
+            # Shelly Pro EM-50: real PV production and grid exchange. Omitted
+            # from the URL when unavailable so the server keeps its last values
+            # instead of recording a bogus zero.
+            energy = read_latest_energy()
+            if energy.get("pv_power") is not None:
+                url_string += f"&pvPower={round(float(energy['pv_power']), 1)}"
+            if energy.get("grid_power") is not None:
+                url_string += f"&gridPower={round(float(energy['grid_power']), 1)}"
             print(url_string)
 
             try:
@@ -667,6 +727,9 @@ def main():
                 "adc_raw": int(raw_value),
                 "station_id": current_main_station if data_valid else -1,
                 "data_valid": data_valid,
+                "pvPower": energy.get("pv_power"),
+                "gridPower": energy.get("grid_power"),
+                "casaPower": energy.get("casa_power"),
                 "timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
             print("MQTT payload:", payload)

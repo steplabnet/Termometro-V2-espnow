@@ -72,6 +72,69 @@ $safePower0 = (float) ($row['power'] ?? 0);
 $safeData0 = (int) ($row['data'] ?? time());
 $safePortata0 = (float) ($row['portata'] ?? 0);
 
+/** ---------- 2b. SHELLY PRO EM-50 (PV PRODUCTION + GRID EXCHANGE) ----------
+ * Queried apart from the main SELECTs so the dashboard still renders on a DB
+ * where carica_dati.php has not yet added the two columns.
+ *   pvPower   = photovoltaic production, W
+ *   gridPower = grid exchange, W  (> 0 prelievo / import, < 0 immissione / export)
+ *   casaPower = house load = pvPower + gridPower
+ */
+$safePv0 = null;
+$safeGrid0 = null;
+$emAvailable = false;
+
+// mysqli throws on an unknown column (PHP 8.1+ reports errors as exceptions),
+// so this has to be caught, not silenced with @.
+try {
+  $resEm = $link->query("SELECT `pvPower`,`gridPower` FROM `dati_instant` WHERE `id` = 1");
+  if ($resEm instanceof mysqli_result && $rowEm = $resEm->fetch_assoc()) {
+    $emAvailable = true;
+    $safePv0 = is_numeric($rowEm['pvPower']) ? (float) $rowEm['pvPower'] : null;
+    $safeGrid0 = is_numeric($rowEm['gridPower']) ? (float) $rowEm['gridPower'] : null;
+  }
+} catch (Throwable $e) {
+  // Columns not created yet (carica_dati.php adds them on its first run).
+  $emAvailable = false;
+}
+
+$safeCasa0 = ($safePv0 !== null && $safeGrid0 !== null) ? $safePv0 + $safeGrid0 : null;
+
+// 24h extremes for the same two channels (again isolated from the main query).
+$em_max_pv = null;
+$em_max_grid = null;
+$em_min_grid = null;
+$em_max_casa = null;
+if ($emAvailable) {
+  try {
+    $resEmMM = $link->query(
+      "SELECT MAX(pvPower + 0) AS max_pv,
+              MAX(gridPower + 0) AS max_grid,
+              MIN(gridPower + 0) AS min_grid,
+              MAX(pvPower + gridPower) AS max_casa
+       FROM dati_meteo
+       WHERE data >= {$time24hAgo} AND pvPower IS NOT NULL"
+    );
+    if ($resEmMM instanceof mysqli_result && $rowEmMM = $resEmMM->fetch_assoc()) {
+      $em_max_pv = is_numeric($rowEmMM['max_pv']) ? (float) $rowEmMM['max_pv'] : null;
+      $em_max_grid = is_numeric($rowEmMM['max_grid']) ? (float) $rowEmMM['max_grid'] : null;
+      $em_min_grid = is_numeric($rowEmMM['min_grid']) ? (float) $rowEmMM['min_grid'] : null;
+      $em_max_casa = is_numeric($rowEmMM['max_casa']) ? (float) $rowEmMM['max_casa'] : null;
+    }
+  } catch (Throwable $e) {
+    // dati_instant has the columns but dati_meteo does not (yet): no extremes.
+  }
+}
+
+/** Format a wattage as W below 1 kW and kW above, so cards stay readable. */
+function fmtW($val, $default = '--')
+{
+  if ($val === null) {
+    return $default;
+  }
+  $val = (float) $val;
+  return (abs($val) >= 1000) ? number_format($val / 1000, 2) . ' kW' : round($val) . ' W';
+}
+
 /** ---------- 3. PRESSURE & FORECAST (WITH SNOW; USING TEMPERATURA SOLE) ---------- */
 $stateFile = '/dev/shm/thermo_data/state.json';
 $presHistoryFile = '/dev/shm/thermo_data/pres_history.csv';
@@ -132,7 +195,9 @@ $mslp = $safePres0 + 31.8 - 2.5;
 
 // >>> USE TEMPERATURA OMBRA (shade air temp) as reference; fall back to sun sensor <<<
 // The shade sensor is the true air temperature; the sun-exposed probe over-reads.
-$outTemp = ($safeTMobile0 > -99) ? $safeTMobile0 : $safeTemp0;
+// Shade air temp lives in the `tombra` column ($safeTombra0); `tMobile` is the
+// indoor sensor.
+$outTemp = ($safeTombra0 > -99) ? $safeTombra0 : $safeTemp0;
 
 // humidity numeric
 $humi = is_numeric($safeHombra0) ? (float) $safeHombra0 : 0.0;
@@ -396,6 +461,7 @@ function getPowerClass($val)
       --accent-ice: #0ea5e9;
       --accent-purple: #8b5cf6;
       --accent-dry: #92400e;
+      --accent-green: #16a34a;
       --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
     }
 
@@ -615,6 +681,37 @@ function getPowerClass($val)
       border-top-color: var(--accent-teal);
     }
 
+    .border-grid {
+      border-top-color: var(--accent-blue);
+    }
+
+    .border-grid.exporting {
+      border-top-color: var(--accent-green);
+    }
+
+    .border-house {
+      border-top-color: var(--accent-purple);
+    }
+
+    .icon-grid {
+      color: var(--accent-blue);
+    }
+
+    .border-grid.exporting .icon-grid {
+      color: var(--accent-green);
+    }
+
+    .icon-house {
+      color: var(--accent-purple);
+    }
+
+    .flow-state {
+      font-weight: 800;
+      font-size: 0.78rem;
+      margin-top: 5px;
+      text-transform: uppercase;
+    }
+
     .icon-multi {
       color: var(--accent-teal);
     }
@@ -652,9 +749,9 @@ function getPowerClass($val)
       </a>
     </div>
 
-    <!-- 2. Temp Ombra -->
-    <div class="card border-temp <?php echo getTempClass($safeTMobile0); ?>">
-      <a href="grafico.php?var=tMobile">
+    <!-- 2. Temp Ombra (DB column: tombra) -->
+    <div class="card border-temp <?php echo getTempClass($safeTombra0); ?>">
+      <a href="grafico.php?var=tombra">
         <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-temp icon-warm" viewBox="0 0 24 24">
           <path
             d="M14 2a5 5 0 0 0-5 5v8a5 5 0 0 0-2.15 4.096A5 5 0 0 0 12 24a5 5 0 0 0 5.15-4.904A5 5 0 0 0 15 15V7a5 5 0 0 0-1-3Z" />
@@ -663,16 +760,16 @@ function getPowerClass($val)
           <path d="M2 12h20M12 2v20M20 4l-8 8-8-8M4 20l8-8 8 8" />
         </svg>
         <div class="card-label">Temperatura Ombra</div>
-        <div class="card-value"><?php echo ($safeTMobile0 <= -99 ? '--' : $safeTMobile0); ?><span
+        <div class="card-value"><?php echo ($safeTombra0 <= -99 ? '--' : $safeTombra0); ?><span
             class="card-unit">°C</span></div>
         <div class="minmax-row">
           <div class="minmax-item"><span class="minmax-label">Min</span><span
-              class="minmax-val val-min"><?php echo $mm_min_tMobile; ?>°</span></div>
+              class="minmax-val val-min"><?php echo $mm_min_tombra; ?>°</span></div>
           <div class="minmax-item"><span
-              class="minmax-label">Trend</span><?php echo getTrendHtml($trend_tMobile, '°C/h', $iceTime_tMobile); ?>
+              class="minmax-label">Trend</span><?php echo getTrendHtml($trend_tombra, '°C/h', $iceTime_tombra); ?>
           </div>
           <div class="minmax-item"><span class="minmax-label">Max</span><span
-              class="minmax-val val-max"><?php echo $mm_max_tMobile; ?>°</span></div>
+              class="minmax-val val-max"><?php echo $mm_max_tombra; ?>°</span></div>
         </div>
       </a>
     </div>
@@ -799,9 +896,17 @@ function getPowerClass($val)
       </a>
     </div>
 
-    <!-- 4. Potenza Fotovoltaico (istantanea) -->
-    <div class="card border-power <?php echo getPowerClass($safePower0); ?>">
-      <a href="grafico.php?var=power">
+    <!-- 4. Produzione Fotovoltaico (Shelly Pro EM-50, canale em1:1) -->
+    <?php
+    // Prefer the metered production; fall back to the ADC estimate while the
+    // meter (or its DB columns) is not available, so the card is never empty.
+    $pvMetered = ($safePv0 !== null);
+    $pvValue = $pvMetered ? round($safePv0) : $safePower0;
+    $pvPeak = ($em_max_pv !== null) ? fmtW($em_max_pv) : ($mm_max_power . ' W');
+    $pvLink = $pvMetered ? 'grafico.php?var=pvPower' : 'grafico.php?var=power';
+    ?>
+    <div class="card border-power <?php echo getPowerClass((float) $pvValue); ?>">
+      <a href="<?php echo $pvLink; ?>">
 
         <!-- Day icon: solar panel + lightning -->
         <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-power icon-day" viewBox="0 0 24 24"
@@ -830,8 +935,8 @@ function getPowerClass($val)
           <path d="M5.8 14.5h12.4" opacity="0.25" />
         </svg>
 
-        <div class="card-label">Potenza Fotovoltaico</div>
-        <div class="card-value"><?php echo $safePower0; ?><span class="card-unit">W</span></div>
+        <div class="card-label">Produzione Fotovoltaico</div>
+        <div class="card-value"><?php echo $pvValue; ?><span class="card-unit">W</span></div>
 
         <?php if ($skyNow !== null): ?>
           <div
@@ -843,7 +948,7 @@ function getPowerClass($val)
         <div class="minmax-row">
           <div class="minmax-item">
             <span class="minmax-label">Picco 24h</span>
-            <span class="minmax-val"><?php echo $mm_max_power; ?> W</span>
+            <span class="minmax-val"><?php echo $pvPeak; ?></span>
           </div>
           <div class="minmax-item">
             <span class="minmax-label">Irraggiamento</span>
@@ -899,23 +1004,23 @@ function getPowerClass($val)
       </a>
     </div>
 
-    <!-- 7. Temp Interno -->
-    <div class="card border-temp <?php echo getTempClass($safeTombra0); ?>">
-      <a href="grafico.php?var=tombra">
+    <!-- 7. Temp Interno (DB column: tMobile) -->
+    <div class="card border-temp <?php echo getTempClass($safeTMobile0); ?>">
+      <a href="grafico.php?var=tMobile">
         <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-temp icon-warm" viewBox="0 0 24 24">
           <path
             d="M14 2a5 5 0 0 0-5 5v8a5 5 0 0 0-2.15 4.096A5 5 0 0 0 12 24a5 5 0 0 0 5.15-4.904A5 5 0 0 0 15 15V7a5 5 0 0 0-1-3Z" />
         </svg>
         <div class="card-label">Temperatura Interno</div>
-        <div class="card-value"><?php echo ($safeTombra0 <= -99 ? '--' : $safeTombra0); ?><span
+        <div class="card-value"><?php echo ($safeTMobile0 <= -99 ? '--' : $safeTMobile0); ?><span
             class="card-unit">°C</span></div>
         <div class="minmax-row">
           <div class="minmax-item"><span class="minmax-label">Min</span><span
-              class="minmax-val val-min"><?php echo $mm_min_tombra; ?>°</span></div>
+              class="minmax-val val-min"><?php echo $mm_min_tMobile; ?>°</span></div>
           <div class="minmax-item"><span
-              class="minmax-label">Trend</span><?php echo getTrendHtml($trend_tombra, '°C/h', $iceTime_tombra); ?></div>
+              class="minmax-label">Trend</span><?php echo getTrendHtml($trend_tMobile, '°C/h', $iceTime_tMobile); ?></div>
           <div class="minmax-item"><span class="minmax-label">Max</span><span
-              class="minmax-val val-max"><?php echo $mm_max_tombra; ?>°</span></div>
+              class="minmax-val val-max"><?php echo $mm_max_tMobile; ?>°</span></div>
         </div>
       </a>
     </div>
@@ -958,6 +1063,66 @@ function getPowerClass($val)
         </div>
       </a>
     </div>
+
+    <?php if ($emAvailable): ?>
+      <!-- 10. Scambio con la rete (canale em1:0): >0 prelievo, <0 immissione -->
+      <?php
+      $exporting = ($safeGrid0 !== null && $safeGrid0 < 0);
+      $gridColor = $exporting ? 'var(--accent-green)' : 'var(--accent-blue)';
+      ?>
+      <div class="card border-grid <?php echo $exporting ? 'exporting' : ''; ?>">
+        <a href="grafico.php?var=gridPower">
+          <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-grid" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M11 2h2v4h-2V2zM6.2 4.6l1.6 1.2-2.4 3.2-1.6-1.2 2.4-3.2zm11.6 0 2.4 3.2-1.6 1.2-2.4-3.2 1.6-1.2z" />
+            <path d="M7 8h10l3 12H4L7 8zm2 2-.6 2.5h7.2L15 10H9zm-1.1 4.5-.9 3.5h9.9l-.9-3.5H7.9z" opacity="0.85" />
+          </svg>
+          <div class="card-label">Scambio Rete</div>
+          <div class="card-value"><?php echo ($safeGrid0 === null ? '--' : round(abs($safeGrid0))); ?><span
+              class="card-unit">W</span></div>
+          <div class="flow-state" style="color:<?php echo $gridColor; ?>;">
+            <?php
+            if ($safeGrid0 === null) {
+              echo '--';
+            } elseif ($exporting) {
+              echo '&#8593; Immissione';
+            } elseif ($safeGrid0 > 5) {
+              echo '&#8595; Prelievo';
+            } else {
+              echo 'Equilibrio';
+            }
+            ?>
+          </div>
+          <div class="minmax-row">
+            <div class="minmax-item"><span class="minmax-label">Max prelievo</span><span
+                class="minmax-val val-max"><?php echo ($em_max_grid === null ? '--' : fmtW(max(0, $em_max_grid))); ?></span></div>
+            <div class="minmax-item"><span class="minmax-label">Max immissione</span><span
+                class="minmax-val val-min"><?php echo ($em_min_grid === null ? '--' : fmtW(abs(min(0, $em_min_grid)))); ?></span>
+            </div>
+          </div>
+        </a>
+      </div>
+
+      <!-- 11. Consumo di casa = produzione + scambio rete -->
+      <div class="card border-house">
+        <a href="grafico.php?var=casa">
+          <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-house" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M12 3 2 12h3v9h6v-6h2v6h6v-9h3L12 3z" />
+          </svg>
+          <div class="card-label">Consumo Casa</div>
+          <div class="card-value"><?php echo ($safeCasa0 === null ? '--' : round($safeCasa0)); ?><span
+              class="card-unit">W</span></div>
+          <?php if ($safeCasa0 !== null && $safePv0 !== null && $safeCasa0 > 0): ?>
+            <div class="flow-state" style="color:var(--accent-purple);">
+              <?php echo round(min(100, ($safePv0 / $safeCasa0) * 100)); ?>% da fotovoltaico
+            </div>
+          <?php endif; ?>
+          <div class="minmax-row">
+            <div class="minmax-item"><span class="minmax-label">Picco 24h</span><span
+                class="minmax-val"><?php echo fmtW($em_max_casa); ?></span></div>
+          </div>
+        </a>
+      </div>
+    <?php endif; ?>
   </div>
 
   <footer style="margin-top:40px; text-align:center; font-size:0.8rem; color:var(--text-muted);">

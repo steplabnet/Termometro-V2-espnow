@@ -3,6 +3,10 @@
 define('DB_PATH', '/dev/shm/meteo.db');
 define('METEO_LIMIT', 1440);   // default history points (~2 h at 1/min)
 define('SENSORS_LIMIT', 50);
+// Alarm rules DB + live fired-state file — written by alarm_watcher.py / alarms.php.
+// Paths pinned to match those two so all three processes agree.
+define('ALARMS_DB_PATH', '/var/www/html/alarms.db');
+define('ALARM_STATE_PATH', '/dev/shm/alarm_state.json');
 
 // ── API mode ─────────────────────────────────────────────────────────────────
 $api = $_GET['api'] ?? '';
@@ -40,6 +44,99 @@ if ($api !== '') {
     }
   }
 
+  // Row of $table whose timestamp is closest to $targetTs (UTC ISO-Z string),
+  // searched inside a ±$windowMin window. Returns null when the logger was down
+  // around that moment, so the caller can show "—" instead of a stale value.
+  function row_near(PDO $db, string $table, string $targetTs, int $windowMin = 20)
+  {
+    $t = strtotime($targetTs);
+    $lo = gmdate('Y-m-d\TH:i:s\Z', $t - $windowMin * 60);
+    $hi = gmdate('Y-m-d\TH:i:s\Z', $t + $windowMin * 60);
+    try {
+      $st = $db->prepare("SELECT * FROM $table WHERE timestamp BETWEEN :lo AND :hi");
+      $st->execute([':lo' => $lo, ':hi' => $hi]);
+      $rows = $st->fetchAll();
+    } catch (Exception $e) {
+      return null;
+    }
+
+    $best = null;
+    $bestDiff = PHP_INT_MAX;
+    foreach ($rows as $r) {
+      $rt = strtotime((string) ($r['timestamp'] ?? ''));
+      if ($rt === false) continue;
+      $diff = abs($rt - $t);
+      if ($diff < $bestDiff) { $bestDiff = $diff; $best = $r; }
+    }
+    return $best;
+  }
+
+  // Currently-triggered alarms, derived the same way alarm_watcher.py reports
+  // "Allarmi attivi": an enabled edge rule with state.fired, or a scheduled rule
+  // whose last_fired == today. Reads the rules DB + live state file directly so
+  // the dashboard reflects exactly what the watcher has sent.
+  function active_alarms(): array
+  {
+    if (!file_exists(ALARMS_DB_PATH)) {
+      return ['available' => false, 'alarms' => []];
+    }
+    try {
+      $adb = new PDO('sqlite:' . ALARMS_DB_PATH, null, null, [
+        PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
+        PDO::ATTR_TIMEOUT => 2,
+      ]);
+      $rules = $adb->query("SELECT id, enabled, message FROM rules ORDER BY id")->fetchAll();
+    } catch (Exception $e) {
+      // Schema not created yet / DB unreadable — treat as "no config available".
+      return ['available' => false, 'alarms' => []];
+    }
+
+    // Which rules carry a schedule condition (fire-once-per-day semantics).
+    $scheduled = [];
+    try {
+      foreach ($adb->query("SELECT DISTINCT rule_id FROM conditions WHERE kind = 'schedule'") as $c) {
+        $scheduled[(int) $c['rule_id']] = true;
+      }
+    } catch (Exception $e) { /* conditions table absent — no scheduled rules */ }
+    $adb = null;
+
+    // Live fired-state (edge rules: {fired, fired_at}; scheduled: {last_fired}).
+    $state = [];
+    if (file_exists(ALARM_STATE_PATH)) {
+      $j = json_decode((string) file_get_contents(ALARM_STATE_PATH), true);
+      if (is_array($j)) $state = $j;
+    }
+
+    $today = date('Y-m-d');
+    $alarms = [];
+    foreach ($rules as $rule) {
+      if (empty($rule['enabled'])) continue;
+      $rid = (string) $rule['id'];
+      $entry = (isset($state[$rid]) && is_array($state[$rid])) ? $state[$rid] : [];
+      $isSched = !empty($scheduled[(int) $rule['id']]);
+
+      $active = false;
+      $when = null;
+      if ($isSched) {
+        if (($entry['last_fired'] ?? null) === $today) { $active = true; $when = $entry['last_fired']; }
+      } else {
+        if (!empty($entry['fired'])) { $active = true; $when = $entry['fired_at'] ?? null; }
+      }
+      if (!$active) continue;
+
+      $msg = trim((string) ($rule['message'] ?? ''));
+      $alarms[] = [
+        'id'        => (int) $rule['id'],
+        'label'     => $msg !== '' ? $msg : ('Regola #' . $rid),
+        'when'      => $when,
+        'scheduled' => $isSched,
+      ];
+    }
+
+    return ['available' => true, 'alarms' => $alarms];
+  }
+
   try {
     switch ($api) {
       case 'meteo':
@@ -53,6 +150,19 @@ if ($api !== '') {
         echo json_encode($rows[0] ?? (object) []);
         break;
 
+      case 'yesterday':
+        // Snapshot of meteo + ufficio at (now − 24 h), used by the "oggi vs ieri"
+        // comparison table. Timestamps are stored as UTC "YYYY-MM-DDTHH:MM:SSZ",
+        // so lexicographic BETWEEN over a ±window is a valid time range filter.
+        $targetTs = gmdate('Y-m-d\TH:i:s\Z', time() - 86400);
+        echo json_encode([
+          'target'  => $targetTs,
+          'meteo'   => row_near($db, 'meteo', $targetTs),
+          'ufficio' => row_near($db, 'ufficio', $targetTs),
+          'energia' => row_near($db, 'energia', $targetTs),
+        ]);
+        break;
+
       case 'ufficio':
         $limit = min((int) ($_GET['limit'] ?? METEO_LIMIT), 2880);
         $rows = db_rows($db, "SELECT * FROM ufficio ORDER BY id DESC LIMIT $limit");
@@ -61,6 +171,19 @@ if ($api !== '') {
 
       case 'ufficio_latest':
         $rows = db_rows($db, "SELECT * FROM ufficio ORDER BY id DESC LIMIT 1");
+        echo json_encode($rows[0] ?? (object) []);
+        break;
+
+      case 'energia':
+        // Shelly Pro EM-50 history (pv / grid / house load), written ~1/min by
+        // mqtt_receiver.py. Same limits as the meteo series.
+        $limit = min((int) ($_GET['limit'] ?? METEO_LIMIT), 2880);
+        $rows = db_rows($db, "SELECT * FROM energia ORDER BY id DESC LIMIT $limit");
+        echo json_encode(array_reverse($rows));
+        break;
+
+      case 'energia_latest':
+        $rows = db_rows($db, "SELECT * FROM energia ORDER BY id DESC LIMIT 1");
         echo json_encode($rows[0] ?? (object) []);
         break;
 
@@ -85,6 +208,10 @@ if ($api !== '') {
                     ORDER BY s.sensoreId
                 ");
         echo json_encode($rows);
+        break;
+
+      case 'alarms':
+        echo json_encode(active_alarms());
         break;
 
       default:
@@ -158,6 +285,107 @@ if ($api !== '') {
 
     .header-link svg { width: 1rem; height: 1rem; }
     .header-link:hover { text-decoration: underline; }
+
+    /* ── Triggered-alarms panel ── */
+    .alarms-panel {
+      background: #ffffff;
+      border-radius: .75rem;
+      padding: 1rem 1.2rem;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, .08);
+      margin-bottom: 1.5rem;
+      border-left: 4px solid #16a34a;
+    }
+
+    .alarms-panel.has-alarms {
+      border-left-color: #dc2626;
+      background: #fef2f2;
+    }
+
+    .alarms-head {
+      display: flex;
+      align-items: center;
+      gap: .5rem;
+      font-size: .85rem;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      color: #64748b;
+      font-weight: 600;
+      margin-bottom: .6rem;
+    }
+
+    .alarms-head svg {
+      width: 1.1rem;
+      height: 1.1rem;
+      color: #16a34a;
+      flex-shrink: 0;
+    }
+
+    .alarms-panel.has-alarms .alarms-head svg {
+      color: #dc2626;
+    }
+
+    .alarms-count {
+      margin-left: auto;
+      font-size: .72rem;
+      font-weight: 700;
+      background: #dcfce7;
+      color: #16a34a;
+      border-radius: 999px;
+      padding: .1rem .55rem;
+    }
+
+    .alarms-panel.has-alarms .alarms-count {
+      background: #fee2e2;
+      color: #dc2626;
+    }
+
+    .alarms-list {
+      list-style: none;
+      display: flex;
+      flex-direction: column;
+      gap: .4rem;
+    }
+
+    .alarm-item {
+      display: flex;
+      align-items: baseline;
+      gap: .6rem;
+      padding: .5rem .7rem;
+      background: #ffffff;
+      border: 1px solid #fecaca;
+      border-radius: .5rem;
+    }
+
+    .alarm-item .alarm-label {
+      font-weight: 600;
+      color: #991b1b;
+    }
+
+    .alarm-item .alarm-sched {
+      font-size: .62rem;
+      text-transform: uppercase;
+      letter-spacing: .04em;
+      color: #9333ea;
+      border: 1px solid #e9d5ff;
+      border-radius: 999px;
+      padding: .05rem .4rem;
+    }
+
+    .alarm-item .alarm-when {
+      margin-left: auto;
+      font-size: .75rem;
+      color: #64748b;
+      white-space: nowrap;
+    }
+
+    .alarms-empty {
+      font-size: .85rem;
+      color: #16a34a;
+    }
+
+    .alarms-panel.has-alarms .alarms-empty {
+      color: #dc2626;
+    }
 
     /* ── Cards ── */
     .cards {
@@ -329,6 +557,10 @@ if ($api !== '') {
       color: #9333ea;
     }
 
+    .icon-plug {
+      color: #f97316;
+    }
+
     header h1 svg {
       width: 1.5rem;
       height: 1.5rem;
@@ -430,6 +662,51 @@ if ($api !== '') {
       padding: .15rem .5rem;
       border-radius: 999px;
       font-size: .72rem;
+    }
+
+    /* ── Today vs yesterday table ── */
+    .section-head {
+      display: flex;
+      align-items: baseline;
+      gap: .6rem;
+      flex-wrap: wrap;
+      margin-bottom: .6rem;
+    }
+
+    .section-head .section-title {
+      margin-bottom: 0;
+    }
+
+    .section-note {
+      font-size: .75rem;
+      color: #94a3b8;
+    }
+
+    #yday-table td.num,
+    #yday-table th.num {
+      text-align: right;
+      font-variant-numeric: tabular-nums;
+    }
+
+    #yday-table td.metric {
+      font-weight: 600;
+      color: #334155;
+    }
+
+    #yday-table td.num.now {
+      font-weight: 700;
+    }
+
+    .delta-up {
+      color: #dc2626;
+    }
+
+    .delta-down {
+      color: #0284c7;
+    }
+
+    .delta-flat {
+      color: #64748b;
     }
 
     #db-error {
@@ -576,6 +853,23 @@ if ($api !== '') {
 
   <div id="db-error"></div>
 
+  <!-- ── Triggered alarms ── -->
+  <div class="alarms-panel" id="alarms-panel">
+    <div class="alarms-head">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+        stroke-linejoin="round" aria-hidden="true">
+        <path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z" />
+        <line x1="12" y1="9" x2="12" y2="13" />
+        <line x1="12" y1="17" x2="12.01" y2="17" />
+      </svg>
+      Allarmi Attivi
+      <span class="alarms-count" id="alarms-count">—</span>
+    </div>
+    <ul class="alarms-list" id="alarms-list">
+      <li class="alarms-empty">Caricamento…</li>
+    </ul>
+  </div>
+
   <!-- ── Grouped panels (temp + humidity + combined chart) ── -->
   <div class="groups">
     <div class="group" data-compare="fullsun" title="Clicca per confronto con ieri">
@@ -654,6 +948,28 @@ if ($api !== '') {
       </div>
       <canvas id="chart-power" height="140"></canvas>
     </div>
+    <div class="group" data-compare="energia" title="Clicca per confronto con ieri">
+      <h2>
+        <svg class="icon-plug" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M9 2v6M15 2v6" />
+          <path d="M6 8h12v3a6 6 0 0 1-12 0V8z" />
+          <path d="M12 17v5" />
+        </svg>
+        Energia (Shelly EM)
+      </h2>
+      <div class="group-stats">
+        <div class="stat"><span class="label">Produzione FV</span><span class="value c-orange"
+            id="c-pv">—</span><span class="unit">W</span></div>
+        <div class="stat"><span class="label">Scambio Rete</span><span class="value c-blue"
+            id="c-grid">—</span><span class="unit" id="c-grid-dir">W</span></div>
+        <div class="stat"><span class="label">Consumo Casa</span><span class="value c-purple"
+            id="c-casa">—</span><span class="unit">W</span></div>
+        <div class="stat"><span class="label">Autoconsumo</span><span class="value c-green"
+            id="c-selfuse">—</span><span class="unit">%</span></div>
+      </div>
+      <canvas id="chart-energia" height="140"></canvas>
+    </div>
     <div class="group">
       <h2>
         <svg class="icon-server" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
@@ -696,12 +1012,6 @@ if ($api !== '') {
     </div>
   </div>
 
-  <!-- ── Stat cards ── -->
-  <div class="cards">
-    <div class="card"><span class="label">Stazione ID</span><span class="value c-gray" id="c-station">—</span><span
-        class="unit"></span></div>
-  </div>
-
   <!-- ── Comparison modal (today vs yesterday) ── -->
   <div class="modal" id="compare-modal" hidden>
     <div class="modal-backdrop" data-close></div>
@@ -712,23 +1022,43 @@ if ($api !== '') {
       </div>
       <div class="modal-body">
         <div class="chart-box">
-          <h2>Temperatura (°C) — oggi vs ieri</h2>
-          <canvas id="compare-temp" height="180"></canvas>
+          <h2 id="compare-title-a">—</h2>
+          <canvas id="compare-a" height="180"></canvas>
         </div>
         <div class="chart-box">
-          <h2>Umidità (%) — oggi vs ieri</h2>
-          <div class="compare-avg">
-            <span class="pill"><span class="swatch" id="compare-humi-swatch-today"></span>Media oggi:
-              <strong id="compare-humi-avg-today">—</strong>%</span>
-            <span class="pill"><span class="swatch" id="compare-humi-swatch-yday"
-                style="background:rgba(100,116,139,.8)"></span>Media ieri:
-              <strong id="compare-humi-avg-yday">—</strong>%</span>
+          <h2 id="compare-title-b">—</h2>
+          <div class="compare-avg" id="compare-avg-row">
+            <span class="pill"><span class="swatch" id="compare-swatch-today"></span>Media oggi:
+              <strong id="compare-avg-today">—</strong><span id="compare-avg-unit-a"></span></span>
+            <span class="pill"><span class="swatch" style="background:rgba(100,116,139,.8)"></span>Media ieri:
+              <strong id="compare-avg-yday">—</strong><span id="compare-avg-unit-b"></span></span>
           </div>
-          <canvas id="compare-humi" height="180"></canvas>
+          <canvas id="compare-b" height="180"></canvas>
         </div>
       </div>
     </div>
   </div>
+
+  <!-- ── Today vs same time yesterday ── -->
+  <div class="section-head">
+    <div class="section-title">Confronto con ieri (stessa ora)</div>
+    <span class="section-note" id="yday-when">—</span>
+  </div>
+  <table id="yday-table" style="margin-bottom:1.5rem">
+    <thead>
+      <tr>
+        <th>Grandezza</th>
+        <th class="num">Adesso</th>
+        <th class="num">Ieri</th>
+        <th class="num">Δ</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td colspan="4" style="color:#64748b">Loading…</td>
+      </tr>
+    </tbody>
+  </table>
 
   <!-- ── Sensors table ── -->
   <div class="section-title">Sensori IN (ultimi valori)</div>
@@ -817,6 +1147,11 @@ if ($api !== '') {
       ombra: makeTempHumiChart('chart-ombra', 'rgb(22,163,74)', 'rgb(99,102,241)'),
       power: makeChart('chart-power', [ds('Potenza', 'rgb(234,88,12)', true)]),
       cpu: makeChart('chart-cpu', [ds('CPU', 'rgb(220,38,38)')]),
+      energia: makeChart('chart-energia', [
+        ds('Produzione FV', 'rgb(249,115,22)', true),
+        ds('Scambio Rete', 'rgb(14,165,233)'),
+        ds('Consumo Casa', 'rgb(168,85,247)'),
+      ], 'W'),
       ufficio: makeTempHumiChart('chart-ufficio', 'rgb(147,51,234)', 'rgb(99,102,241)'),
     };
 
@@ -884,6 +1219,19 @@ if ($api !== '') {
       document.getElementById(id).textContent = (v === null || v === undefined) ? '—' : v.toFixed(decimals);
     }
 
+    // Latest rows kept around so the "confronto con ieri" table can reuse them
+    // instead of re-fetching the same two endpoints every refresh.
+    let latestMeteo = null;
+    let latestUfficio = null;
+    let latestEnergia = null;
+
+    // Signed numeric coercion: keeps negatives (grid export) but rejects junk.
+    function num(v) {
+      if (v === null || v === undefined || v === '') return null;
+      const n = Number(v);
+      return Number.isFinite(n) ? n : null;
+    }
+
     // ── Fetch & render meteo ──────────────────────────────────────────────────────
     async function loadMeteo() {
       const [histRes, latestRes] = await Promise.all([
@@ -907,6 +1255,7 @@ if ($api !== '') {
       if (rows.error) { showError(rows.error); return; }
       if (!Array.isArray(rows)) { showError('Unexpected response from meteo API'); return; }
       hideError();
+      latestMeteo = latest;
 
       // Cards
       setCard('c-temp', latest.temp);
@@ -920,7 +1269,6 @@ if ($api !== '') {
       setCard('c-hmobile', nullIfNegative(latest.hombra), 0);
       setCard('c-power', latest.power, 0);
       setCard('c-cpu', latest.tempCpu);
-      setCard('c-station', latest.station_id, 0);
 
       const fanEl = document.getElementById('c-fan');
       fanEl.textContent = latest.fan ? 'ON' : 'OFF';
@@ -966,6 +1314,7 @@ if ($api !== '') {
       const rows = await histRes.json();
       const latest = await latestRes.json();
       if (!Array.isArray(rows) || rows.error) return;
+      latestUfficio = latest;
 
       setCard('c-uff-temp', latest.temp);
       setCard('c-uff-hum', nullIfNegative(latest.hum), 0);
@@ -980,6 +1329,63 @@ if ($api !== '') {
       updateChartData(charts.ufficio, labels,
         rows.map(r => nullIfSentinel(r.temp)),
         rows.map(r => nullIfNegative(r.hum)),
+      );
+    }
+
+    // ── Fetch & render energy meter (Shelly Pro EM-50) ────────────────────────────
+    // grid_power is signed: > 0 while importing from the grid, < 0 while the PV
+    // surplus is being exported, so no negative-value filter is applied here.
+    async function loadEnergia() {
+      const [histRes, latestRes] = await Promise.all([
+        fetch('?api=energia&limit=1440'),
+        fetch('?api=energia_latest'),
+      ]);
+      if (!histRes.ok || !latestRes.ok) return;
+
+      const rows = await histRes.json();
+      const latest = await latestRes.json();
+      if (!Array.isArray(rows) || rows.error) return;
+      latestEnergia = latest;
+
+      const pv = num(latest.pv_power);
+      const grid = num(latest.grid_power);
+      const casa = num(latest.casa_power);
+
+      // setText (not setCard): these are watt figures, and setCard's formatter
+      // would blank anything <= -99 as a dead-sensor sentinel.
+      setText('c-pv', pv);
+      setText('c-grid', grid === null ? null : Math.abs(grid));
+      setText('c-casa', casa);
+
+      // Direction is carried by the unit label + colour, so the figure itself
+      // can stay unsigned and readable.
+      const gridEl = document.getElementById('c-grid');
+      const dirEl = document.getElementById('c-grid-dir');
+      if (grid === null) {
+        dirEl.textContent = 'W';
+        gridEl.className = 'value c-blue';
+      } else if (grid < -5) {
+        dirEl.textContent = 'W immessi';
+        gridEl.className = 'value c-green';
+      } else if (grid > 5) {
+        dirEl.textContent = 'W prelevati';
+        gridEl.className = 'value c-blue';
+      } else {
+        dirEl.textContent = 'W';
+        gridEl.className = 'value c-teal';
+      }
+
+      // Share of the house load covered by the panels right now.
+      const selfUse = (pv !== null && casa !== null && casa > 0)
+        ? Math.min(100, (pv / casa) * 100)
+        : null;
+      setText('c-selfuse', selfUse);
+
+      const labels = rows.map(r => r.timestamp ? (romeHHMM(r.timestamp) ?? '') : '');
+      updateChartData(charts.energia, labels,
+        rows.map(r => num(r.pv_power)),
+        rows.map(r => num(r.grid_power)),
+        rows.map(r => num(r.casa_power)),
       );
     }
 
@@ -1036,6 +1442,146 @@ if ($api !== '') {
       }).join('');
     }
 
+    // ── Fetch & render triggered alarms ───────────────────────────────────────────
+    function escapeHtml(s) {
+      return String(s).replace(/[&<>"']/g, c =>
+        ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    }
+
+    function formatAlarmWhen(when, scheduled) {
+      if (!when) return '';
+      if (scheduled) return 'oggi';
+      // Edge rules store "YYYY-MM-DD HH:MM:SS" (already Rome local time on the Pi).
+      const m = /^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})/.exec(when);
+      return m ? `${m[3]}/${m[2]} ${m[4]}:${m[5]}` : when;
+    }
+
+    async function loadAlarms() {
+      const panel = document.getElementById('alarms-panel');
+      const list = document.getElementById('alarms-list');
+      const count = document.getElementById('alarms-count');
+
+      let data;
+      try {
+        const res = await fetch('?api=alarms');
+        data = await res.json();
+      } catch (e) {
+        return; // leave the last rendered state on a transient fetch error
+      }
+
+      if (!data || data.available === false) {
+        panel.classList.remove('has-alarms');
+        count.textContent = 'n/d';
+        list.innerHTML = '<li class="alarms-empty">Configurazione allarmi non disponibile</li>';
+        return;
+      }
+
+      const alarms = Array.isArray(data.alarms) ? data.alarms : [];
+      if (!alarms.length) {
+        panel.classList.remove('has-alarms');
+        count.textContent = '0';
+        list.innerHTML = '<li class="alarms-empty">✓ Nessun allarme attivo</li>';
+        return;
+      }
+
+      panel.classList.add('has-alarms');
+      count.textContent = String(alarms.length);
+      list.innerHTML = alarms.map(a => {
+        const when = formatAlarmWhen(a.when, a.scheduled);
+        const sched = a.scheduled ? '<span class="alarm-sched">pianificato</span>' : '';
+        return `<li class="alarm-item">
+          <span class="alarm-label">${escapeHtml(a.label)}</span>
+          ${sched}
+          <span class="alarm-when">${when}</span>
+        </li>`;
+      }).join('');
+    }
+
+    // ── Today vs same time yesterday ──────────────────────────────────────────────
+    // Panel/column pairing mirrors the group panels above: Serra shows tMobile/hMobile
+    // and Ombra shows tombra/hombra (see the note near SENSOR_ID_TARGETS).
+    const YDAY_ROWS = [
+      { label: 'Full Sun — Temperatura', src: 'meteo',   key: 'temp',    unit: '°C', dec: 1, filter: nullIfSentinel },
+      { label: 'Full Sun — Umidità',     src: 'meteo',   key: 'humi',    unit: '%',  dec: 0, filter: nullIfNegative },
+      { label: 'Serra — Temperatura',    src: 'meteo',   key: 'tMobile', unit: '°C', dec: 1, filter: nullIfSentinel },
+      { label: 'Serra — Umidità',        src: 'meteo',   key: 'hMobile', unit: '%',  dec: 0, filter: nullIfNegative },
+      { label: 'Ombra — Temperatura',    src: 'meteo',   key: 'tombra',  unit: '°C', dec: 1, filter: nullIfSentinel },
+      { label: 'Ombra — Umidità',        src: 'meteo',   key: 'hombra',  unit: '%',  dec: 0, filter: nullIfNegative },
+      { label: 'Fotovoltaico — Potenza', src: 'meteo',   key: 'power',   unit: 'W',  dec: 0, filter: nullIfNegative },
+      { label: 'Server — CPU Temp',      src: 'meteo',   key: 'tempCpu', unit: '°C', dec: 1, filter: nullIfSentinel },
+      { label: 'Ufficio — Temperatura',  src: 'ufficio', key: 'temp',    unit: '°C', dec: 1, filter: nullIfSentinel },
+      { label: 'Ufficio — Umidità',      src: 'ufficio', key: 'hum',     unit: '%',  dec: 0, filter: nullIfNegative },
+      // signed: these are watt readings that may legitimately sit below -99
+      // (grid export), so they bypass the "<= -99 means dead sensor" formatter.
+      { label: 'Energia — Produzione FV', src: 'energia', key: 'pv_power',   unit: 'W', dec: 0, filter: (v) => v, signed: true },
+      { label: 'Energia — Scambio Rete',  src: 'energia', key: 'grid_power', unit: 'W', dec: 0, filter: (v) => v, signed: true },
+      { label: 'Energia — Consumo Casa',  src: 'energia', key: 'casa_power', unit: 'W', dec: 0, filter: (v) => v, signed: true },
+    ];
+
+    function pickValue(row, def) {
+      if (!row) return null;
+      let v = row[def.key];
+      if (v === null || v === undefined || v === '') return null;
+      if (typeof v === 'string') v = Number(v);
+      if (typeof v !== 'number' || Number.isNaN(v)) return null;
+      v = def.filter(v);
+      return typeof v === 'number' ? v : null;
+    }
+
+    // fmt() blanks anything <= -99 as a dead-sensor sentinel; signed rows need
+    // their negative values printed as-is.
+    function fmtRow(v, dec, signed) {
+      if (v === null || v === undefined) return '—';
+      return signed ? v.toFixed(dec) : fmt(v, dec);
+    }
+
+    function deltaCell(now, yday, dec) {
+      if (now === null || yday === null) return '<td class="num delta-flat">—</td>';
+      const d = now - yday;
+      const cls = d > 0 ? 'delta-up' : d < 0 ? 'delta-down' : 'delta-flat';
+      const arrow = d > 0 ? '▲' : d < 0 ? '▼' : '=';
+      const sign = d > 0 ? '+' : '';
+      return `<td class="num ${cls}">${arrow} ${sign}${d.toFixed(dec)}</td>`;
+    }
+
+    async function loadYesterdayTable() {
+      const tbody = document.querySelector('#yday-table tbody');
+      const whenEl = document.getElementById('yday-when');
+
+      let data;
+      try {
+        const res = await fetch('?api=yesterday');
+        data = await res.json();
+      } catch (e) {
+        return; // keep the previously rendered table on a transient error
+      }
+      if (!data || data.error) return;
+
+      const past = { meteo: data.meteo || null, ufficio: data.ufficio || null, energia: data.energia || null };
+      const nowSrc = { meteo: latestMeteo, ufficio: latestUfficio, energia: latestEnergia };
+
+      const stamp = past.meteo?.timestamp || past.ufficio?.timestamp || data.target;
+      whenEl.textContent = stamp
+        ? 'riferimento: ' + romeFullDateTime(stamp) + ' (Roma)'
+        : 'nessun dato di ieri';
+
+      if (!past.meteo && !past.ufficio && !past.energia) {
+        tbody.innerHTML = '<tr><td colspan="4" style="color:#64748b">Nessun dato registrato a quest\'ora ieri</td></tr>';
+        return;
+      }
+
+      tbody.innerHTML = YDAY_ROWS.map(def => {
+        const now = pickValue(nowSrc[def.src], def);
+        const yday = pickValue(past[def.src], def);
+        return `<tr>
+      <td class="metric">${escapeHtml(def.label)}</td>
+      <td class="num now">${fmtRow(now, def.dec, def.signed)} ${def.unit}</td>
+      <td class="num">${fmtRow(yday, def.dec, def.signed)} ${def.unit}</td>
+      ${deltaCell(now, yday, def.dec)}
+    </tr>`;
+      }).join('');
+    }
+
     // ── Error banner ──────────────────────────────────────────────────────────────
     function showError(msg) {
       const el = document.getElementById('db-error');
@@ -1046,7 +1592,10 @@ if ($api !== '') {
 
     // ── Refresh loop ──────────────────────────────────────────────────────────────
     async function refresh() {
-      try { await Promise.all([loadMeteo(), loadSensors(), loadUfficio(), loadSensorIds()]); }
+      try {
+        await Promise.all([loadMeteo(), loadSensors(), loadUfficio(), loadEnergia(), loadSensorIds(), loadAlarms()]);
+        await loadYesterdayTable();   // needs latestMeteo/latestUfficio to be populated
+      }
       catch (e) { showError(e.message); }
     }
 
@@ -1054,14 +1603,39 @@ if ($api !== '') {
     setInterval(refresh, 30_000);
 
     // ── Comparison modal (today vs yesterday) ───────────────────────────────────
+    // Each entry drives the two stacked charts in the modal: `api` is the history
+    // endpoint to pull, `charts` the two series to plot (today vs yesterday).
+    // `avg` adds the mean pills above the lower chart.
     const COMPARE_CONFIG = {
-      fullsun: { title: 'Full Sun', tempKey: 'temp',    humiKey: 'humi',    tempColor: 'rgb(2,132,199)',  humiColor: 'rgb(99,102,241)' },
-      serra:   { title: 'Parametri Serra', tempKey: 'tMobile', humiKey: 'hMobile', tempColor: 'rgb(13,148,136)', humiColor: 'rgb(99,102,241)' },
-      ombra:   { title: 'Ombra',   tempKey: 'tombra', humiKey: 'hombra', tempColor: 'rgb(22,163,74)',  humiColor: 'rgb(99,102,241)' },
+      fullsun: {
+        title: 'Full Sun', api: 'meteo', charts: [
+          { key: 'temp', label: 'Temperatura', unit: '°C', color: 'rgb(2,132,199)', filter: nullIfSentinel, dec: 1 },
+          { key: 'humi', label: 'Umidità', unit: '%', color: 'rgb(99,102,241)', filter: nullIfNegative, dec: 0, avg: true },
+        ]
+      },
+      serra: {
+        title: 'Parametri Serra', api: 'meteo', charts: [
+          { key: 'tMobile', label: 'Temperatura', unit: '°C', color: 'rgb(13,148,136)', filter: nullIfSentinel, dec: 1 },
+          { key: 'hMobile', label: 'Umidità', unit: '%', color: 'rgb(99,102,241)', filter: nullIfNegative, dec: 0, avg: true },
+        ]
+      },
+      ombra: {
+        title: 'Ombra', api: 'meteo', charts: [
+          { key: 'tombra', label: 'Temperatura', unit: '°C', color: 'rgb(22,163,74)', filter: nullIfSentinel, dec: 1 },
+          { key: 'hombra', label: 'Umidità', unit: '%', color: 'rgb(99,102,241)', filter: nullIfNegative, dec: 0, avg: true },
+        ]
+      },
+      energia: {
+        title: 'Energia (Shelly EM)', api: 'energia', charts: [
+          { key: 'pv_power', label: 'Produzione FV', unit: 'W', color: 'rgb(249,115,22)', filter: num, dec: 0 },
+          // Signed: a negative value is surplus exported to the grid.
+          { key: 'grid_power', label: 'Scambio Rete', unit: 'W', color: 'rgb(14,165,233)', filter: num, dec: 0, avg: true },
+        ]
+      },
     };
 
-    let compareTempChart = null;
-    let compareHumiChart = null;
+    let compareChartA = null;
+    let compareChartB = null;
 
     function minuteOfDayFromTs(ts) {
       // ts is "YYYY-MM-DDTHH:MM:SSZ" (UTC). Convert to Europe/Rome for display alignment.
@@ -1141,17 +1715,32 @@ if ($api !== '') {
       return pts;
     }
 
+    // Feed one modal chart with today's and yesterday's series for a variable.
+    function fillCompareChart(chart, def, rows, todaySince, nowMs, ydaySince) {
+      const today = buildSeries(rows, def.key, def.filter, todaySince, nowMs);
+      const yday = buildSeries(rows, def.key, def.filter, ydaySince, todaySince);
+      chart.data.datasets[0].borderColor = def.color;
+      chart.data.datasets[0].data = today;
+      chart.data.datasets[1].data = yday;
+      chart.options.scales.y.title.text = def.unit;
+      chart.update('none');
+      return { today, yday };
+    }
+
     async function openCompare(key) {
       const cfg = COMPARE_CONFIG[key];
       if (!cfg) return;
 
+      const [defA, defB] = cfg.charts;
       document.getElementById('compare-title').textContent = `${cfg.title} — oggi vs ieri`;
+      document.getElementById('compare-title-a').textContent = `${defA.label} (${defA.unit}) — oggi vs ieri`;
+      document.getElementById('compare-title-b').textContent = `${defB.label} (${defB.unit}) — oggi vs ieri`;
       const modal = document.getElementById('compare-modal');
       modal.hidden = false;
 
       let rows;
       try {
-        const res = await fetch('?api=meteo&limit=2880');
+        const res = await fetch(`?api=${cfg.api}&limit=2880`);
         rows = await res.json();
         if (!Array.isArray(rows)) throw new Error(rows.error || 'Bad response');
       } catch (e) {
@@ -1162,34 +1751,27 @@ if ($api !== '') {
       const nowMs = Date.now();
       const day = 24 * 3600 * 1000;
       const todaySince = nowMs - day;
-      const ydaySince  = nowMs - 2 * day;
+      const ydaySince = nowMs - 2 * day;
 
-      const todayTemp = buildSeries(rows, cfg.tempKey, nullIfSentinel, todaySince, nowMs);
-      const ydayTemp  = buildSeries(rows, cfg.tempKey, nullIfSentinel, ydaySince, todaySince);
-      const todayHumi = buildSeries(rows, cfg.humiKey, nullIfNegative, todaySince, nowMs);
-      const ydayHumi  = buildSeries(rows, cfg.humiKey, nullIfNegative, ydaySince, todaySince);
-
-      if (!compareTempChart) {
-        compareTempChart = makeCompareChart('compare-temp', '°C', cfg.tempColor, 'rgba(100,116,139,.8)');
-        compareHumiChart = makeCompareChart('compare-humi', '%',  cfg.humiColor, 'rgba(100,116,139,.8)');
-      } else {
-        compareTempChart.data.datasets[0].borderColor = cfg.tempColor;
-        compareHumiChart.data.datasets[0].borderColor = cfg.humiColor;
+      if (!compareChartA) {
+        compareChartA = makeCompareChart('compare-a', defA.unit, defA.color, 'rgba(100,116,139,.8)');
+        compareChartB = makeCompareChart('compare-b', defB.unit, defB.color, 'rgba(100,116,139,.8)');
       }
 
-      compareTempChart.data.datasets[0].data = todayTemp;
-      compareTempChart.data.datasets[1].data = ydayTemp;
-      compareTempChart.update('none');
+      fillCompareChart(compareChartA, defA, rows, todaySince, nowMs, ydaySince);
+      const seriesB = fillCompareChart(compareChartB, defB, rows, todaySince, nowMs, ydaySince);
 
-      compareHumiChart.data.datasets[0].data = todayHumi;
-      compareHumiChart.data.datasets[1].data = ydayHumi;
-      compareHumiChart.update('none');
-
-      // Humidity averages (today vs yesterday) shown above the humidity chart
-      const meanY = (pts) => pts.length ? pts.reduce((s, p) => s + p.y, 0) / pts.length : null;
-      setText('compare-humi-avg-today', meanY(todayHumi));
-      setText('compare-humi-avg-yday',  meanY(ydayHumi));
-      document.getElementById('compare-humi-swatch-today').style.background = cfg.humiColor;
+      // Mean of the lower series (today vs yesterday), when it has a useful one.
+      const avgRow = document.getElementById('compare-avg-row');
+      avgRow.style.display = defB.avg ? '' : 'none';
+      if (defB.avg) {
+        const meanY = (pts) => pts.length ? pts.reduce((s, p) => s + p.y, 0) / pts.length : null;
+        setText('compare-avg-today', meanY(seriesB.today), defB.dec ?? 0);
+        setText('compare-avg-yday', meanY(seriesB.yday), defB.dec ?? 0);
+        document.getElementById('compare-avg-unit-a').textContent = ' ' + defB.unit;
+        document.getElementById('compare-avg-unit-b').textContent = ' ' + defB.unit;
+        document.getElementById('compare-swatch-today').style.background = defB.color;
+      }
     }
 
     function closeCompare() {

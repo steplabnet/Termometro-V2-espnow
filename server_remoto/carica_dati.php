@@ -39,6 +39,35 @@ $hombra = $_GET['hombra'];
 $tempCpu = $_GET['tempCpu'];
 $fanMode = $_GET['fan'];
 
+// Shelly Pro EM-50 (sent by meteo.py only when the meter is reachable):
+//   pvPower   = photovoltaic production, W (>= 0)
+//   gridPower = grid exchange, W (> 0 importing, < 0 exporting surplus)
+// Both may be absent; null keeps the previous stored value instead of writing 0.
+$pvPower = isset($_GET['pvPower']) && is_numeric($_GET['pvPower']) ? (float) $_GET['pvPower'] : null;
+$gridPower = isset($_GET['gridPower']) && is_numeric($_GET['gridPower']) ? (float) $_GET['gridPower'] : null;
+
+/**
+ * Add a column to a table if it is not there yet.
+ * Lets the Shelly columns appear on first run without a manual migration.
+ */
+function ensure_column(mysqli $link, string $table, string $column, string $definition): void
+{
+    $res = $link->query("SHOW COLUMNS FROM `$table` LIKE '$column'");
+    if ($res instanceof mysqli_result && $res->num_rows === 0) {
+        $link->query("ALTER TABLE `$table` ADD `$column` $definition");
+    }
+}
+
+foreach (['dati_meteo', 'dati_instant'] as $t) {
+    ensure_column($link, $t, 'pvPower', 'FLOAT NULL');
+    ensure_column($link, $t, 'gridPower', 'FLOAT NULL');
+}
+
+// SQL literals: a missing reading is stored as NULL in dati_meteo, and left
+// untouched in dati_instant (see the UPDATE below).
+$pvSql = ($pvPower === null) ? 'NULL' : "'" . $pvPower . "'";
+$gridSql = ($gridPower === null) ? 'NULL' : "'" . $gridPower . "'";
+
 // --- Existing Logic for Insert/Update ---
 
 $sql = "SELECT * from dati_meteo ORDER by id DESC limit 1";
@@ -57,7 +86,7 @@ if ($data >= $last + 600 - $resto) {
         $tMobile = $row['tMobile'];
     }
 
-    $sql = "INSERT INTO `dati_meteo` (`temperatura`, `humi`, `wind`, `rain`, `press`, `tombra`, `hombra`, `data`,chip,gust, power, cpuTemp, fanMode, tMobile, portata) VALUES ('$temp','$humi', '$wind', '$rain', '$pres', '$tombra', '$hombra', '$data','$chip','$gust', '$power','$tempCpu', '$fanMode', '$tMobile', '$portata')";
+    $sql = "INSERT INTO `dati_meteo` (`temperatura`, `humi`, `wind`, `rain`, `press`, `tombra`, `hombra`, `data`,chip,gust, power, cpuTemp, fanMode, tMobile, portata, pvPower, gridPower) VALUES ('$temp','$humi', '$wind', '$rain', '$pres', '$tombra', '$hombra', '$data','$chip','$gust', '$power','$tempCpu', '$fanMode', '$tMobile', '$portata', $pvSql, $gridSql)";
 
     // Echo kept as per your original script
     echo $sql;
@@ -65,7 +94,14 @@ if ($data >= $last + 600 - $resto) {
 }
 
 // Update Instant Data
-$sql = "update dati_instant set temperatura='$temp', humi='$humi', wind='$wind', rain='$rain', press='$pres', tombra='$tombra', hombra='$hombra', data='$data', gust='$gust', power='$power', cpuTemp='$tempCpu', chip ='$chip', fan='$fanMode', tMobile='$tMobile', portata='$portata' WHERE id=1";
+$instantExtra = '';
+if ($pvPower !== null) {
+    $instantExtra .= ", pvPower=$pvSql";
+}
+if ($gridPower !== null) {
+    $instantExtra .= ", gridPower=$gridSql";
+}
+$sql = "update dati_instant set temperatura='$temp', humi='$humi', wind='$wind', rain='$rain', press='$pres', tombra='$tombra', hombra='$hombra', data='$data', gust='$gust', power='$power', cpuTemp='$tempCpu', chip ='$chip', fan='$fanMode', tMobile='$tMobile', portata='$portata'$instantExtra WHERE id=1";
 echo $sql;
 $result = $link->query($sql);
 
@@ -91,7 +127,10 @@ $sqlStats = "SELECT
     MIN(press + 0) as min_press,
     MAX(wind + 0) as max_wind, 
     MAX(gust + 0) as max_gust,
-    MAX(power + 0) as max_power
+    MAX(power + 0) as max_power,
+    MAX(pvPower + 0) as max_pvPower,
+    MAX(gridPower + 0) as max_gridPower,
+    MIN(gridPower + 0) as min_gridPower
     FROM dati_meteo 
     WHERE data >= $time24hAgo";
 

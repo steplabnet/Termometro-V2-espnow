@@ -67,7 +67,25 @@ switch ($variable) {
     $titolo = "Portata";
     $unit = "m3/s";
     break;
+  case 'pvPower':
+    $titolo = "Produzione Fotovoltaico";
+    $unit = "W";
+    break;
+  case 'gridPower':
+    $titolo = "Scambio Rete";
+    $unit = "W";
+    break;
+  case 'casa':
+    $titolo = "Consumo Casa";
+    $unit = "W";
+    break;
 }
+
+// Shelly power channels legitimately go far below zero (grid export), so the
+// "< -50 means dead sensor" rule that guards the temperature series must not be
+// applied to them. 'casa' is derived (pvPower + gridPower), not a DB column.
+$POWER_VARS = ['pvPower', 'gridPower', 'casa'];
+$skipSentinelFilter = in_array($variable, $POWER_VARS, true);
 
 $now = time();
 $ieri = $now - 86400;
@@ -76,13 +94,27 @@ $ieri = $now - 86400;
 //   key => [label, unit, color, source]   source: 'db' column or 'csv' (pressure)
 $MULTI_CATALOG = [
   'temperatura' => ['label' => 'Temp Sole',    'unit' => '°C',   'color' => '#ef4444', 'src' => 'db'],
-  'tMobile'     => ['label' => 'Temp Ombra',   'unit' => '°C',   'color' => '#f59e0b', 'src' => 'db'],
-  'tombra'      => ['label' => 'Temp Interno', 'unit' => '°C',   'color' => '#14b8a6', 'src' => 'db'],
+  'tMobile'     => ['label' => 'Temp Interno', 'unit' => '°C',   'color' => '#f59e0b', 'src' => 'db'],
+  'tombra'      => ['label' => 'Temp Ombra',   'unit' => '°C',   'color' => '#14b8a6', 'src' => 'db'],
   'hombra'      => ['label' => 'Umidità',      'unit' => '%',    'color' => '#22c55e', 'src' => 'db'],
   'power'       => ['label' => 'Fotovoltaico', 'unit' => 'W',    'color' => '#eab308', 'src' => 'db'],
   'portata'     => ['label' => 'Piave',        'unit' => 'm³/s', 'color' => '#3b82f6', 'src' => 'db'],
   'press'       => ['label' => 'Pressione',    'unit' => 'hPa',  'color' => '#8b5cf6', 'src' => 'csv'],
+  'pvPower'     => ['label' => 'Produzione FV', 'unit' => 'W',    'color' => '#f97316', 'src' => 'db',   'signed' => true],
+  'gridPower'   => ['label' => 'Scambio Rete',  'unit' => 'W',    'color' => '#0ea5e9', 'src' => 'db',   'signed' => true],
+  'casa'        => ['label' => 'Consumo Casa',  'unit' => 'W',    'color' => '#a855f7', 'src' => 'calc', 'signed' => true],
 ];
+
+/** House load: what the panels make plus what the grid supplies (export is negative). */
+function casa_power(array $row)
+{
+  $pv = $row['pvPower'] ?? null;
+  $grid = $row['gridPower'] ?? null;
+  if (!is_numeric($pv) || !is_numeric($grid)) {
+    return null;
+  }
+  return (float) $pv + (float) $grid;
+}
 
 // ---- MULTI (compare) MODE ---------------------------------------------------
 // grafico.php?var=multi&v[]=temperatura&v[]=power  (or &sel=temperatura,power)
@@ -101,7 +133,7 @@ if ($isMulti) {
     $k = trim((string) $k);
     if (isset($MULTI_CATALOG[$k]) && !in_array($k, $multiSelected, true)) $multiSelected[] = $k;
   }
-  if (!$multiSelected) $multiSelected = ['temperatura', 'tMobile']; // sensible default
+  if (!$multiSelected) $multiSelected = ['temperatura', 'tombra']; // sensible default: Sole + Ombra
 
   // Shared timeline: the last 144 DB samples (chronological). All DB variables
   // share these rows; pressure is matched onto the same timestamps below.
@@ -155,10 +187,16 @@ if ($isMulti) {
     $data = [];
     if ($meta['src'] === 'csv') {
       foreach ($times as $ts) $data[] = $presAt($ts);
+    } elseif ($meta['src'] === 'calc') {
+      foreach ($rowsAsc as $rw) $data[] = casa_power($rw);
     } else {
+      // 'signed' series (the Shelly power channels) keep their negative values;
+      // everything else treats < -50 as a dead-sensor sentinel.
+      $signed = !empty($meta['signed']);
       foreach ($rowsAsc as $rw) {
         $v = $rw[$k] ?? null;
-        $data[] = (is_numeric($v) && (float) $v > -50) ? (float) $v : null;
+        $ok = is_numeric($v) && ($signed || (float) $v > -50);
+        $data[] = $ok ? (float) $v : null;
       }
     }
     $multiSeries[] = [
@@ -231,12 +269,17 @@ $labels = [];
 while ($row = $result->fetch_array(MYSQLI_ASSOC)) {
   if ($variable == 'press') {
     $val = round(press_qff($row['press'], $row['chip']), 1);
+  } elseif ($variable == 'casa') {
+    $val = casa_power($row);
+    if ($val === null) {
+      continue;
+    }
   } else {
     $val = $row[$variable];
   }
 
-  // --- FILTER: Discard data < -50 ---
-  if ($val < -50) {
+  // --- FILTER: Discard data < -50 (not for signed power channels) ---
+  if (!$skipSentinelFilter && $val < -50) {
     continue;
   }
   // ----------------------------------
@@ -258,12 +301,17 @@ while ($row = $result2->fetch_array(MYSQLI_ASSOC)) {
     $val = round(press_qff($row['press'], $row['chip']), 1);
   } else if ($variable == 'chip') {
     $val = round($row['cpuTemp'], 1);
+  } elseif ($variable == 'casa') {
+    $val = casa_power($row);
+    if ($val === null) {
+      continue;
+    }
   } else {
     $val = $row[$variable];
   }
 
-  // --- FILTER: Discard data < -50 ---
-  if ($val < -50) {
+  // --- FILTER: Discard data < -50 (not for signed power channels) ---
+  if (!$skipSentinelFilter && $val < -50) {
     continue;
   }
   // ----------------------------------
@@ -457,8 +505,87 @@ if ($isMulti) {
   </div>
 
   <?php
-  // ENERGY SECTION
-  if ($variable !== 'press' && !$isMulti):
+  // ENERGY SECTION (Shelly power channels): true kWh, integrated over the real
+  // sample timestamps instead of assuming a fixed cadence.
+  if (in_array($variable, ['pvPower', 'gridPower', 'casa'], true) && !$isMulti):
+
+    /**
+     * Integrate a power channel between two timestamps.
+     * Returns ['kwh' => total, 'pos' => imported kWh, 'neg' => exported kWh].
+     * Gaps longer than 1h are not bridged, so a logger outage does not invent energy.
+     */
+    function energia_potenza(int $timedw, int $timeup, string $variable): array
+    {
+      global $link;
+      $empty = ['kwh' => 0.0, 'pos' => 0.0, 'neg' => 0.0];
+      try {
+        // mysqli throws when the columns are not there yet (PHP 8.1+).
+        $res = $link->query("SELECT data, pvPower, gridPower FROM dati_meteo WHERE data > $timedw AND data < $timeup ORDER BY data ASC");
+      } catch (Throwable $e) {
+        return $empty;
+      }
+      if (!$res instanceof mysqli_result) {
+        return $empty;
+      }
+      $tot = 0.0;
+      $pos = 0.0;
+      $neg = 0.0;
+      $prevT = null;
+      $prevV = null;
+      while ($row = $res->fetch_assoc()) {
+        $v = ($variable === 'casa') ? casa_power($row) : ($row[$variable] ?? null);
+        if ($v === null || !is_numeric($v)) {
+          continue;
+        }
+        $v = (float) $v;
+        $t = (int) $row['data'];
+        if ($prevT !== null && $t - $prevT <= 3600) {
+          $wh = (($v + $prevV) / 2.0) * (($t - $prevT) / 3600.0);
+          $tot += $wh;
+          if ($wh > 0) $pos += $wh; else $neg += $wh;
+        }
+        $prevT = $t;
+        $prevV = $v;
+      }
+      return ['kwh' => $tot / 1000.0, 'pos' => $pos / 1000.0, 'neg' => $neg / 1000.0];
+    }
+
+    $midnight = mktime(0, 0, 0, (int) date('n'), (int) date('j'), (int) date('Y'));
+    $eOggi = energia_potenza($midnight, time(), $variable);
+    $eIeri = energia_potenza($midnight - 86400, $midnight, $variable);
+    ?>
+    <div class="stats-row">
+      <?php if ($variable === 'gridPower'): ?>
+        <div class="mini-stat">
+          <div class="label">Prelevato oggi</div>
+          <div class="value"><?php echo number_format($eOggi['pos'], 2); ?> kWh</div>
+        </div>
+        <div class="mini-stat">
+          <div class="label">Immesso oggi</div>
+          <div class="value"><?php echo number_format(abs($eOggi['neg']), 2); ?> kWh</div>
+        </div>
+        <div class="mini-stat">
+          <div class="label">Saldo ieri</div>
+          <div class="value"><?php echo number_format($eIeri['kwh'], 2); ?> kWh</div>
+        </div>
+      <?php else: ?>
+        <div class="mini-stat">
+          <div class="label">Oggi</div>
+          <div class="value"><?php echo number_format($eOggi['kwh'], 2); ?> kWh</div>
+        </div>
+        <div class="mini-stat">
+          <div class="label">Ieri</div>
+          <div class="value"><?php echo number_format($eIeri['kwh'], 2); ?> kWh</div>
+        </div>
+        <div class="mini-stat">
+          <div class="label">Totale (2 giorni)</div>
+          <div class="value"><?php echo number_format($eOggi['kwh'] + $eIeri['kwh'], 2); ?> kWh</div>
+        </div>
+      <?php endif; ?>
+    </div>
+  <?php
+  // ENERGY SECTION (legacy, other variables)
+  elseif ($variable !== 'press' && !$isMulti):
 
     function energia($timeup, $timedw)
     {
