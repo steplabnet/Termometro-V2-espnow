@@ -5,7 +5,6 @@ import os
 import json
 import sqlite3
 import datetime
-import urllib.request
 from time import sleep, time
 
 import numpy as np
@@ -48,16 +47,45 @@ sensoreTemperatura = 138
 sensoreTemperatura2 = 96
 
 # -------- MQTT --------
-MQTT_HOST = "stazionemeteo.local"
+# Telemetry goes straight to the broker the remote server subscribes to; the
+# HTTP call to carica_dati.php it used to make is gone.
+MQTT_HOST = "mqtt1.steplab.net"
 MQTT_PORT = 1883
-MQTT_USER = "stzionemeteo"
-MQTT_PASSWORD = "78f25d_78"
-MQTT_TOPIC = "casa/stazionemeteo/OUT"
+MQTT_USER = "mark"
+MQTT_PASSWORD = "78f25d"
+MQTT_TOPIC = "casa/stazionemeteo"
+MQTT_TOPIC_STATUS = "casa/stazionemeteo/status"  # retained online/offline (LWT)
+
+# -------- Publish cadence --------
+# A reading goes out as soon as it changes, so the dashboard follows the sensors
+# instead of a one-minute timer. What stops that from flooding the broker is the
+# per-field deadband below plus a floor between two publishes.
+PUBLISH_MIN_INTERVAL = 2      # seconds; never publish more often than this
+PUBLISH_HEARTBEAT = 60        # seconds; publish anyway, so the retained message
+                              # never goes stale and the server keeps sampling
+SENSOR_POLL_INTERVAL = 5      # seconds between Tinkerforge reads
+CPU_POLL_INTERVAL = 60        # seconds between vcgencmd calls (drives the fan
+                              # average, whose window must not change)
+LOCAL_LOG_INTERVAL = 60       # seconds between rows in the local /dev/shm DB
+
+# How much a field must move before it counts as "changed". Sized above each
+# sensor's own noise: without this the ADC alone would publish every cycle.
+PUBLISH_DEADBAND = {
+    "temp": 0.1, "tombra": 0.1, "tMobile": 0.1, "chip": 0.1,
+    "humi": 1, "hombra": 1, "hMobile": 1,
+    "wind": 0.1, "gust": 0.1, "rain": 0.1,
+    "pres": 1, "tempCpu": 0.5,
+    "power": 20,
+    "pvPower": 10, "gridPower": 10, "casaPower": 10,
+}
+
+# Diagnostics that ride along in the payload but must never trigger a publish
+# on their own: the raw ADC figures change on every single read.
+PUBLISH_IGNORE = {"timestamp", "mean_voltage", "adc_voltage", "adc_raw"}
 
 # -------- Globals --------
 log_int = 1000  # seconds
 tb = 0
-urltime = 0
 
 tensioni = [0.0] * 20
 powerPrev = 0
@@ -519,32 +547,178 @@ def autogain_read():
     return max_v, max_raw
 
 
+def _on_mqtt_connect(client, userdata, flags, reason_code, properties):
+    if reason_code == 0:
+        print(f"MQTT connected to {MQTT_HOST}:{MQTT_PORT}")
+        # Retained, so a subscriber that connects later learns we are alive
+        # without waiting for the next reading.
+        client.publish(MQTT_TOPIC_STATUS, "online", qos=1, retain=True)
+    else:
+        print("MQTT connection refused, reason code:", reason_code)
+
+
+def _on_mqtt_disconnect(client, userdata, flags, reason_code, properties):
+    print("MQTT disconnected, reason code:", reason_code)
+
+
 def mqtt_connect():
+    """Connect in the background so a broker that is down cannot block boot.
+
+    connect_async + loop_start means paho keeps retrying on its own; the main
+    loop goes on reading sensors and publishes as soon as the link is back.
+    """
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
-    client.connect(MQTT_HOST, MQTT_PORT, 60)
+    client.on_connect = _on_mqtt_connect
+    client.on_disconnect = _on_mqtt_disconnect
+    # Last will: if this process dies or the link drops, the server sees it.
+    client.will_set(MQTT_TOPIC_STATUS, "offline", qos=1, retain=True)
+    client.reconnect_delay_set(min_delay=1, max_delay=60)
+    client.connect_async(MQTT_HOST, MQTT_PORT, keepalive=60)
     client.loop_start()
     return client
 
 
 def mqtt_publish_payload(client, payload):
+    """Publish retained at QoS 1.
+
+    Retained so the server-side subscriber gets the current readings the moment
+    it (re)connects rather than waiting for the next change; QoS 1 so a brief
+    drop does not silently swallow a reading.
+    """
     try:
-        info = client.publish(MQTT_TOPIC, json.dumps(payload), qos=0, retain=True)
-        print("MQTT publish queued, rc:", info.rc)
+        info = client.publish(MQTT_TOPIC, json.dumps(payload), qos=1, retain=True)
+        if info.rc != mqtt.MQTT_ERR_SUCCESS:
+            print("MQTT publish queued with rc:", info.rc)
     except Exception as e:
         print("MQTT publish error:", e)
+
+
+def payload_changed(new_payload, old_payload):
+    """True when any monitored field moved past its deadband.
+
+    Fields in PUBLISH_IGNORE are skipped; fields with no deadband (fan,
+    data_valid, station_id, wdir) compare exactly, so a state flip always
+    publishes. A value appearing or disappearing counts as a change.
+    """
+    if old_payload is None:
+        return True
+
+    for key, value in new_payload.items():
+        if key in PUBLISH_IGNORE:
+            continue
+        previous = old_payload.get(key)
+        if previous is None or value is None:
+            if previous != value:
+                return True
+            continue
+
+        band = PUBLISH_DEADBAND.get(key)
+        if band is None:
+            if previous != value:
+                return True
+            continue
         try:
-            client.reconnect()
-            info = client.publish(MQTT_TOPIC, json.dumps(payload), qos=0, retain=True)
-            print("MQTT publish OK after reconnect, rc:", info.rc)
-        except Exception as e2:
-            print("MQTT reconnect/publish error:", e2)
+            if abs(float(value) - float(previous)) >= band:
+                return True
+        except (TypeError, ValueError):
+            if previous != value:
+                return True
+
+    return False
+
+def read_weather(ow, roles):
+    """One full read of the Tinkerforge station plus both remote sensors.
+
+    Cheap: the bricklet answers from its own buffer, so this can run every few
+    seconds even though the remote devices only transmit about once a minute.
+    Mutates `roles` (and the persisted file) if the main station had to be
+    replaced by a freshly discovered one.
+    """
+    data_valid = False
+    dati = None
+    temp = -100
+
+    # 1. Try to read from the current known station
+    try:
+        dati = ow.get_station_data(roles["main"])
+        lastChangeStation = dati[7]
+        db_update_sensor_status("main", "station", roles["main"], lastChangeStation)
+
+        # Check if data is fresh (less than 20 mins old)
+        if lastChangeStation < ONLINE_THRESHOLD:
+            temp = dati[0] / 10.0
+            data_valid = True
+        else:
+            print(f"Main station {roles['main']} data is too old ({lastChangeStation}s).")
+    except Exception:
+        print(f"Main station {roles['main']} not responding.")
+
+    # 2. If current station failed or is old, scan for a new one
+    if not data_valid:
+        new_id = scan_for_active_station(ow)
+        if new_id:
+            try:
+                dati = ow.get_station_data(new_id)
+                temp = dati[0] / 10.0
+                data_valid = True
+                db_update_sensor_status("main", "station", new_id, dati[7])
+                update_role_if_changed(roles, "main", new_id)
+                print(f"Switched to active station: {new_id}")
+            except Exception:
+                data_valid = False
+
+    # 3. Final fallback if everything failed
+    if not data_valid:
+        temp = -100
+        print("No active weather station found.")
+
+    # --- Sensor 2 (Mobile) ---
+    try:
+        tMobile = ow.get_sensor_data(roles["mobile"])
+        db_update_sensor_status("mobile", "sensor", roles["mobile"], tMobile[2])
+        temp2 = tMobile[0] / 10.0
+        hum_mobile = tMobile[1]
+        if tMobile[2] > ONLINE_THRESHOLD:  # data too old
+            temp2 = -100
+            hum_mobile = -1
+    except Exception:
+        temp2 = -100
+        hum_mobile = -1
+
+    # --- Sensor 1 (Ombra) ---
+    try:
+        ombra = ow.get_sensor_data(roles["ombra"])
+        db_update_sensor_status("ombra", "sensor", roles["ombra"], ombra[2])
+        temp1 = ombra[0] / 10.0
+        hum_ombra = ombra[1]
+        if ombra[2] > ONLINE_THRESHOLD:
+            # Temperature only: humidity keeps the bricklet's last buffered
+            # value, as it always has -- the server's forecast gating treats a
+            # non-positive humidity as "unknown" and changes its conclusions.
+            temp1 = -100
+    except Exception:
+        temp1 = -100
+        hum_ombra = -1
+
+    return {
+        "temp": temp,
+        "humi": dati[1] if data_valid else 0,
+        "wind": dati[2] / 10.0 if data_valid else 0,
+        "gust": dati[3] / 10.0 if data_valid else 0,
+        "rain": dati[4] / 10.0 if data_valid else 0,
+        "wdir": dati[5] if data_valid else 0,
+        "tombra": temp1,
+        "hombra": hum_ombra,
+        "tMobile": temp2,
+        "hMobile": hum_mobile,
+        "station_id": roles["main"] if data_valid else -1,
+        "data_valid": data_valid,
+    }
 
 
 def main():
-    global tb, urltime, tensioni, powerPrev
-
-    current_main_station = mainStation
+    global tb, tensioni, powerPrev
 
     # connect once
     ipcon = IPConnection()
@@ -558,35 +732,30 @@ def main():
     roles = load_sensor_roles()
     roles = identify_devices_on_boot(ow, roles)
     save_sensor_roles(roles)
-    current_main_station = roles["main"]
-    mobile_id = roles["mobile"]
-    ombra_id = roles["ombra"]
 
     # BME280 removed: use neutral fallback values
     temperature = 0.0
     pressure = 0
-    humidity = 0
+
+    weather = read_weather(ow, roles)
+    tempCpu = temperature_of_raspberry_pi()
+
+    last_sensor_poll = time()
+    last_cpu_poll = last_sensor_poll
+    last_publish = 0.0
+    last_local_log = 0.0
+    last_payload = None
 
     while True:
-        print("Temperature :", temperature, "C")
-
-        sleep(1)
-
-        # read ADS with autogain
+        # The ADC is the fastest signal here, and autogain_read() already takes
+        # a fraction of a second, so it sets the pace of the whole loop.
         voltage, raw_value = autogain_read()
-        print("volt:", voltage)
-        print("raw:", raw_value)
 
         left_shift(tensioni, voltage)
         mean_v = volt_average(tensioni)
-        print("mean:", mean_v)
 
         power = max(230 * (mean_v - 0.0102) * 30 / 1.08, 0)
-
-        if abs(power - powerPrev) < 1000:
-            powerPrev = power
-        else:
-            powerPrev = power
+        powerPrev = power
 
         now = time()
 
@@ -594,160 +763,71 @@ def main():
             log_write("meteo up")
             tb = now
 
-        if now - urltime > 60:
-            urltime = now
-            data_valid = False
-            dati = None
+        # The remote sensors transmit about once a minute; re-reading the
+        # bricklet every few seconds is enough to catch each one promptly.
+        if now - last_sensor_poll >= SENSOR_POLL_INTERVAL:
+            last_sensor_poll = now
+            weather = read_weather(ow, roles)
 
-            # 1. Try to read from the current known station
-            try:
-                dati = ow.get_station_data(current_main_station)
-                lastChangeStation = dati[7]
-                db_update_sensor_status(
-                    "main", "station", current_main_station, lastChangeStation
-                )
-
-                # Check if data is fresh (less than 20 mins old)
-                if lastChangeStation < 1200:
-                    temp = dati[0] / 10.0
-                    data_valid = True
-                    print(
-                        f"Main station {current_main_station} updated {lastChangeStation}s ago."
-                    )
-                else:
-                    print(
-                        f"Main station {current_main_station} data is too old ({lastChangeStation}s)."
-                    )
-            except Exception:
-                print(f"Main station {current_main_station} not responding.")
-
-            # 2. If current station failed or is old, scan for a new one
-            if not data_valid:
-                new_id = scan_for_active_station(ow)
-                if new_id:
-                    current_main_station = new_id
-                    try:
-                        dati = ow.get_station_data(current_main_station)
-                        temp = dati[0] / 10.0
-                        data_valid = True
-                        db_update_sensor_status(
-                            "main", "station", current_main_station, dati[7]
-                        )
-                        update_role_if_changed(roles, "main", current_main_station)
-                        print(f"Switched to active station: {current_main_station}")
-                    except Exception:
-                        data_valid = False
-
-            # 3. Final fallback if everything failed
-            if not data_valid:
-                temp = -100
-                print("No active weather station found.")
-
-            # --- Sensor 2 (Mobile) ---
-            try:
-                tMobile = ow.get_sensor_data(mobile_id)
-                db_update_sensor_status(
-                    "mobile", "sensor", mobile_id, tMobile[2]
-                )
-                temp2 = tMobile[0] / 10.0
-                hum_mobile = tMobile[1]
-                if tMobile[2] > 1200:  # data too old
-                    temp2 = -100
-                    hum_mobile = -1
-            except Exception:
-                temp2 = -100
-                hum_mobile = -1
-
-            # --- Sensor 1 (Ombra) ---
-            try:
-                ombra = ow.get_sensor_data(ombra_id)
-                db_update_sensor_status(
-                    "ombra", "sensor", ombra_id, ombra[2]
-                )
-                temp1 = ombra[0] / 10.0
-                hum_ombra = ombra[1]
-                if ombra[2] > 1200:
-                    temp1 = -100
-            except Exception:
-                temp1 = -100
-                hum_ombra = -1
-
-            # --- fan / cpu temp ---
+        # vcgencmd is a subprocess, and its readings feed the fan's 10-sample
+        # moving average: keeping the old 60 s cadence keeps that window (and
+        # so the fan hysteresis) exactly as it was.
+        if now - last_cpu_poll >= CPU_POLL_INTERVAL:
+            last_cpu_poll = now
             tempCpu = temperature_of_raspberry_pi()
 
-            humi_value = dati[1] if data_valid else humidity
-            wind_value = dati[2] / 10.0 if data_valid else 0
-            gust_value = dati[3] / 10.0 if data_valid else 0
-            rain_value = dati[4] / 10.0 if data_valid else 0
-            wdir_value = dati[5] if data_valid else 0
+        # Shelly Pro EM-50, written to the local DB by mqtt_receiver.py.
+        energy = read_latest_energy()
 
-            # --- Build HTTP URL ---
-            url_string = (
-                "https://cesana.steplab.net/carica_dati.php"
-                f"?tMobile={temp2}"
-                f"&hMobile={hum_mobile}"
-                f"&fan={fanMode}"
-                f"&tempCpu={tempCpu}"
-                f"&temp={temp}"
-                f"&humi={humi_value}"
-                f"&wind={wind_value}"
-                f"&gust={gust_value}"
-                f"&rain={rain_value}"
-                f"&wdir={wdir_value}"
-                f"&tombra={temp1}"
-                f"&hombra={hum_ombra}"
-                f"&chip={temperature}"
-                f"&pres={round(pressure)}"
-                f"&power={int(power)}"
-            )
+        payload = {
+            "tMobile": weather["tMobile"],
+            "hMobile": weather["hMobile"],
+            "fan": fanMode,
+            "tempCpu": round(tempCpu, 2),
+            "temp": weather["temp"],
+            "humi": weather["humi"],
+            "wind": weather["wind"],
+            "gust": weather["gust"],
+            "rain": weather["rain"],
+            "wdir": weather["wdir"],
+            "tombra": weather["tombra"],
+            "hombra": weather["hombra"],
+            "chip": temperature,
+            "pres": round(pressure),
+            "power": int(power),
+            "mean_voltage": round(mean_v, 6),
+            "adc_voltage": round(voltage, 6),
+            "adc_raw": int(raw_value),
+            "station_id": weather["station_id"],
+            "data_valid": weather["data_valid"],
+            "pvPower": energy.get("pv_power"),
+            "gridPower": energy.get("grid_power"),
+            "casaPower": energy.get("casa_power"),
+            "timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+        }
 
-            # Shelly Pro EM-50: real PV production and grid exchange. Omitted
-            # from the URL when unavailable so the server keeps its last values
-            # instead of recording a bogus zero.
-            energy = read_latest_energy()
-            if energy.get("pv_power") is not None:
-                url_string += f"&pvPower={round(float(energy['pv_power']), 1)}"
-            if energy.get("grid_power") is not None:
-                url_string += f"&gridPower={round(float(energy['grid_power']), 1)}"
-            print(url_string)
-
-            try:
-                weburl = urllib.request.urlopen(url_string, timeout=5)
-                print("Server response code:", weburl.getcode())
-            except Exception as e:
-                print("Network Connection Error:", e)
-
-            # --- MQTT JSON publish ---
-            payload = {
-                "tMobile": temp2,
-                "hMobile": hum_mobile,
-                "fan": fanMode,
-                "tempCpu": round(tempCpu, 2),
-                "temp": temp,
-                "humi": humi_value,
-                "wind": wind_value,
-                "gust": gust_value,
-                "rain": rain_value,
-                "wdir": wdir_value,
-                "tombra": temp1,
-                "hombra": hum_ombra,
-                "chip": temperature,
-                "pres": round(pressure),
-                "power": int(power),
-                "mean_voltage": round(mean_v, 6),
-                "adc_voltage": round(voltage, 6),
-                "adc_raw": int(raw_value),
-                "station_id": current_main_station if data_valid else -1,
-                "data_valid": data_valid,
-                "pvPower": energy.get("pv_power"),
-                "gridPower": energy.get("grid_power"),
-                "casaPower": energy.get("casa_power"),
-                "timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
-            }
-            print("MQTT payload:", payload)
+        # Publish on change, not on a timer: a reading reaches the dashboard as
+        # soon as it exists. PUBLISH_MIN_INTERVAL keeps a jittery sensor from
+        # flooding the broker, and the heartbeat refreshes the retained message
+        # even through a completely still night.
+        since_publish = now - last_publish
+        if since_publish >= PUBLISH_HEARTBEAT or (
+            since_publish >= PUBLISH_MIN_INTERVAL and payload_changed(payload, last_payload)
+        ):
             mqtt_publish_payload(mqtt_client, payload)
+            print(f"[{payload['timestamp']}] published "
+                  f"temp={payload['temp']} tombra={payload['tombra']} "
+                  f"power={payload['power']} pv={payload['pvPower']}")
+            last_publish = now
+            last_payload = payload
+
+        # The local tmpfs log stays at its original cadence: it feeds the Pi's
+        # own pages and alarm watchers, which do not need per-second history.
+        if now - last_local_log >= LOCAL_LOG_INTERVAL:
+            last_local_log = now
             db_store_payload(payload)
 
+        sleep(1)
 
 if __name__ == "__main__":
     try:
