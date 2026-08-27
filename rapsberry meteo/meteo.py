@@ -94,6 +94,10 @@ fanHistory = np.array([48] * 10, dtype=float)  # moving avg of CPU temp
 
 DB_PATH = "/dev/shm/meteo.db"
 ENERGY_MAX_AGE = 300  # seconds; older Shelly readings are not forwarded
+# mqtt_receiver.py rewrites this on every clamp message, so meter changes reach
+# the payload (and the remote server) within a loop instead of waiting for the
+# throttled `energia` row.
+ENERGY_LATEST_PATH = "/dev/shm/energy_latest.json"
 PV_ZERO_THRESHOLD = 10.0     # PV production below this is noise -> treated as 0 W
 ROLES_PATH = "/var/www/html/sensor_roles.json"  # persisted role->id map; survives reboot
 ONLINE_THRESHOLD = 1200  # seconds; a sensor is "online" if it transmitted more recently than this
@@ -154,19 +158,37 @@ def init_db():
     con.close()
 
 
-def read_latest_energy(max_age=ENERGY_MAX_AGE):
-    """Latest Shelly Pro EM-50 snapshot, or {} when it is missing/stale.
+def _energy_is_fresh(row, max_age):
+    """True while the snapshot's own timestamp is inside max_age."""
+    try:
+        stamp = datetime.datetime.strptime(row["timestamp"], "%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError, KeyError):
+        return False
+    return (datetime.datetime.utcnow() - stamp).total_seconds() <= max_age
 
-    mqtt_receiver.py owns the energia table; this only reads the freshest row so
-    the production/grid figures ride along to the remote server with the rest of
-    the telemetry.
-    """
+
+def _energy_from_file(max_age):
+    """The live snapshot mqtt_receiver.py writes on every Shelly message."""
+    try:
+        with open(ENERGY_LATEST_PATH) as f:
+            row = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print("Energy snapshot read error:", e)
+        return {}
+    if not isinstance(row, dict) or not _energy_is_fresh(row, max_age):
+        return {}
+    return row
+
+
+def _energy_from_db(max_age):
+    """Fallback: the freshest `energia` row, for the moments after a restart
+    when the snapshot file does not exist yet."""
     try:
         con = sqlite3.connect(DB_PATH)
         con.row_factory = sqlite3.Row
-        row = con.execute(
-            "SELECT * FROM energia ORDER BY id DESC LIMIT 1"
-        ).fetchone()
+        row = con.execute("SELECT * FROM energia ORDER BY id DESC LIMIT 1").fetchone()
         con.close()
     except Exception as e:
         print("Energy read error:", e)
@@ -174,16 +196,25 @@ def read_latest_energy(max_age=ENERGY_MAX_AGE):
 
     if row is None:
         return {}
-
-    try:
-        stamp = datetime.datetime.strptime(row["timestamp"], "%Y-%m-%dT%H:%M:%SZ")
-    except (TypeError, ValueError):
+    row = {k: row[k] for k in row.keys()}
+    if not _energy_is_fresh(row, max_age):
+        print("Energy data is stale, skipping:", row.get("timestamp"))
         return {}
-    if (datetime.datetime.utcnow() - stamp).total_seconds() > max_age:
-        print("Energy data is stale, skipping:", row["timestamp"])
-        return {}
+    return row
 
-    energy = {k: row[k] for k in row.keys()}
+
+def read_latest_energy(max_age=ENERGY_MAX_AGE):
+    """Latest Shelly Pro EM-50 snapshot, or {} when it is missing/stale.
+
+    Prefers the tmpfs snapshot, which mqtt_receiver.py rewrites the instant a
+    clamp reports, so production and grid exchange ride out to the remote
+    server as soon as they change rather than on the energia table's cadence.
+    """
+    energy = _energy_from_file(max_age)
+    if not energy:
+        energy = _energy_from_db(max_age)
+    if not energy:
+        return {}
 
     # Same deadband mqtt_receiver.py applies when writing: anything under
     # PV_ZERO_THRESHOLD is not real production. Re-applied here so older rows

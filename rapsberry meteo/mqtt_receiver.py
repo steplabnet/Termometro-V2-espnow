@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import json
+import os
 import sqlite3
 import datetime
 from time import monotonic
@@ -32,6 +33,12 @@ ENERGY_WRITE_INTERVAL = 60   # seconds between energia rows
 ENERGY_MAX_AGE = 150         # a clamp's reading is ignored once this stale
 ENERGY_STARTUP_GRACE = 120   # wait this long for the second clamp before logging
 PV_ZERO_THRESHOLD = 10.0     # PV production below this is noise -> recorded as 0 W
+
+# Live snapshot, rewritten on EVERY clamp message. The energia table stays on
+# its one-minute cadence for history, but meteo.py reads this file instead, so
+# a change at the meter reaches the remote server in a second or two rather
+# than waiting out ENERGY_WRITE_INTERVAL.
+ENERGY_LATEST_PATH = "/dev/shm/energy_latest.json"
 
 # Latest reading per clamp: channel -> (monotonic_seconds, payload dict).
 energy_latest = {}
@@ -143,30 +150,14 @@ def db_store_energy(row):
         print("DB write error (energia):", e)
 
 
-def handle_energy(channel, payload):
-    """Buffer one clamp reading and, at most once per ENERGY_WRITE_INTERVAL,
-    write the merged PV + grid snapshot to the energia table.
+def merge_energy(mono):
+    """Current PV + grid figures merged from the two clamp topics.
 
-    Each clamp arrives on its own topic, so the two are merged here. A clamp
+    Each clamp arrives on its own topic, so the two are combined here. A clamp
     that stopped publishing drops out (ENERGY_MAX_AGE) instead of freezing its
-    last value into every subsequent row.
+    last value into every subsequent reading. Returns None when neither clamp
+    has anything fresh to say.
     """
-    global energy_last_write
-
-    mono = monotonic()
-    energy_latest[channel] = (mono, payload)
-
-    if mono - energy_last_write < ENERGY_WRITE_INTERVAL:
-        return
-
-    # Right after startup only one clamp may have reported yet; hold off briefly
-    # so the first row carries both. Past the grace period a silent clamp is
-    # recorded as NULL instead of blocking the log.
-    if len(energy_latest) < 2 and mono - energy_start < ENERGY_STARTUP_GRACE:
-        return
-
-    energy_last_write = mono
-
     def fresh(ch):
         entry = energy_latest.get(ch)
         if not entry or mono - entry[0] > ENERGY_MAX_AGE:
@@ -176,7 +167,7 @@ def handle_energy(channel, payload):
     pv = fresh(1)
     grid = fresh(0)
     if not pv and not grid:
-        return
+        return None
 
     pv_power = pv.get("act_power")
     # Below the threshold the inverter is not really producing (clamp leakage,
@@ -193,7 +184,7 @@ def handle_energy(channel, payload):
         else None
     )
 
-    row = {
+    return {
         "timestamp":    now(),
         "pv_power":     pv_power,
         "grid_power":   grid_power,
@@ -206,9 +197,56 @@ def handle_energy(channel, payload):
         "grid_pf":      grid.get("pf"),
         "freq":         pv.get("freq", grid.get("freq")),
     }
+
+
+def write_energy_latest(row):
+    """Publish the snapshot to tmpfs for meteo.py, atomically.
+
+    Written via a temp file + rename so meteo.py, which polls this about once a
+    second, can never read a half-written file.
+    """
+    try:
+        tmp = ENERGY_LATEST_PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(row, f)
+        os.replace(tmp, ENERGY_LATEST_PATH)
+    except Exception as e:
+        print("Energy snapshot write error:", e)
+
+
+def handle_energy(channel, payload):
+    """Buffer one clamp reading, publish it for meteo.py at once, and log it to
+    the energia table at most once per ENERGY_WRITE_INTERVAL.
+
+    Two different cadences on purpose: the snapshot has to be immediate so the
+    dashboard follows the meter, while the history table only needs a row a
+    minute and would otherwise grow by a row every couple of seconds.
+    """
+    global energy_last_write
+
+    mono = monotonic()
+    energy_latest[channel] = (mono, payload)
+
+    row = merge_energy(mono)
+    if row is None:
+        return
+
+    # Immediate: this is what meteo.py picks up on its next loop.
+    write_energy_latest(row)
+
+    if mono - energy_last_write < ENERGY_WRITE_INTERVAL:
+        return
+
+    # Right after startup only one clamp may have reported yet; hold off briefly
+    # so the first row carries both. Past the grace period a silent clamp is
+    # recorded as NULL instead of blocking the log.
+    if len(energy_latest) < 2 and mono - energy_start < ENERGY_STARTUP_GRACE:
+        return
+
+    energy_last_write = mono
     db_store_energy(row)
     print(f"[{row['timestamp']}] Energy stored to DB "
-          f"(pv={pv_power}, grid={grid_power}, casa={casa_power})")
+          f"(pv={row['pv_power']}, grid={row['grid_power']}, casa={row['casa_power']})")
 
 
 def on_connect(client, userdata, flags, reason_code, properties):
