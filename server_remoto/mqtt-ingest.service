@@ -1,0 +1,42 @@
+# systemd unit for the MQTT -> ingest.php bridge.
+#
+#   sudo cp mqtt_ingest.py /opt/mqtt-ingest/mqtt_ingest.py
+#   sudo cp mqtt-ingest.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now mqtt-ingest
+#   journalctl -u mqtt-ingest -f
+#
+# Requires paho-mqtt 2.x, which needs Python >= 3.7 -- AlmaLinux 8's default
+# python3 is 3.6, hence python3.11 below:
+#   dnf install -y python3.11 python3.11-pip && python3.11 -m pip install paho-mqtt
+# Everything else the script needs is in the Python standard library.
+
+[Unit]
+Description=MQTT bridge: casa/stazionemeteo -> ingest.php
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3.11 /opt/mqtt-ingest/mqtt_ingest.py
+Restart=always
+RestartSec=5
+
+# Keeping the secrets here rather than in the script means the repo copy can be
+# deployed as-is. Drop any line to fall back to the default in mqtt_ingest.py.
+Environment=MQTT_HOST=mqtt1.steplab.net
+Environment=MQTT_PORT=1883
+Environment=MQTT_USER=mark
+Environment=MQTT_PASSWORD=78f25d
+Environment=MQTT_TOPIC=casa/stazionemeteo
+Environment=INGEST_URL=https://cesana.steplab.net/ingest.php
+Environment=INGEST_TOKEN=4945cbdbe95752de9c6c6ae67118f10df884d6f87eb8ae16
+
+# Unbuffered, so journalctl shows lines as they happen.
+Environment=PYTHONUNBUFFERED=1
+
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
