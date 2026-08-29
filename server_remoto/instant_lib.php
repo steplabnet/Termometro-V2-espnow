@@ -560,6 +560,23 @@ function meteo_build_payload(mysqli $link): array
       'maxOut' => ($em_min_grid === null ? '--' : fmtW(abs(min(0, $em_min_grid)))),
     ],
 
+    // Prelievo: what the house actually buys from the grid. Zero whenever the
+    // PV covers the whole consumption (grid flow <= 0, i.e. balance or export);
+    // otherwise it is simply the imported side of the exchange.
+    'prelievo' => [
+      'val' => ($safeGrid0 === null ? '--' : (string) round(max(0, $safeGrid0))),
+      'drawing' => ($safeGrid0 !== null && $safeGrid0 > 5),
+      'stateText' => ($safeGrid0 === null ? '--'
+        : (($safeGrid0 > 5) ? '&#8595; Dalla rete' : '100% da fotovoltaico')),
+      'stateColor' => ($safeGrid0 !== null && $safeGrid0 > 5)
+        ? 'var(--accent-red)' : 'var(--accent-green)',
+      'shareShow' => ($safeGrid0 !== null && $safeCasa0 !== null && $safeCasa0 > 0),
+      'share' => ($safeGrid0 !== null && $safeCasa0 !== null && $safeCasa0 > 0)
+        ? round(min(100, (max(0, $safeGrid0) / $safeCasa0) * 100)) . '% da rete'
+        : '',
+      'max' => ($em_max_grid === null ? '--' : fmtW(max(0, $em_max_grid))),
+    ],
+
     'casa' => [
       'val' => ($safeCasa0 === null ? '--' : (string) round($safeCasa0)),
       'shareShow' => ($safeCasa0 !== null && $safePv0 !== null && $safeCasa0 > 0),

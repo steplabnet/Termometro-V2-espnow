@@ -33,6 +33,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 # is useless without it, and it must match the unit file's INGEST_TOKEN.
 PHP_FILES=(
   index.php
+  previsioni.php
   live.php
   instant_lib.php
   instant_store.php

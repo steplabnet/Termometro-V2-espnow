@@ -257,6 +257,58 @@ function showStyle($cond): string
       border-top-color: var(--accent-purple);
     }
 
+    .border-rain {
+      border-top-color: var(--accent-blue);
+    }
+
+    .icon-rain {
+      color: var(--accent-blue);
+    }
+
+    /* Six 15-minute buckets in one row: same idea as .minmax-row but tighter,
+       since six clock times have to fit on a phone without wrapping. */
+    .rain-row {
+      display: flex;
+      justify-content: space-between;
+      width: 100%;
+      padding-top: 15px;
+      border-top: 1px solid #eee;
+      margin-top: auto;
+      gap: 2px;
+    }
+
+    .rain-item {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      text-align: center;
+      min-width: 0;
+    }
+
+    .rain-when {
+      color: #9ca3af;
+      font-size: 0.6rem;
+      font-variant-numeric: tabular-nums;
+      text-transform: uppercase;
+      margin-bottom: 3px;
+      white-space: nowrap;
+    }
+
+    .rain-mm {
+      font-weight: 700;
+      font-size: 0.8rem;
+      font-variant-numeric: tabular-nums;
+      color: var(--text-muted);
+    }
+
+    .rain-prob {
+      font-size: 0.6rem;
+      color: #9ca3af;
+      font-variant-numeric: tabular-nums;
+      margin-top: 1px;
+    }
+
     .border-power {
       border-top-color: var(--accent-orange);
     }
@@ -297,6 +349,24 @@ function showStyle($cond): string
       border-top-color: var(--accent-purple);
     }
 
+    /* Prelievo: verde quando e' zero (tutto da fotovoltaico), rosso quando
+       stiamo comprando dalla rete. */
+    .border-draw {
+      border-top-color: var(--accent-green);
+    }
+
+    .border-draw.drawing {
+      border-top-color: var(--accent-red);
+    }
+
+    .icon-draw {
+      color: var(--accent-green);
+    }
+
+    .border-draw.drawing .icon-draw {
+      color: var(--accent-red);
+    }
+
     .icon-grid {
       color: var(--accent-blue);
     }
@@ -320,18 +390,31 @@ function showStyle($cond): string
       color: var(--accent-teal);
     }
 
-    /* Brief highlight when a value is patched in by the live poller. */
+    /* Background blink when a value is patched in by the live poller: a single
+       fade was easy to miss on a dashboard nobody is staring at, so the changed
+       number flashes three times before settling. */
     .pulse {
-      animation: pulse-fade 0.9s ease-out;
+      animation: pulse-blink 1.35s ease-in-out;
     }
 
-    @keyframes pulse-fade {
-      0% { background: rgba(59, 130, 246, 0.22); }
+    @keyframes pulse-blink {
+      0%   { background: transparent; }
+      8%   { background: rgba(59, 130, 246, 0.35); }
+      25%  { background: transparent; }
+      40%  { background: rgba(59, 130, 246, 0.35); }
+      55%  { background: transparent; }
+      70%  { background: rgba(59, 130, 246, 0.35); }
+      85%  { background: transparent; }
       100% { background: transparent; }
     }
 
-    .card-value, .minmax-val, .flow-state {
+    /* The negative margin cancels the padding, so the highlight is wider than
+       the glyphs without nudging the layout when it appears. */
+    .card-value, .minmax-val, .flow-state, [data-live], [data-live-html] {
       border-radius: 6px;
+      padding: 0 4px;
+      margin-left: -4px;
+      margin-right: -4px;
     }
 
     .header-meta {
@@ -429,7 +512,52 @@ function showStyle($cond): string
       </a>
     </div>
 
-    <!-- 3. Pressione / Forecast -->
+    <!-- 3. Nowcast pioggia (Open-Meteo, lato browser: nessun dato nostro) -->
+    <div class="card border-rain" data-card="rain">
+      <a href="previsioni.php">
+        <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-rain" viewBox="0 0 24 24" fill="currentColor">
+          <path
+            d="M17.5 18c-3 0-5.5-2.5-5.5-5.5 0-3 2.5-5.5 5.5-5.5.4 0 .7 0 1.1.1C17.7 4.8 15 3 12 3 8.1 3 5 6.1 5 10c0 .1 0 .3 0 .4C3.3 11.3 2 13 2 15c0 2.8 2.2 5 5 5h10.5c2.5 0 4.5-2 4.5-4.5s-2-4.5-4.5-4.5" />
+          <g stroke="currentColor" stroke-width="2" stroke-linecap="round">
+            <line x1="8" y1="21" x2="8" y2="23" />
+            <line x1="12" y1="21" x2="12" y2="23" />
+            <line x1="16" y1="21" x2="16" y2="23" />
+          </g>
+        </svg>
+        <div class="card-label">Pioggia Prevista</div>
+        <div class="card-value"><span id="rain-total">&mdash;</span><span class="card-unit">mm/90'</span></div>
+
+        <div id="rain-summary"
+          style="font-weight:800; font-size:0.75rem; color:var(--text-muted); margin-top:5px; text-transform:uppercase;">
+          Caricamento&hellip;
+        </div>
+
+        <div id="rain-next" style="margin-top:3px; font-size:0.68rem; color:var(--text-muted); display:none;">
+          &#128337; <span id="rain-next-text"></span>
+        </div>
+
+        <!-- One column per native 15-minute bucket of the model, six of them:
+             the current one plus the next 90 minutes. Labels are filled in
+             with the bucket's own clock time, so the card never implies a
+             resolution the API does not have. -->
+        <div class="rain-row">
+          <div class="rain-item"><span class="rain-when" data-rain-when="0">&nbsp;</span><span class="rain-mm"
+              data-rain="0">&mdash;</span><span class="rain-prob" data-rain-prob="0"></span></div>
+          <div class="rain-item"><span class="rain-when" data-rain-when="1">&nbsp;</span><span class="rain-mm"
+              data-rain="1">&mdash;</span><span class="rain-prob" data-rain-prob="1"></span></div>
+          <div class="rain-item"><span class="rain-when" data-rain-when="2">&nbsp;</span><span class="rain-mm"
+              data-rain="2">&mdash;</span><span class="rain-prob" data-rain-prob="2"></span></div>
+          <div class="rain-item"><span class="rain-when" data-rain-when="3">&nbsp;</span><span class="rain-mm"
+              data-rain="3">&mdash;</span><span class="rain-prob" data-rain-prob="3"></span></div>
+          <div class="rain-item"><span class="rain-when" data-rain-when="4">&nbsp;</span><span class="rain-mm"
+              data-rain="4">&mdash;</span><span class="rain-prob" data-rain-prob="4"></span></div>
+          <div class="rain-item"><span class="rain-when" data-rain-when="5">&nbsp;</span><span class="rain-mm"
+              data-rain="5">&mdash;</span><span class="rain-prob" data-rain-prob="5"></span></div>
+        </div>
+      </a>
+    </div>
+
+    <!-- 4. Pressione / Forecast -->
     <!-- Every icon variant is in the DOM; the poller shows the one that matches
          pres.icon, so the forecast can change without a page reload. -->
     <div class="card border-pres" data-card="pres">
@@ -710,7 +838,32 @@ function showStyle($cond): string
         </a>
       </div>
 
-      <!-- 9. Consumo di casa = produzione + scambio rete -->
+      <!-- 9. Prelievo dalla rete: 0 quando il fotovoltaico copre tutto il
+           consumo, altrimenti la parte importata dello scambio rete. -->
+      <div class="card border-draw <?php echo $p['prelievo']['drawing'] ? 'drawing' : ''; ?>" data-card="prelievo">
+        <a href="grafico.php?var=prelievo">
+          <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-draw" viewBox="0 0 24 24" fill="currentColor">
+            <path d="M7 2h10l3 12H4L7 2zm2.2 2-.5 2h6.6l-.5-2H9.2zm-1 4-.6 2.5h8.8L15.4 8H8.2z" opacity="0.85" />
+            <path d="M11 15h2v3h3l-4 6-4-6h3v-3z" />
+          </svg>
+          <div class="card-label">Prelievo Rete</div>
+          <div class="card-value"><span data-live="prelievo.val"><?php echo $p['prelievo']['val']; ?></span><span
+              class="card-unit">W</span></div>
+          <div class="flow-state" style="color:<?php echo $p['prelievo']['stateColor']; ?>;"
+            data-live-html="prelievo.stateText" data-live-color="prelievo.stateColor">
+            <?php echo $p['prelievo']['stateText']; ?>
+          </div>
+          <div class="minmax-row">
+            <div class="minmax-item"><span class="minmax-label">Quota consumo</span><span class="minmax-val"
+                style="<?php echo showStyle($p['prelievo']['shareShow']); ?>" data-live-show="prelievo.shareShow"
+                data-live="prelievo.share"><?php echo $p['prelievo']['share']; ?></span></div>
+            <div class="minmax-item"><span class="minmax-label">Max 24h</span><span class="minmax-val val-max"
+                data-live="prelievo.max"><?php echo $p['prelievo']['max']; ?></span></div>
+          </div>
+        </a>
+      </div>
+
+      <!-- 10. Consumo di casa = produzione + scambio rete -->
       <div class="card border-house" data-card="casa">
         <a href="grafico.php?var=casa">
           <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-house" viewBox="0 0 24 24" fill="currentColor">
@@ -854,14 +1007,24 @@ function showStyle($cond): string
 
         document.querySelectorAll('[data-live-color]').forEach(function (el) {
           var k = el.getAttribute('data-live-color');
-          if (k in f) el.style.color = f[k];
+          if (!(k in f)) return;
+          // Compared against the last value we applied, not el.style.color: the
+          // browser normalises "#3b82f6" to "rgb(...)", so reading it back would
+          // look like a change on every single poll.
+          var prev = el.__liveColor;
+          el.style.color = f[k];
+          el.__liveColor = f[k];
+          if (prev !== undefined && prev !== f[k]) pulse(el);
         });
 
         document.querySelectorAll('[data-live-show]').forEach(function (el) {
           var k = el.getAttribute('data-live-show');
           if (!(k in f)) return;
           var v = f[k];
-          el.style.display = (v === '' || v === false || v === null) ? 'none' : '';
+          var next = (v === '' || v === false || v === null) ? 'none' : '';
+          if (el.style.display === next) return;
+          el.style.display = next;
+          if (next === '') pulse(el);   // blink only when a block appears
         });
 
         document.querySelectorAll('[data-live-href]').forEach(function (el) {
@@ -894,6 +1057,7 @@ function showStyle($cond): string
         if (card('pv')) card('pv').classList.toggle('night-mode', !!p.pv.night);
         if (card('piave')) card('piave').classList.toggle('river-dry', p.piave.status === 'dry');
         if (card('grid')) card('grid').classList.toggle('exporting', !!p.grid.exporting);
+        if (card('prelievo')) card('prelievo').classList.toggle('drawing', !!p.prelievo.drawing);
       }
 
       function schedule(ms) {
@@ -962,6 +1126,152 @@ function showStyle($cond): string
       });
 
       poll();
+    })();
+  </script>
+
+  <script>
+    /**
+     * Rain nowcast (Open-Meteo, no key, no quota registration).
+     *
+     * This is the one card whose numbers do NOT come from our own snapshot:
+     * the browser talks to api.open-meteo.com directly, so a failure here can
+     * never hold up a PHP worker or delay the rest of the dashboard.
+     *
+     * The columns are the model's OWN 15-minute buckets (mm fallen in each),
+     * not round-number horizons: 15 minutes is the finest grid Open-Meteo
+     * publishes for Central Europe (ICON-D2 / AROME), so anything labelled
+     * "5 minuti" would only be that same bucket wearing a nicer label. Each
+     * bucket is shown as mm/h, with the probability read from the hourly
+     * series -- the only resolution at which Open-Meteo exposes it.
+     */
+    (function () {
+      var LAT = 46.0186, LON = 11.9931;   // Cesana di Lentiai (BL), 264 m slm
+      var SLOTS = 6;                      // current bucket + the next 90 minutes
+      var REFRESH_MS = 10 * 60 * 1000;
+
+      var URL = 'https://api.open-meteo.com/v1/forecast'
+        + '?latitude=' + LAT + '&longitude=' + LON
+        + '&minutely_15=precipitation'
+        + '&hourly=precipitation_probability'
+        + '&forecast_days=2&timezone=UTC';
+
+      var summaryEl = document.getElementById('rain-summary');
+      var totalEl = document.getElementById('rain-total');
+      var nextEl = document.getElementById('rain-next');
+      var nextTextEl = document.getElementById('rain-next-text');
+
+      /** Open-Meteo timestamps come back as "2026-08-29T14:30" in UTC. */
+      function ts(s) { return Date.parse(s + ':00Z'); }
+
+      /** Index of the entry whose slot of `stepMin` minutes contains `t`. */
+      function slotIndex(times, t, stepMin) {
+        var span = stepMin * 60000;
+        for (var i = 0; i < times.length; i++) {
+          var start = ts(times[i]);
+          if (t >= start && t < start + span) return i;
+        }
+        return -1;
+      }
+
+      function num(v) { return (typeof v === 'number' && isFinite(v)) ? v : null; }
+
+      /** mm/h -> the wording a person would use looking out of the window. */
+      function describe(mmh) {
+        if (mmh < 0.1) return ['Asciutto', 'var(--text-muted)'];
+        if (mmh < 1) return ['Pioviggine', 'var(--accent-teal)'];
+        if (mmh < 4) return ['Pioggia debole', 'var(--accent-blue)'];
+        if (mmh < 10) return ['Pioggia', 'var(--accent-blue)'];
+        return ['Rovescio', 'var(--accent-red)'];
+      }
+
+      function fmt(mmh) {
+        if (mmh === null) return '—';
+        if (mmh < 0.1) return '0';
+        return mmh < 10 ? mmh.toFixed(1) : Math.round(mmh).toString();
+      }
+
+      function fail(msg) {
+        summaryEl.textContent = msg;
+        summaryEl.style.color = 'var(--text-muted)';
+        totalEl.textContent = '—';
+      }
+
+      function render(data) {
+        var mTimes = data && data.minutely_15 && data.minutely_15.time;
+        var mPrec = data && data.minutely_15 && data.minutely_15.precipitation;
+        if (!mTimes || !mPrec) { fail('Previsione non disponibile'); return; }
+
+        var hTimes = (data.hourly && data.hourly.time) || [];
+        var hProb = (data.hourly && data.hourly.precipitation_probability) || [];
+
+        var now = Date.now();
+        var maxMmh = 0, total = 0, maxProb = null, firstWet = null;
+
+        // The bucket we are inside right now; the row walks forward from it.
+        var base = slotIndex(mTimes, now, 15);
+        if (base < 0) { fail('Previsione non disponibile'); return; }
+
+        for (var k = 0; k < SLOTS; k++) {
+          var i = base + k;
+          var start = i < mTimes.length ? ts(mTimes[i]) : null;
+          var mm = start === null ? null : num(mPrec[i]);
+          var mmh = mm === null ? null : mm * 4;
+
+          var j = start === null ? -1 : slotIndex(hTimes, start, 60);
+          var prob = j >= 0 ? num(hProb[j]) : null;
+
+          var whenEl = document.querySelector('[data-rain-when="' + k + '"]');
+          var valEl = document.querySelector('[data-rain="' + k + '"]');
+          var probEl = document.querySelector('[data-rain-prob="' + k + '"]');
+
+          if (whenEl) {
+            // The first column is the quarter-hour in progress, so it gets the
+            // word rather than a clock time that is already partly in the past.
+            whenEl.textContent = start === null ? '—' : (k === 0 ? 'ora' :
+              new Date(start).toLocaleTimeString('it-IT',
+                { hour: '2-digit', minute: '2-digit', hour12: false }));
+          }
+          if (valEl) {
+            valEl.textContent = fmt(mmh);
+            valEl.style.color = (mmh !== null && mmh >= 0.1) ? describe(mmh)[1] : 'var(--text-muted)';
+          }
+          if (probEl) probEl.textContent = prob === null ? '' : Math.round(prob) + '%';
+
+          if (mmh !== null && mmh > maxMmh) maxMmh = mmh;
+          if (prob !== null && (maxProb === null || prob > maxProb)) maxProb = prob;
+          if (mm !== null) {
+            total += mm;
+            if (firstWet === null && mm >= 0.05) firstWet = start;
+          }
+        }
+
+        totalEl.textContent = total < 0.05 ? '0' : total.toFixed(1);
+
+        var d = describe(maxMmh);
+        summaryEl.textContent = d[0] + (maxProb !== null ? ' · ' + Math.round(maxProb) + '%' : '');
+        summaryEl.style.color = d[1];
+
+        if (firstWet !== null) {
+          var mins = Math.max(0, Math.round((firstWet - now) / 60000));
+          nextTextEl.textContent = mins <= 0 ? 'in corso' : 'inizio tra ~' + mins + ' min';
+          nextEl.style.display = '';
+        } else {
+          nextEl.style.display = 'none';
+        }
+      }
+
+      function load() {
+        fetch(URL, { cache: 'no-store' })
+          .then(function (r) {
+            if (!r.ok) throw new Error('HTTP ' + r.status);
+            return r.json();
+          })
+          .then(render)
+          .catch(function () { fail('Previsione non disponibile'); });
+      }
+
+      load();
+      setInterval(function () { if (!document.hidden) load(); }, REFRESH_MS);
     })();
   </script>
 </body>

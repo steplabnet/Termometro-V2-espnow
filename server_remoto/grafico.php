@@ -79,12 +79,17 @@ switch ($variable) {
     $titolo = "Consumo Casa";
     $unit = "W";
     break;
+  case 'prelievo':
+    $titolo = "Prelievo Rete";
+    $unit = "W";
+    break;
 }
 
 // Shelly power channels legitimately go far below zero (grid export), so the
 // "< -50 means dead sensor" rule that guards the temperature series must not be
-// applied to them. 'casa' is derived (pvPower + gridPower), not a DB column.
-$POWER_VARS = ['pvPower', 'gridPower', 'casa'];
+// applied to them. 'casa' (pvPower + gridPower) and 'prelievo' (the imported
+// half of gridPower) are derived, not DB columns.
+$POWER_VARS = ['pvPower', 'gridPower', 'casa', 'prelievo'];
 $skipSentinelFilter = in_array($variable, $POWER_VARS, true);
 
 $now = time();
@@ -103,6 +108,7 @@ $MULTI_CATALOG = [
   'pvPower'     => ['label' => 'Produzione FV', 'unit' => 'W',    'color' => '#f97316', 'src' => 'db',   'signed' => true],
   'gridPower'   => ['label' => 'Scambio Rete',  'unit' => 'W',    'color' => '#0ea5e9', 'src' => 'db',   'signed' => true],
   'casa'        => ['label' => 'Consumo Casa',  'unit' => 'W',    'color' => '#a855f7', 'src' => 'calc', 'signed' => true],
+  'prelievo'    => ['label' => 'Prelievo Rete', 'unit' => 'W',    'color' => '#dc2626', 'src' => 'calc'],
 ];
 
 /** PV production under this many watts is noise, not production. */
@@ -127,6 +133,26 @@ function casa_power(array $row)
     return null;
   }
   return (float) $pv + (float) $grid;
+}
+
+/**
+ * Prelievo: what we actually buy from the grid. Zero while the PV covers the
+ * whole load (grid flow <= 0, i.e. balance or export), the imported side of the
+ * exchange otherwise -- the same rule the dashboard card uses.
+ */
+function prelievo_power(array $row)
+{
+  $grid = $row['gridPower'] ?? null;
+  if (!is_numeric($grid)) {
+    return null;
+  }
+  return max(0.0, (float) $grid);
+}
+
+/** The derived ('calc') series, by variable name. */
+function calc_power(string $variable, array $row)
+{
+  return ($variable === 'prelievo') ? prelievo_power($row) : casa_power($row);
 }
 
 // ---- MULTI (compare) MODE ---------------------------------------------------
@@ -201,7 +227,7 @@ if ($isMulti) {
     if ($meta['src'] === 'csv') {
       foreach ($times as $ts) $data[] = $presAt($ts);
     } elseif ($meta['src'] === 'calc') {
-      foreach ($rowsAsc as $rw) $data[] = casa_power($rw);
+      foreach ($rowsAsc as $rw) $data[] = calc_power($k, $rw);
     } else {
       // 'signed' series (the Shelly power channels) keep their negative values;
       // everything else treats < -50 as a dead-sensor sentinel.
@@ -282,8 +308,8 @@ $labels = [];
 while ($row = $result->fetch_array(MYSQLI_ASSOC)) {
   if ($variable == 'press') {
     $val = round(press_qff($row['press'], $row['chip']), 1);
-  } elseif ($variable == 'casa') {
-    $val = casa_power($row);
+  } elseif ($variable == 'casa' || $variable == 'prelievo') {
+    $val = calc_power($variable, $row);
     if ($val === null) {
       continue;
     }
@@ -314,8 +340,8 @@ while ($row = $result2->fetch_array(MYSQLI_ASSOC)) {
     $val = round(press_qff($row['press'], $row['chip']), 1);
   } else if ($variable == 'chip') {
     $val = round($row['cpuTemp'], 1);
-  } elseif ($variable == 'casa') {
-    $val = casa_power($row);
+  } elseif ($variable == 'casa' || $variable == 'prelievo') {
+    $val = calc_power($variable, $row);
     if ($val === null) {
       continue;
     }
@@ -520,7 +546,7 @@ if ($isMulti) {
   <?php
   // ENERGY SECTION (Shelly power channels): true kWh, integrated over the real
   // sample timestamps instead of assuming a fixed cadence.
-  if (in_array($variable, ['pvPower', 'gridPower', 'casa'], true) && !$isMulti):
+  if (in_array($variable, ['pvPower', 'gridPower', 'casa', 'prelievo'], true) && !$isMulti):
 
     /**
      * Integrate a power channel between two timestamps.
@@ -546,7 +572,7 @@ if ($isMulti) {
       $prevT = null;
       $prevV = null;
       while ($row = $res->fetch_assoc()) {
-        $v = ($variable === 'casa') ? casa_power($row)
+        $v = ($variable === 'casa' || $variable === 'prelievo') ? calc_power($variable, $row)
           : (($variable === 'pvPower') ? pv_clean($row[$variable] ?? null) : ($row[$variable] ?? null));
         if ($v === null || !is_numeric($v)) {
           continue;

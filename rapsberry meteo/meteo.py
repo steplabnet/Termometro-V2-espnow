@@ -143,6 +143,7 @@ def init_db():
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp    TEXT,
             pv_power     REAL,
+            pv_power_raw REAL,
             grid_power   REAL,
             casa_power   REAL,
             pv_voltage   REAL,
@@ -154,6 +155,10 @@ def init_db():
             freq         REAL
         )
     """)
+    # Added after the first deploys — see mqtt_receiver.py, which does the same.
+    cols = {r[1] for r in con.execute("PRAGMA table_info(energia)")}
+    if "pv_power_raw" not in cols:
+        con.execute("ALTER TABLE energia ADD COLUMN pv_power_raw REAL")
     con.commit()
     con.close()
 

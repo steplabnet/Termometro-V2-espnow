@@ -17,6 +17,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from collections import namedtuple
 from datetime import datetime, time as dt_time, timedelta
 
 import requests
@@ -54,6 +55,25 @@ METRICS = {
     "uff_pres":     {"label": "Ufficio Pressione", "unit": "hPa", "sentinel": None, "decimals": 0},
     "uff_setpoint": {"label": "Ufficio Setpoint",  "unit": "°C",  "sentinel": None, "decimals": 1},
 }
+
+# Shelly Pro EM-50 sources, merged from the `energia` table by _merge_energia().
+# pv_raw is the meter reading BEFORE the PV_ZERO_THRESHOLD deadband that
+# mqtt_receiver.py applies, so a rule "pv_raw = 0" fires only when the meter
+# really reads nothing (inverter down / string offline) and not on the leakage
+# and standby noise that every other consumer of pv_power flattens to 0 W.
+ENERGY_METRICS = {
+    "pv_raw":     {"label": "Shelly — Produzione reale", "unit": " W", "sentinel": None, "decimals": 0},
+    "pv_power":   {"label": "Shelly — Produzione",       "unit": " W", "sentinel": None, "decimals": 0},
+    "grid_power": {"label": "Shelly — Scambio rete",     "unit": " W", "sentinel": None, "decimals": 0},
+    "casa_power": {"label": "Shelly — Consumo casa",     "unit": " W", "sentinel": None, "decimals": 0},
+}
+
+# Energy readings older than this are treated as missing, so a dead meter or a
+# stopped mqtt_receiver.py can't keep a rule latched on the last value. The
+# Shelly publishes every couple of seconds and the energia table is written
+# once a minute, so this is generous.
+ENERGY_STALE_S = 600
+ENERGY_KEYS = frozenset(ENERGY_METRICS)
 
 # Office readings older than this are treated as missing so a board dropout
 # can't keep firing alarms on a frozen last value.
@@ -94,11 +114,17 @@ FORECAST_METRICS = {
 CONTROL_METRICS = {
     "fan": {"label": "Ventola Raspberry", "unit": "", "sentinel": None, "decimals": 0},
 }
-ALL_METRICS = {**METRICS, **FORECAST_METRICS, **CONTROL_METRICS}
+ALL_METRICS = {**METRICS, **FORECAST_METRICS, **CONTROL_METRICS, **ENERGY_METRICS}
 
 
 def log(msg):
     print(msg, flush=True)
+
+
+# A command reply that needs more than plain text: an HTML-formatted report,
+# an inline keyboard, or both. Plain strings are still valid replies.
+Reply = namedtuple("Reply", "text parse_mode markup")
+Reply.__new__.__defaults__ = (None, None)
 
 
 # ── Telegram I/O ────────────────────────────────────────────────────────────
@@ -109,7 +135,9 @@ def set_bot_commands():
     /setcommands would otherwise drift out of date. Idempotent: Telegram just
     overwrites the previous list."""
     commands = [
-        {"command": "status",   "description": "Valori correnti"},
+        {"command": "status",   "description": "Report: temperature, energia o tutto"},
+        {"command": "temperature", "description": "Tutte le temperature e umidità"},
+        {"command": "energia",  "description": "Produzione e consumi elettrici"},
         {"command": "forecast", "description": "Previsione 6am (cielo sereno)"},
         {"command": "alarms",   "description": "Soglie configurate e allarmi attivi"},
         {"command": "reboot",   "description": "Riavvia il Raspberry"},
@@ -125,10 +153,14 @@ def set_bot_commands():
         return False
 
 
-def send_message(text, token=None, chat_id=None):
+def send_message(text, token=None, chat_id=None, reply_markup=None, parse_mode=None):
     """Send via the given bot, or the default zbot.py bot when token/chat are None."""
     url = f"https://api.telegram.org/bot{token or BOT_TOKEN}/sendMessage"
     payload = {"chat_id": chat_id if chat_id is not None else CHAT_ID, "text": text}
+    if reply_markup is not None:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     try:
         r = requests.post(url, data=payload, timeout=10)
         r.raise_for_status()
@@ -136,6 +168,18 @@ def send_message(text, token=None, chat_id=None):
     except requests.exceptions.RequestException as e:
         log(f"[send] error: {e}")
         return False
+
+
+def answer_callback_query(callback_id, text=None):
+    """Stop the spinner on an inline button. Failing here is not fatal."""
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/answerCallbackQuery"
+    payload = {"callback_query_id": callback_id}
+    if text:
+        payload["text"] = text
+    try:
+        requests.post(url, data=payload, timeout=10)
+    except requests.exceptions.RequestException as e:
+        log(f"[callback] answer error: {e}")
 
 
 # ── Persistence helpers ─────────────────────────────────────────────────────
@@ -151,10 +195,15 @@ def load_rules():
         con.row_factory = sqlite3.Row
         # bot_id was added later — select it only if the column exists so an
         # un-migrated database keeps firing rules through the default bot.
+        rcols = {c["name"] for c in con.execute("PRAGMA table_info(rules)")}
         cols = "id, enabled, message"
-        has_bot = any(c["name"] == "bot_id" for c in con.execute("PRAGMA table_info(rules)"))
-        if has_bot:
+        if "bot_id" in rcols:
             cols += ", bot_id"
+        # icon / restore_icon / restore_message were added later — select them
+        # only if present so an un-migrated database keeps working.
+        for opt in ("icon", "restore_icon", "restore_message"):
+            if opt in rcols:
+                cols += ", " + opt
         rules = [dict(r) for r in con.execute(
             f"SELECT {cols} FROM rules ORDER BY id"
         ).fetchall()]
@@ -199,9 +248,10 @@ def load_bots():
     return bots
 
 
-def send_rule_message(rule, bots):
+def send_rule_message(rule, bots, text=None):
     """Send a rule's alarm via its associated bot, or the default bot if unset."""
-    text = rule_alarm_text(rule)
+    if text is None:
+        text = rule_alarm_text(rule)
     bot = bots.get(rule.get("bot_id")) if rule.get("bot_id") else None
     if bot and bot.get("token") and bot.get("chat_id"):
         return send_message(text, token=bot["token"], chat_id=bot["chat_id"])
@@ -223,6 +273,10 @@ def save_state(state):
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(state, f)
         os.replace(tmp, ALARM_STATE_PATH)
+        # Every save creates a new file, so the mode has to be re-applied each
+        # time: alarms.php (www-data) rewrites this file in place to clear a
+        # single rule's latched state from its "riarma" button.
+        os.chmod(ALARM_STATE_PATH, 0o666)
     except Exception as e:
         log(f"[state] save error: {e}")
 
@@ -272,6 +326,58 @@ def _merge_ufficio(con, row):
     return row
 
 
+def _merge_energia(con, row):
+    """Augment the reading with the latest Shelly Pro EM-50 row under the
+    ENERGY_METRICS keys.
+
+    Same contract as _merge_ufficio: the energia table has its own cadence and
+    its own timestamp, so anything older than ENERGY_STALE_S is left as None
+    rather than kept alive by the meteo row's freshness. pv_raw comes from
+    pv_power_raw, the value as the meter reported it — older rows (written
+    before that column existed) simply have no raw value and leave it None."""
+    for key in ENERGY_METRICS:
+        row.setdefault(key, None)
+    try:
+        erow = con.execute(
+            "SELECT * FROM energia ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return row  # energia table not created yet
+    if not erow:
+        return row
+
+    ts = erow["timestamp"]
+    fresh = False
+    if ts:
+        try:
+            age = (datetime.utcnow() - datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")).total_seconds()
+            fresh = age <= ENERGY_STALE_S
+        except ValueError:
+            fresh = False
+    if not fresh:
+        return row
+
+    cols = erow.keys()
+
+    def clean(name):
+        if name not in cols:
+            return None
+        v = erow[name]
+        if v is None:
+            return None
+        try:
+            f = float(v)
+            return f if f == f else None  # reject NaN
+        except (TypeError, ValueError):
+            return None
+
+    row["pv_raw"]     = clean("pv_power_raw")
+    row["pv_power"]   = clean("pv_power")
+    row["grid_power"] = clean("grid_power")
+    row["casa_power"] = clean("casa_power")
+    return row
+
+
 def fetch_latest():
     try:
         con = sqlite3.connect(DB_PATH, timeout=2)
@@ -283,11 +389,14 @@ def fetch_latest():
         # conditions on uff_* resolve through the same code path.
         row = dict(meteo_row) if meteo_row else {}
         row = _merge_ufficio(con, row)
+        # Shelly Pro EM-50 sources, likewise from their own table.
+        row = _merge_energia(con, row)
         con.close()
         # Return None only if there is genuinely no data at all, preserving the
         # previous contract for the meteo-only case.
         if not meteo_row and all(row.get(k) is None for k in
-                                 ("uff_temp", "uff_hum", "uff_pres", "uff_setpoint")):
+                                 ("uff_temp", "uff_hum", "uff_pres", "uff_setpoint",
+                                  *ENERGY_KEYS)):
             return None
         return row
     except Exception as e:
@@ -519,9 +628,10 @@ def evaluate_stale_cond(cond, row):
     if not row:
         return True
 
-    # Whole-pipeline staleness. Office sources carry their own freshness (the
-    # merge nulls stale values), so skip the meteo-row age check for them.
-    if src not in UFFICIO_KEYS:
+    # Whole-pipeline staleness. Office and energy sources carry their own
+    # freshness (their merge nulls stale values), so skip the meteo-row age
+    # check for them — meteo.py stopping says nothing about the meter.
+    if src not in UFFICIO_KEYS and src not in ENERGY_KEYS:
         ts = row.get("timestamp")
         if ts:
             try:
@@ -575,11 +685,24 @@ def rule_describe(rule):
     return " AND ".join(parts) if parts else f"regola #{rule['id']}"
 
 
+def _with_icon(icon, text):
+    icon = (icon or "").strip()
+    return f"{icon} {text}" if icon else text
+
+
 def rule_alarm_text(rule):
     msg = (rule.get("message") or "").strip()
-    if msg:
-        return msg
-    return f"[ALARM] {rule_describe(rule)}"
+    if not msg:
+        msg = f"[ALARM] {rule_describe(rule)}"
+    return _with_icon(rule.get("icon"), msg)
+
+
+def rule_restore_text(rule):
+    """Message to send when an edge-triggered rule rearms, or None if unset."""
+    msg = (rule.get("restore_message") or "").strip()
+    if not msg:
+        return None
+    return _with_icon(rule.get("restore_icon"), msg)
 
 
 # Debounce counters for edge-triggered rules. Lost on restart, which only
@@ -706,6 +829,9 @@ def check_alarms():
 
         if entry.get("fired"):
             if verified is False:
+                restore = rule_restore_text(rule)
+                if restore:
+                    send_rule_message(rule, bots, text=restore)
                 state.pop(rid, None)
                 _debounce.pop(rid, None)
                 state_changed = True
@@ -732,26 +858,216 @@ def check_alarms():
 
 # ── Bot commands ────────────────────────────────────────────────────────────
 def format_status():
+    """The "Tutto" report: both sections from a single reading, so the two
+    halves can never show values taken a minute apart."""
     row = fetch_latest()
     if not row:
         return "Nessun dato disponibile."
 
-    lines = ["Stazione Meteo — Stato"]
-    ts = row.get("timestamp")
-    if ts:
-        lines.append(f"Ultimo dato: {ts} (UTC)")
-    lines.append("")
-
-    for key, meta in METRICS.items():
-        value = row.get(key)
-        lines.append(f"{meta['label']}: {fmt_value(value, meta)}")
-
-    fan = row.get("fan")
-    lines.append(f"Ventola: {'ON' if fan else 'OFF'}")
+    parts = [format_temperatures(row), format_energy(row)]
     sid = row.get("station_id")
     if sid is not None:
-        lines.append(f"Stazione: {sid}")
+        parts.append(f"<i>Stazione {sid}</i>")
+    return "\n\n".join(parts)
+
+
+# ── /status reports ─────────────────────────────────────────────────────────
+# Sensors listed by the temperature report: icon, label, current-value keys (as
+# fetch_latest() returns them) and where their 24h history lives. The office
+# board logs to its own table, so its extremes come from there.
+TEMP_REPORT = (
+    ("☀️", "Full Sun", "temp",     "humi",    "meteo",   "temp",    "humi"),
+    ("🌳", "Ombra",    "tombra",   "hombra",  "meteo",   "tombra",  "hombra"),
+    ("🏠", "Interno",  "tMobile",  "hMobile", "meteo",   "tMobile", "hMobile"),
+    ("🏢", "Ufficio",  "uff_temp", "uff_hum", "ufficio", "temp",    "hum"),
+)
+
+
+def fmt_ts_local(ts):
+    """'2026-08-29T17:06:17Z' -> '29/08 19:06 · 2 min fa' in station local time.
+
+    The reports are read on a phone, where "how old is this" matters more than
+    the raw UTC stamp the row carries."""
+    if not ts:
+        return None
+    try:
+        when = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+    except (TypeError, ValueError):
+        return str(ts)
+    # The watcher works in naive local time everywhere else; derive the offset
+    # rather than pulling in a tz library for one line.
+    local = when + (datetime.now() - datetime.utcnow())
+    age_min = max(0, int((datetime.utcnow() - when).total_seconds() // 60))
+    if age_min < 1:
+        age = "ora"
+    elif age_min < 60:
+        age = f"{age_min} min fa"
+    else:
+        age = f"{age_min // 60}h {age_min % 60}min fa"
+    return f"{local.strftime('%d/%m %H:%M')} · {age}"
+
+
+def report_header(title, ts):
+    lines = [f"<b>{title}</b>"]
+    stamp = fmt_ts_local(ts)
+    if stamp:
+        lines.append(f"<i>{stamp}</i>")
+    lines.append("")
+    return lines
+
+
+def window_extremes(table, col, valid_min=None, hours=24):
+    """(min, max) of one column over the last `hours`, or (None, None).
+
+    `valid_min` filters out the offline sentinels (-100 °C, -1 %), which would
+    otherwise win every MIN() as soon as a sensor blinks out once."""
+    since = (datetime.utcnow() - timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    sql = f"SELECT MIN({col}), MAX({col}) FROM {table} WHERE timestamp >= ?"
+    params = [since]
+    if valid_min is not None:
+        sql += f" AND {col} > ?"
+        params.append(valid_min)
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=2)
+        row = con.execute(sql, params).fetchone()
+        con.close()
+    except Exception as e:
+        log(f"[report] extremes {table}.{col}: {e}")
+        return (None, None)
+    if not row:
+        return (None, None)
+    return (row[0], row[1])
+
+
+def fmt_w(value, default="--"):
+    """Watts the way the dashboard prints them: kW past 1000 W."""
+    if value is None:
+        return default
+    value = float(value)
+    if abs(value) >= 1000:
+        return f"{value / 1000:.2f} kW"
+    return f"{round(value):.0f} W"
+
+
+def fmt_range(lo, hi, decimals, unit):
+    if lo is None or hi is None:
+        return None
+    return f"{lo:.{decimals}f}–{hi:.{decimals}f}{unit}"
+
+
+def format_temperatures(row=None):
+    """All temperature and humidity sensors, with their 24h range.
+
+    One block per sensor: the two current values on the headline, the 24h
+    extremes on a dimmer second line, so the numbers that matter are the ones
+    you read first."""
+    row = row if row is not None else fetch_latest()
+    if not row:
+        return "Nessun dato disponibile."
+
+    lines = report_header("🌡️ Temperature e umidità", row.get("timestamp"))
+
+    for icon, label, tkey, hkey, table, tcol, hcol in TEMP_REPORT:
+        t_str = fmt_value(row.get(tkey), METRICS[tkey])
+        h_str = fmt_value(row.get(hkey), METRICS[hkey])
+        lines.append(f"{icon} <b>{label}</b>   {t_str}   ·   {h_str}")
+        t_rng = fmt_range(*window_extremes(table, tcol, valid_min=-99), decimals=1, unit="°C")
+        h_rng = fmt_range(*window_extremes(table, hcol, valid_min=0),   decimals=0, unit="%")
+        if t_rng or h_rng:
+            detail = "   ·   ".join(x for x in (t_rng, h_rng) if x)
+            lines.append(f"      <i>24h  {detail}</i>")
+
+    sp = row.get("uff_setpoint")
+    if sp is not None:
+        lines.append(f"      <i>setpoint {fmt_value(sp, METRICS['uff_setpoint'])}</i>")
+
+    lines.append("")
+    lines.append(f"🖥 CPU {fmt_value(row.get('tempCpu'), METRICS['tempCpu'])}"
+                 f"   ·   🌀 Ventola {'ON' if row.get('fan') else 'OFF'}")
     return "\n".join(lines)
+
+
+def format_energy(row=None):
+    """Production and consumption, mirroring the cards of the remote dashboard
+    (server_remoto/index.php): produzione, scambio rete, prelievo, consumo casa.
+
+    Same block shape as the temperature report: value on the headline, the
+    24h context in italics underneath."""
+    row = row if row is not None else fetch_latest()
+    pv   = row.get("pv_power")   if row else None
+    grid = row.get("grid_power") if row else None
+    casa = row.get("casa_power") if row else None
+    if casa is None and pv is not None and grid is not None:
+        casa = pv + grid          # same definition the dashboard uses
+    if pv is None and grid is None:
+        return ("⚡ Energia\nNessun dato dal Shelly Pro EM-50 "
+                "(meter fermo o mqtt_receiver.py non in esecuzione).")
+
+    max_pv              = window_extremes("energia", "pv_power")[1]
+    min_grid, max_grid  = window_extremes("energia", "grid_power")
+    max_casa            = window_extremes("energia", "casa_power")[1]
+
+    lines = report_header("⚡ Energia", row.get("timestamp"))
+
+    lines.append(f"☀️ <b>Produzione FV</b>   {fmt_w(pv)}")
+    lines.append(f"      <i>picco 24h {fmt_w(max_pv)}</i>")
+
+    if grid is None:
+        lines.append("🔌 <b>Scambio rete</b>   --")
+    else:
+        if grid < 0:
+            flow = "↑ immissione"
+        elif grid > 5:
+            flow = "↓ prelievo"
+        else:
+            flow = "equilibrio"
+        lines.append(f"🔌 <b>Scambio rete</b>   {fmt_w(abs(grid))}   ·   {flow}")
+        lines.append(f"      <i>max 24h  ↓ {fmt_w(max(0.0, max_grid) if max_grid is not None else None)}"
+                     f"   ·   ↑ {fmt_w(abs(min(0.0, min_grid)) if min_grid is not None else None)}</i>")
+
+        draw = max(0.0, grid)
+        lines.append(f"⬇️ <b>Prelievo rete</b>   {fmt_w(draw)}")
+        detail = ("100% da fotovoltaico" if grid <= 5
+                  else (f"{round(min(100, draw / casa * 100))}% del consumo"
+                        if casa and casa > 0 else "dalla rete"))
+        lines.append(f"      <i>{detail}</i>")
+
+    if casa is None:
+        lines.append("🏠 <b>Consumo casa</b>   --")
+    else:
+        lines.append(f"🏠 <b>Consumo casa</b>   {fmt_w(casa)}")
+        share_pv = (f"{round(min(100, pv / casa * 100))}% da fotovoltaico   ·   "
+                    if pv is not None and casa > 0 else "")
+        lines.append(f"      <i>{share_pv}picco 24h {fmt_w(max_casa)}</i>")
+    return "\n".join(lines)
+
+
+# Report chooser shown by a bare /status. The callback_data values are also
+# accepted as text arguments (/status temp, /status energia, /status tutto).
+STATUS_REPORTS = {
+    "temp":   ("🌡️ Temperature", format_temperatures),
+    "energy": ("⚡ Energia",      format_energy),
+    "all":    ("📋 Tutto",        lambda: format_status()),
+}
+STATUS_ALIASES = {
+    "temp": "temp", "temperature": "temp", "temperatura": "temp", "t": "temp",
+    "energy": "energy", "energia": "energy", "e": "energy",
+    "all": "all", "tutto": "all", "completo": "all",
+}
+
+
+def status_menu():
+    """The /status report chooser: one button per report, on its own row."""
+    keyboard = [[{"text": label, "callback_data": f"st:{key}"}]
+                for key, (label, _) in STATUS_REPORTS.items()]
+    return Reply("Quale report vuoi?", markup={"inline_keyboard": keyboard})
+
+
+def format_status_report(key):
+    """The report as a Telegram reply. Reports are the only replies formatted
+    with HTML — everything else stays plain text and needs no escaping."""
+    entry = STATUS_REPORTS.get(key)
+    return Reply(entry[1](), parse_mode="HTML") if entry else None
 
 
 def format_forecast():
@@ -800,7 +1116,7 @@ def format_alarms_summary():
     for rule in rules:
         rid = str(rule["id"])
         msg = (rule.get("message") or "").strip()
-        label = msg if msg else f"regola #{rid}"
+        label = _with_icon(rule.get("icon"), msg if msg else f"regola #{rid}")
         descr = rule_describe(rule)
         bot = bots.get(rule.get("bot_id")) if rule.get("bot_id") else None
         if bot:
@@ -837,7 +1153,9 @@ def format_alarms_summary():
 HELP_TEXT = (
     "Stazione Meteo bot\n"
     "Comandi:\n"
-    "/status — valori correnti\n"
+    "/status — scegli il report (temperature / energia / tutto)\n"
+    "/temperature — tutte le temperature e umidità\n"
+    "/energia — produzione e consumi elettrici\n"
     "/forecast — previsione 6am (cielo sereno)\n"
     "/alarms — soglie configurate e allarmi attivi\n"
     "/reboot — riavvia il Raspberry\n"
@@ -880,7 +1198,19 @@ def handle_command(text):
     if cmd in ("/start", "/help"):
         return HELP_TEXT
     if cmd == "/status":
-        return format_status()
+        # Bare /status opens the chooser; an argument (or one of the shortcut
+        # commands below) goes straight to that report.
+        arg = parts[1].lower().lstrip("/") if len(parts) > 1 else ""
+        if not arg:
+            return status_menu()
+        key = STATUS_ALIASES.get(arg)
+        if not key:
+            return "Report sconosciuto. Usa /status temp, /status energia o /status tutto."
+        return format_status_report(key)
+    if cmd == "/temperature":
+        return format_status_report("temp")
+    if cmd == "/energia":
+        return format_status_report("energy")
     if cmd == "/forecast":
         return format_forecast()
     if cmd == "/alarms":
@@ -894,6 +1224,18 @@ def handle_command(text):
             return "Impossibile avviare il riavvio (vedi log del watcher)."
         return None  # confirmation already sent above
     return None  # silently ignore unknown commands
+
+
+def send_reply(reply, chat_id):
+    """Deliver whatever handle_command() returned: a plain string, or a Reply
+    carrying a parse mode and/or the inline keyboard of the /status chooser."""
+    if not reply:
+        return
+    if isinstance(reply, Reply):
+        send_message(reply.text, chat_id=chat_id,
+                     reply_markup=reply.markup, parse_mode=reply.parse_mode)
+    else:
+        send_message(reply, chat_id=chat_id)
 
 
 # ── Telegram long polling ───────────────────────────────────────────────────
@@ -925,6 +1267,25 @@ def telegram_poll_once():
 
     for update in data.get("result", []):
         _offset = update["update_id"] + 1
+
+        # Inline button on the /status chooser.
+        cb = update.get("callback_query")
+        if cb:
+            cb_chat = (cb.get("message") or {}).get("chat", {}).get("id")
+            answer_callback_query(cb.get("id"))
+            if cb_chat != CHAT_ID:
+                log(f"[poll] ignoring callback from chat_id={cb_chat}")
+                continue
+            data_str = cb.get("data") or ""
+            key = data_str[3:] if data_str.startswith("st:") else ""
+            try:
+                reply = format_status_report(key)
+            except Exception as e:
+                log(f"[cmd] callback error: {e}")
+                reply = "Errore interno durante l'esecuzione del comando."
+            send_reply(reply, cb_chat)
+            continue
+
         msg = update.get("message") or update.get("edited_message")
         if not msg:
             continue
@@ -939,8 +1300,7 @@ def telegram_poll_once():
         except Exception as e:
             log(f"[cmd] error: {e}")
             reply = "Errore interno durante l'esecuzione del comando."
-        if reply:
-            send_message(reply, chat_id=chat_id)
+        send_reply(reply, chat_id)
 
 
 # ── Main loop ───────────────────────────────────────────────────────────────

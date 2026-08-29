@@ -7,6 +7,11 @@ define('SENSORS_LIMIT', 50);
 // Paths pinned to match those two so all three processes agree.
 define('ALARMS_DB_PATH', '/var/www/html/alarms.db');
 define('ALARM_STATE_PATH', '/dev/shm/alarm_state.json');
+// Live Shelly snapshot, rewritten by mqtt_receiver.py on EVERY meter message
+// (~2 s) while the energia table stays on its one-minute cadence. The instant
+// cards read this so they follow the meter instead of the history table.
+define('ENERGY_LATEST_PATH', '/dev/shm/energy_latest.json');
+define('ENERGY_LATEST_MAX_AGE', 150);  // seconds; matches mqtt_receiver.py
 
 // ── API mode ─────────────────────────────────────────────────────────────────
 $api = $_GET['api'] ?? '';
@@ -157,6 +162,27 @@ if ($api !== '') {
     return $row;
   }
 
+  /**
+   * Freshest energy reading: the tmpfs snapshot when it is recent, otherwise
+   * the newest `energia` row. The snapshot is up to a minute ahead of the
+   * table — it is rewritten on every Shelly message, not once per stored row.
+   */
+  function energy_live(PDO $db)
+  {
+    $snap = null;
+    if (is_readable(ENERGY_LATEST_PATH)) {
+      $j = json_decode((string) @file_get_contents(ENERGY_LATEST_PATH), true);
+      if (is_array($j) && isset($j['timestamp'])) {
+        $age = time() - (int) strtotime($j['timestamp']);
+        if ($age >= 0 && $age <= ENERGY_LATEST_MAX_AGE) $snap = $j;
+      }
+    }
+    if ($snap !== null) return pv_deadband($snap);
+
+    $rows = db_rows($db, "SELECT * FROM energia ORDER BY id DESC LIMIT 1");
+    return isset($rows[0]) ? pv_deadband($rows[0]) : null;
+  }
+
   try {
     switch ($api) {
       case 'meteo':
@@ -203,8 +229,24 @@ if ($api !== '') {
         break;
 
       case 'energia_latest':
-        $rows = db_rows($db, "SELECT * FROM energia ORDER BY id DESC LIMIT 1");
-        echo json_encode(isset($rows[0]) ? pv_deadband($rows[0]) : (object) []);
+        echo json_encode(energy_live($db) ?? (object) []);
+        break;
+
+      case 'instant':
+        // Everything the live cards need, in one small request: the fast poll
+        // hits this a few times a minute per open tab, so it must stay cheap —
+        // latest rows only, no history, no alarm-rule parsing.
+        $meteo   = db_rows($db, "SELECT * FROM meteo ORDER BY id DESC LIMIT 1");
+        $ufficio = db_rows($db, "SELECT * FROM ufficio ORDER BY id DESC LIMIT 1");
+        $sensors = db_rows($db, "SELECT s.* FROM sensors s JOIN (
+                                   SELECT sensoreId, MAX(id) AS mid FROM sensors GROUP BY sensoreId
+                                 ) t ON s.id = t.mid ORDER BY s.sensoreId");
+        echo json_encode([
+          'meteo'   => $meteo[0] ?? null,
+          'ufficio' => $ufficio[0] ?? null,
+          'energia' => energy_live($db),
+          'sensors' => $sensors,
+        ]);
         break;
 
       case 'sensor_status':
@@ -563,10 +605,6 @@ if ($api !== '') {
 
     .icon-cloud {
       color: #16a34a;
-    }
-
-    .icon-bolt {
-      color: #ea580c;
     }
 
     .icon-server {
@@ -952,22 +990,6 @@ if ($api !== '') {
       </div>
       <canvas id="chart-ombra" height="140"></canvas>
     </div>
-    <div class="group">
-      <h2>
-        <svg class="icon-bolt" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
-          stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
-          <path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z" />
-        </svg>
-        Fotovoltaico
-      </h2>
-      <div class="group-stats">
-        <div class="stat"><span class="label">Potenza</span><span class="value c-orange" id="c-power">—</span><span
-            class="unit">W</span></div>
-        <div class="stat"><span class="label">Picco 24h</span><span class="value c-orange"
-            id="c-power-peak">—</span><span class="unit">W</span></div>
-      </div>
-      <canvas id="chart-power" height="140"></canvas>
-    </div>
     <div class="group" data-compare="energia" title="Clicca per confronto con ieri">
       <h2>
         <svg class="icon-plug" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
@@ -1165,7 +1187,6 @@ if ($api !== '') {
       fullsun: makeTempHumiChart('chart-fullsun', 'rgb(2,132,199)', 'rgb(99,102,241)'),
       serra: makeTempHumiChart('chart-serra', 'rgb(13,148,136)', 'rgb(99,102,241)'),
       ombra: makeTempHumiChart('chart-ombra', 'rgb(22,163,74)', 'rgb(99,102,241)'),
-      power: makeChart('chart-power', [ds('Potenza', 'rgb(234,88,12)', true)]),
       cpu: makeChart('chart-cpu', [ds('CPU', 'rgb(220,38,38)')]),
       energia: makeChart('chart-energia', [
         ds('Produzione FV', 'rgb(249,115,22)', true),
@@ -1226,15 +1247,6 @@ if ($api !== '') {
       return n ? sum / n : null;
     }
 
-    function maxOf(rows, key, filterFn = (v) => v) {
-      let max = null;
-      for (const r of rows) {
-        const v = filterFn(r[key]);
-        if (typeof v === 'number' && (max === null || v > max)) max = v;
-      }
-      return max;
-    }
-
     function setText(id, v, decimals = 0) {
       document.getElementById(id).textContent = (v === null || v === undefined) ? '—' : v.toFixed(decimals);
     }
@@ -1250,6 +1262,32 @@ if ($api !== '') {
       if (v === null || v === undefined || v === '') return null;
       const n = Number(v);
       return Number.isFinite(n) ? n : null;
+    }
+
+    // ── Card renderers ────────────────────────────────────────────────────────────
+    // Split out of the load*() functions so the fast instant poll and the slow
+    // full refresh paint the same values through the same code — only the
+    // charts and the history tables are tied to the slow loop.
+    function renderMeteoCards(latest) {
+      if (!latest) return;
+      latestMeteo = latest;
+      setCard('c-temp', latest.temp);
+      setCard('c-humi', nullIfNegative(latest.humi), 0);
+      // Serra panel = mobile sensor (tMobile/hMobile); Ombra panel = ombra sensor
+      // (tombra/hombra). Element ids are kept as-is, so c-tombra/c-tmobile no
+      // longer match the DB column they show — the panel each lives in is the guide.
+      setCard('c-tombra', latest.tMobile);
+      setCard('c-hombra', nullIfNegative(latest.hMobile), 0);
+      setCard('c-tmobile', latest.tombra);
+      setCard('c-hmobile', nullIfNegative(latest.hombra), 0);
+      setCard('c-cpu', latest.tempCpu);
+
+      const fanEl = document.getElementById('c-fan');
+      fanEl.textContent = latest.fan ? 'ON' : 'OFF';
+      fanEl.className = 'value ' + (latest.fan ? 'c-orange' : 'c-green');
+
+      document.getElementById('last-update').textContent =
+        'Aggiornato: ' + romeFullDateTime(latest.timestamp || new Date().toISOString()) + ' (Roma)';
     }
 
     // ── Fetch & render meteo ──────────────────────────────────────────────────────
@@ -1277,22 +1315,7 @@ if ($api !== '') {
       hideError();
       latestMeteo = latest;
 
-      // Cards
-      setCard('c-temp', latest.temp);
-      setCard('c-humi', nullIfNegative(latest.humi), 0);
-      // Serra panel = mobile sensor (tMobile/hMobile); Ombra panel = ombra sensor
-      // (tombra/hombra). Element ids are kept as-is, so c-tombra/c-tmobile no
-      // longer match the DB column they show — the panel each lives in is the guide.
-      setCard('c-tombra', latest.tMobile);
-      setCard('c-hombra', nullIfNegative(latest.hMobile), 0);
-      setCard('c-tmobile', latest.tombra);
-      setCard('c-hmobile', nullIfNegative(latest.hombra), 0);
-      setCard('c-power', latest.power, 0);
-      setCard('c-cpu', latest.tempCpu);
-
-      const fanEl = document.getElementById('c-fan');
-      fanEl.textContent = latest.fan ? 'ON' : 'OFF';
-      fanEl.className = 'value ' + (latest.fan ? 'c-orange' : 'c-green');
+      renderMeteoCards(latest);
 
       // Charts
       const labels = rows.map(r => r.timestamp ? (romeHHMM(r.timestamp) ?? '') : '');
@@ -1308,19 +1331,25 @@ if ($api !== '') {
         rows.map(r => nullIfSentinel(r.tombra)),
         rows.map(r => nullIfNegative(r.hombra)),
       );
-      updateChartData(charts.power, labels, rows.map(r => r.power));
       updateChartData(charts.cpu, labels, rows.map(r => r.tempCpu));
 
       // 24h humidity averages (rows already cover the last ~24h at 1 sample/min)
       setText('c-humi-avg',    meanOf(rows, 'humi',    nullIfNegative));
       setText('c-hombra-avg',  meanOf(rows, 'hMobile', nullIfNegative));  // Serra = mobile
       setText('c-hmobile-avg', meanOf(rows, 'hombra',  nullIfNegative));  // Ombra = ombra
+    }
 
-      // 24h peak photovoltaic power
-      setText('c-power-peak', maxOf(rows, 'power'));
+    function renderUfficioCards(latest) {
+      if (!latest) return;
+      latestUfficio = latest;
+      setCard('c-uff-temp', latest.temp);
+      setCard('c-uff-hum', nullIfNegative(latest.hum), 0);
+      setCard('c-uff-sp', latest.setpoint);
 
-      document.getElementById('last-update').textContent =
-        'Aggiornato: ' + romeFullDateTime(latest.timestamp || new Date().toISOString()) + ' (Roma)';
+      const heaterEl = document.getElementById('c-uff-heater');
+      const on = (latest.heater || '').toUpperCase() === 'ON';
+      heaterEl.textContent = latest.heater ? (on ? 'ON' : 'OFF') : '—';
+      heaterEl.className = 'value ' + (on ? 'c-red' : 'c-green');
     }
 
     // ── Fetch & render office (ufficio) board ─────────────────────────────────────
@@ -1334,16 +1363,7 @@ if ($api !== '') {
       const rows = await histRes.json();
       const latest = await latestRes.json();
       if (!Array.isArray(rows) || rows.error) return;
-      latestUfficio = latest;
-
-      setCard('c-uff-temp', latest.temp);
-      setCard('c-uff-hum', nullIfNegative(latest.hum), 0);
-      setCard('c-uff-sp', latest.setpoint);
-
-      const heaterEl = document.getElementById('c-uff-heater');
-      const on = (latest.heater || '').toUpperCase() === 'ON';
-      heaterEl.textContent = latest.heater ? (on ? 'ON' : 'OFF') : '—';
-      heaterEl.className = 'value ' + (on ? 'c-red' : 'c-green');
+      renderUfficioCards(latest);
 
       const labels = rows.map(r => r.timestamp ? (romeHHMM(r.timestamp) ?? '') : '');
       updateChartData(charts.ufficio, labels,
@@ -1352,25 +1372,14 @@ if ($api !== '') {
       );
     }
 
-    // ── Fetch & render energy meter (Shelly Pro EM-50) ────────────────────────────
-    // grid_power is signed: > 0 while importing from the grid, < 0 while the PV
-    // surplus is being exported, so no negative-value filter is applied here.
-    async function loadEnergia() {
-      const [histRes, latestRes] = await Promise.all([
-        fetch('?api=energia&limit=1440'),
-        fetch('?api=energia_latest'),
-      ]);
-      if (!histRes.ok || !latestRes.ok) return;
+    // Below 10 W there is no real production (clamp/inverter noise) -> 0 W.
+    // mqtt_receiver.py stores it that way; this also covers rows logged before
+    // that rule existed, and the live snapshot the instant poll reads.
+    const pvZero = (v) => (v !== null && Math.abs(v) < 10) ? 0 : v;
 
-      const rows = await histRes.json();
-      const latest = await latestRes.json();
-      if (!Array.isArray(rows) || rows.error) return;
+    function renderEnergiaCards(latest) {
+      if (!latest) return;
       latestEnergia = latest;
-
-      // Below 10 W there is no real production (clamp/inverter noise) -> 0 W.
-      // mqtt_receiver.py stores it that way; this also covers rows logged
-      // before that rule existed.
-      const pvZero = (v) => (v !== null && Math.abs(v) < 10) ? 0 : v;
 
       const pv = pvZero(num(latest.pv_power));
       const grid = num(latest.grid_power);
@@ -1405,6 +1414,22 @@ if ($api !== '') {
         ? Math.min(100, (pv / casa) * 100)
         : null;
       setText('c-selfuse', selfUse);
+    }
+
+    // ── Fetch & render energy meter (Shelly Pro EM-50) ────────────────────────────
+    // grid_power is signed: > 0 while importing from the grid, < 0 while the PV
+    // surplus is being exported, so no negative-value filter is applied here.
+    async function loadEnergia() {
+      const [histRes, latestRes] = await Promise.all([
+        fetch('?api=energia&limit=1440'),
+        fetch('?api=energia_latest'),
+      ]);
+      if (!histRes.ok || !latestRes.ok) return;
+
+      const rows = await histRes.json();
+      const latest = await latestRes.json();
+      if (!Array.isArray(rows) || rows.error) return;
+      renderEnergiaCards(latest);
 
       const labels = rows.map(r => r.timestamp ? (romeHHMM(r.timestamp) ?? '') : '');
       updateChartData(charts.energia, labels,
@@ -1442,9 +1467,8 @@ if ($api !== '') {
     }
 
     // ── Fetch & render sensors ────────────────────────────────────────────────────
-    async function loadSensors() {
-      const res = await fetch('?api=sensors_latest');
-      const rows = await res.json();
+    function renderSensorsTable(rows) {
+      if (!Array.isArray(rows)) return;
       const tbody = document.querySelector('#sensors-table tbody');
 
       if (!rows.length) {
@@ -1465,6 +1489,11 @@ if ($api !== '') {
       <td>${r.timestamp ?? '—'}</td>
     </tr>`;
       }).join('');
+    }
+
+    async function loadSensors() {
+      const res = await fetch('?api=sensors_latest');
+      renderSensorsTable(await res.json());
     }
 
     // ── Fetch & render triggered alarms ───────────────────────────────────────────
@@ -1539,6 +1568,10 @@ if ($api !== '') {
       // signed: these are watt readings that may legitimately sit below -99
       // (grid export), so they bypass the "<= -99 means dead sensor" formatter.
       { label: 'Energia — Produzione FV', src: 'energia', key: 'pv_power',   unit: 'W', dec: 0, filter: (v) => v, signed: true },
+      // The meter reading before the 10 W deadband: it differs from Produzione FV
+      // only in the noise band, where it shows what the clamp actually sees
+      // instead of the clean 0. Blank for rows logged before pv_power_raw existed.
+      { label: 'Energia — Produzione reale', src: 'energia', key: 'pv_power_raw', unit: 'W', dec: 0, filter: (v) => v, signed: true },
       { label: 'Energia — Scambio Rete',  src: 'energia', key: 'grid_power', unit: 'W', dec: 0, filter: (v) => v, signed: true },
       { label: 'Energia — Consumo Casa',  src: 'energia', key: 'casa_power', unit: 'W', dec: 0, filter: (v) => v, signed: true },
     ];
@@ -1615,7 +1648,33 @@ if ($api !== '') {
     }
     function hideError() { document.getElementById('db-error').style.display = 'none'; }
 
-    // ── Refresh loop ──────────────────────────────────────────────────────────────
+    // ── Refresh loops ─────────────────────────────────────────────────────────────
+    // Two cadences. The instant one polls a single small endpoint every few
+    // seconds and repaints only the live cards — for the Shelly that is the
+    // tmpfs snapshot mqtt_receiver.py rewrites on every meter message, so a
+    // card follows the payload instead of waiting for the next `energia` row
+    // (up to a minute) and the next full refresh (up to another 30 s). The slow
+    // one keeps doing the expensive work: 1440-point histories, charts, the
+    // yesterday table and the alarm panel.
+    const INSTANT_INTERVAL = 3_000;
+    const FULL_INTERVAL = 30_000;
+
+    async function refreshInstant() {
+      let data;
+      try {
+        const res = await fetch('?api=instant');
+        if (!res.ok) return;
+        data = await res.json();
+      } catch (e) {
+        return;   // transient failure: leave the last painted values alone
+      }
+      if (!data || data.error) return;
+      renderMeteoCards(data.meteo);
+      renderUfficioCards(data.ufficio);
+      renderEnergiaCards(data.energia);
+      renderSensorsTable(data.sensors);
+    }
+
     async function refresh() {
       try {
         await Promise.all([loadMeteo(), loadSensors(), loadUfficio(), loadEnergia(), loadSensorIds(), loadAlarms()]);
@@ -1625,7 +1684,13 @@ if ($api !== '') {
     }
 
     refresh();
-    setInterval(refresh, 30_000);
+    setInterval(refresh, FULL_INTERVAL);
+
+    // A hidden tab paints nothing, so polling it only costs the Pi requests.
+    // Coming back to the tab refreshes at once rather than waiting out the timer.
+    setInterval(() => { if (!document.hidden) refreshInstant(); }, INSTANT_INTERVAL);
+    document.addEventListener('visibilitychange', () => { if (!document.hidden) refreshInstant(); });
+    refreshInstant();
 
     // ── Comparison modal (today vs yesterday) ───────────────────────────────────
     // Each entry drives the two stacked charts in the modal: `api` is the history

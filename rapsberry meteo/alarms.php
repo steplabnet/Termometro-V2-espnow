@@ -24,6 +24,17 @@ $SOURCES = [
   'uff_hum'      => ['label' => 'Ufficio — Umidità',     'unit' => '%'],
   'uff_pres'     => ['label' => 'Ufficio — Pressione',   'unit' => 'hPa'],
   'uff_setpoint' => ['label' => 'Ufficio — Setpoint',    'unit' => '°C'],
+  // Shelly Pro EM-50 (centralino/status/em1:* → energia table). Merged into
+  // the evaluated reading by alarm_watcher.py.
+  // "Produzione reale" is the value as the Shelly reports it, senza la soglia
+  // di 10 W che azzera il rumore: una regola "Produzione reale = 0" scatta solo
+  // quando il contatore legge davvero zero (inverter fermo), non quando la
+  // produzione è solo bassa. Abbinala a una finestra oraria per non ricevere
+  // l'allarme di notte.
+  'pv_raw'     => ['label' => 'Shelly — Produzione reale', 'unit' => 'W'],
+  'pv_power'   => ['label' => 'Shelly — Produzione',       'unit' => 'W'],
+  'grid_power' => ['label' => 'Shelly — Scambio rete',     'unit' => 'W'],
+  'casa_power' => ['label' => 'Shelly — Consumo casa',     'unit' => 'W'],
   // Virtual sources — computed in alarm_watcher.py (clear-sky cooling model,
   // floored at the dew point). Useful for frost-warning rules combined with
   // a Pianificazione condition (e.g. fire at 23:00 if forecast 6am < 2°C).
@@ -33,6 +44,12 @@ $SOURCES = [
 ];
 
 $OPS = ['>', '<', '='];
+
+// Optional icon prepended to the Telegram message of a rule. The empty string
+// means "no icon". Only values from this list are accepted on save, so the
+// stored text can never be arbitrary user input.
+$ICONS = ['', '🔔', '⚠️', '🚨', '🔥', '❄️', '🌡️', '💧', '☀️', '🌧️', '💨', '⚡',
+          '🔌', '🔋', '🏠', '🖥️', '🌀', '⏰', '📈', '📉', '✅', '❌', 'ℹ️'];
 
 // Special source for a "Non trasmette" condition: matches ANY physical meteo.py
 // sensor. Must match STALE_ANY in alarm_watcher.py.
@@ -70,10 +87,13 @@ function ensure_schema() {
   }
 
   $db->exec("CREATE TABLE IF NOT EXISTS rules (
-    id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    enabled INTEGER NOT NULL DEFAULT 1,
-    message TEXT    NOT NULL DEFAULT '',
-    bot_id  INTEGER
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    enabled         INTEGER NOT NULL DEFAULT 1,
+    message         TEXT    NOT NULL DEFAULT '',
+    icon            TEXT    NOT NULL DEFAULT '',
+    restore_icon    TEXT    NOT NULL DEFAULT '',
+    restore_message TEXT    NOT NULL DEFAULT '',
+    bot_id          INTEGER
   )");
   // Telegram bots that can be associated to a rule. A rule with bot_id = NULL
   // uses the default bot from zbot.py (BOT_TOKEN / CHAT_ID). Managed by bots.php.
@@ -117,6 +137,16 @@ function ensure_schema() {
   while ($r = $res->fetchArray(SQLITE3_ASSOC)) $rCols[$r['name']] = true;
   if ($rCols && !isset($rCols['bot_id'])) {
     $db->exec('ALTER TABLE rules ADD COLUMN bot_id INTEGER');
+  }
+  // Optional message icon and "rientro" (alarm cleared) message, added later.
+  if ($rCols && !isset($rCols['icon'])) {
+    $db->exec("ALTER TABLE rules ADD COLUMN icon TEXT NOT NULL DEFAULT ''");
+  }
+  if ($rCols && !isset($rCols['restore_icon'])) {
+    $db->exec("ALTER TABLE rules ADD COLUMN restore_icon TEXT NOT NULL DEFAULT ''");
+  }
+  if ($rCols && !isset($rCols['restore_message'])) {
+    $db->exec("ALTER TABLE rules ADD COLUMN restore_message TEXT NOT NULL DEFAULT ''");
   }
 
   return $db;
@@ -171,6 +201,53 @@ function send_telegram_test($text) {
   return [false, 'Telegram ha rifiutato il messaggio: ' . $desc];
 }
 
+// ── Rule state reset ────────────────────────────────────────────────────────
+/**
+ * Drop one rule's entry from the watcher's state file, so an edge-triggered
+ * rule rearms (and a scheduled one can fire again today) without waiting for
+ * the condition to clear on its own.
+ *
+ * The file is rewritten IN PLACE, never replaced: it lives in /dev/shm (sticky
+ * bit) and belongs to the user running alarm_watcher.py, so www-data may write
+ * its contents but cannot rename or unlink it. alarm_watcher.py chmods it 666
+ * on every save for exactly this. The watcher re-reads the file at the top of
+ * each check, so the reset takes effect on its next cycle.
+ */
+function reset_rule_state($rule_id) {
+  $key = (string)(int)$rule_id;
+  if (!file_exists(ALARM_STATE_FILE)) {
+    return [true, "Nessuno stato memorizzato: la regola #{$key} può già scattare."];
+  }
+  $fh = @fopen(ALARM_STATE_FILE, 'r+');
+  if (!$fh) {
+    return [false, 'Impossibile aprire ' . ALARM_STATE_FILE
+                 . ' in scrittura. Riavvia meteo-alarms.service (il watcher imposta i permessi al primo salvataggio).'];
+  }
+  try {
+    flock($fh, LOCK_EX);
+    $raw  = stream_get_contents($fh);
+    $data = json_decode($raw, true);
+    if (!is_array($data)) $data = [];
+    if (!array_key_exists($key, $data)) {
+      return [true, "La regola #{$key} non risulta scattata: nulla da azzerare."];
+    }
+    unset($data[$key]);
+    // FORCE_OBJECT: an emptied state must stay a JSON object, or the watcher's
+    // load_state() sees a list, rejects it and logs nothing useful.
+    $json = json_encode($data, JSON_FORCE_OBJECT);
+    rewind($fh);
+    ftruncate($fh, 0);
+    if (fwrite($fh, $json) === false) {
+      return [false, "Errore scrittura di " . ALARM_STATE_FILE . '.'];
+    }
+    fflush($fh);
+    return [true, "Stato della regola #{$key} azzerato: può scattare di nuovo."];
+  } finally {
+    flock($fh, LOCK_UN);
+    fclose($fh);
+  }
+}
+
 $message = '';
 $messageType = '';
 
@@ -178,7 +255,18 @@ $messageType = '';
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   $action = $_POST['action'] ?? '';
 
-  if ($action === 'test_bot') {
+  if ($action === 'reset_rule') {
+    $rid = $_POST['reset_id'] ?? '';
+    if (!is_numeric($rid)) {
+      $message = 'Regola non valida.';
+      $messageType = 'err';
+    } else {
+      list($ok, $info) = reset_rule_state($rid);
+      $message = $info;
+      $messageType = $ok ? 'ok' : 'err';
+    }
+
+  } elseif ($action === 'test_bot') {
     $text = trim($_POST['test_msg'] ?? '');
     if ($text === '') $text = 'Test message from alarms.php';
     list($ok, $info) = send_telegram_test($text);
@@ -195,7 +283,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       $db->exec('DELETE FROM rules');
 
       $valid_bot_ids = array_keys(load_bots($db));
-      $insRule = $db->prepare('INSERT INTO rules (enabled, message, bot_id) VALUES (:e, :m, :b)');
+      $insRule = $db->prepare(
+        'INSERT INTO rules (enabled, message, icon, restore_icon, restore_message, bot_id)
+         VALUES (:e, :m, :i, :ri, :rm, :b)'
+      );
       $insCond = $db->prepare(
         'INSERT INTO conditions (rule_id, kind, source, source2, op, value, time_from, time_to, schedule_at, days_mask)
          VALUES (:rid, :k, :s, :s2, :o, :v, :tf, :tt, :sa, :dm)'
@@ -204,6 +295,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       foreach ($rows as $r) {
         $rule_enabled = !empty($r['enabled']) ? 1 : 0;
         $rule_message = trim($r['message'] ?? '');
+        $rule_icon    = in_array(($r['icon'] ?? ''), $GLOBALS['ICONS'], true) ? ($r['icon'] ?? '') : '';
+        $rule_ricon   = in_array(($r['restore_icon'] ?? ''), $GLOBALS['ICONS'], true) ? ($r['restore_icon'] ?? '') : '';
+        $rule_rmsg    = trim($r['restore_message'] ?? '');
         $rule_bot     = $r['bot_id'] ?? '';
         $rule_bot     = (is_numeric($rule_bot) && in_array((int)$rule_bot, $valid_bot_ids, true)) ? (int)$rule_bot : null;
         $conds = $r['cond'] ?? [];
@@ -264,6 +358,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $insRule->clear();
         $insRule->bindValue(':e', $rule_enabled, SQLITE3_INTEGER);
         $insRule->bindValue(':m', $rule_message, SQLITE3_TEXT);
+        $insRule->bindValue(':i',  $rule_icon,  SQLITE3_TEXT);
+        $insRule->bindValue(':ri', $rule_ricon, SQLITE3_TEXT);
+        $insRule->bindValue(':rm', $rule_rmsg,  SQLITE3_TEXT);
         $insRule->bindValue(':b', $rule_bot, $rule_bot === null ? SQLITE3_NULL : SQLITE3_INTEGER);
         $insRule->execute();
         $rid = $db->lastInsertRowID();
@@ -323,7 +420,7 @@ try {
   $db = ensure_schema();
   $BOTS = load_bots($db);
   $byId = [];
-  $rRes = $db->query('SELECT id, enabled, message, bot_id FROM rules ORDER BY id');
+  $rRes = $db->query('SELECT id, enabled, message, icon, restore_icon, restore_message, bot_id FROM rules ORDER BY id');
   while ($r = $rRes->fetchArray(SQLITE3_ASSOC)) {
     $r['conds'] = [];
     $byId[$r['id']] = $r;
@@ -516,16 +613,36 @@ function schedule_cond_html($i, $j, $c = null) {
   return ob_get_clean();
 }
 
+// Optional emoji picker. An empty value means "no icon".
+function icon_select_html($name, $selected, $title) {
+  ob_start(); ?>
+  <select name="<?= $name ?>" class="rule-icon" title="<?= htmlspecialchars($title) ?>">
+    <?php foreach ($GLOBALS['ICONS'] as $ic): ?>
+      <option value="<?= htmlspecialchars($ic) ?>" <?= $ic === $selected ? 'selected' : '' ?>>
+        <?= $ic === '' ? '–' : htmlspecialchars($ic) ?>
+      </option>
+    <?php endforeach; ?>
+  </select>
+  <?php
+  return ob_get_clean();
+}
+
 function rule_card_html($SOURCES, $OPS, $BOTS, $i, $r = null, $active = false) {
   $enabled = $r ? !empty($r['enabled']) : true;
   $message = $r['message'] ?? '';
+  $icon    = $r['icon']    ?? '';
+  $ricon   = $r['restore_icon']    ?? '';
+  $rmsg    = $r['restore_message'] ?? '';
   $conds   = $r['conds']   ?? [];
+  // Only a saved rule has a state entry to reset; the JS clone template has no id.
+  $rid     = (is_array($r) && isset($r['id'])) ? (int)$r['id'] : null;
   $sel_bot = (is_array($r) && isset($r['bot_id']) && $r['bot_id'] !== null) ? (int)$r['bot_id'] : null;
   $cls     = 'rule-card' . ($active ? ' active' : '');
   ob_start(); ?>
   <div class="<?= $cls ?>" data-rule-idx="<?= htmlspecialchars((string)$i) ?>" data-cond-next="<?= count($conds) ?>">
     <div class="rule-head">
       <input type="checkbox" name="rule[<?= $i ?>][enabled]" value="1" <?= $enabled ? 'checked' : '' ?> title="Attiva la regola">
+      <?= icon_select_html("rule[$i][icon]", $icon, 'Icona del messaggio di allarme (opzionale)') ?>
       <input type="text" name="rule[<?= $i ?>][message]" value="<?= htmlspecialchars($message) ?>"
         placeholder="Messaggio Telegram (opzionale)">
       <select name="rule[<?= $i ?>][bot_id]" class="rule-bot" title="Bot Telegram di destinazione">
@@ -536,7 +653,20 @@ function rule_card_html($SOURCES, $OPS, $BOTS, $i, $r = null, $active = false) {
           </option>
         <?php endforeach; ?>
       </select>
+      <?php if ($rid !== null): ?>
+        <!-- Submits the small #reset-form below, not this one: the rules are
+             left exactly as they are on screen, only the fired state is cleared. -->
+        <button type="submit" form="reset-form" name="reset_id" value="<?= $rid ?>"
+          class="btn-reset" title="Azzera lo scatto: la regola torna a essere verificata">&#8635;</button>
+      <?php endif; ?>
       <button type="button" class="btn-remove-rule" title="Rimuovi regola">&times;</button>
+    </div>
+
+    <div class="rule-restore">
+      <span class="restore-label" title="Inviato quando la condizione rientra">Rientro</span>
+      <?= icon_select_html("rule[$i][restore_icon]", $ricon, 'Icona del messaggio di rientro (opzionale)') ?>
+      <input type="text" name="rule[<?= $i ?>][restore_message]" value="<?= htmlspecialchars($rmsg) ?>"
+        placeholder="Messaggio di rientro (opzionale — lascia vuoto per non inviarlo)">
     </div>
 
     <table class="cond-table">
@@ -649,6 +779,22 @@ $tpl_cond_schedule  = schedule_cond_html('__I__', '__J__');
 
     .rule-head input[type="text"] { flex: 1; }
     .rule-head .rule-bot { width: auto; flex: 0 0 auto; max-width: 12rem; }
+    .rule-icon { width: auto; flex: 0 0 auto; font-size: 1rem; padding: .3rem .2rem; }
+
+    .rule-restore {
+      display: flex;
+      align-items: center;
+      gap: .65rem;
+      margin: 0 0 .6rem;
+    }
+
+    .rule-restore input[type="text"] { flex: 1; }
+
+    .restore-label {
+      font-size: .8rem;
+      color: #64748b;
+      flex: 0 0 auto;
+    }
 
     .cond-table { width: 100%; border-collapse: collapse; }
     .cond-table td {
@@ -794,6 +940,21 @@ $tpl_cond_schedule  = schedule_cond_html('__I__', '__J__');
     }
     .btn-remove:hover, .btn-remove-rule:hover { background: #fee2e2; }
 
+    /* Rearm: same footprint as the remove button, but never red — it undoes a
+       trigger, it doesn't delete anything. */
+    .btn-reset {
+      background: transparent;
+      color: #0369a1;
+      border: 1px solid #bae6fd;
+      border-radius: .35rem;
+      padding: 0;
+      width: 1.8rem; height: 1.8rem;
+      font-size: 1rem; line-height: 1;
+      cursor: pointer;
+    }
+
+    .btn-reset:hover { background: #e0f2fe; }
+
     .actions {
       display: flex;
       justify-content: flex-end;
@@ -901,6 +1062,10 @@ $tpl_cond_schedule  = schedule_cond_html('__I__', '__J__');
       <span id="dirty-flag" class="dirty-flag" hidden>● Modifiche non salvate</span>
       <button type="submit">Salva regole</button>
     </div>
+  </form>
+
+  <form id="reset-form" method="post">
+    <input type="hidden" name="action" value="reset_rule">
   </form>
 
   <form method="post" class="panel">

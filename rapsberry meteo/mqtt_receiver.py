@@ -80,6 +80,7 @@ def init_db():
             id           INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp    TEXT,
             pv_power     REAL,
+            pv_power_raw REAL,
             grid_power   REAL,
             casa_power   REAL,
             pv_voltage   REAL,
@@ -91,6 +92,11 @@ def init_db():
             freq         REAL
         )
     """)
+    # pv_power_raw was added after the first deploys; older DB files (and the
+    # copy meteo.py may have created) lack it.
+    cols = {r[1] for r in con.execute("PRAGMA table_info(energia)")}
+    if "pv_power_raw" not in cols:
+        con.execute("ALTER TABLE energia ADD COLUMN pv_power_raw REAL")
     con.commit()
     con.close()
 
@@ -135,11 +141,11 @@ def db_store_energy(row):
         con = sqlite3.connect(DB_PATH)
         con.execute("""
             INSERT INTO energia (
-                timestamp, pv_power, grid_power, casa_power,
+                timestamp, pv_power, pv_power_raw, grid_power, casa_power,
                 pv_voltage, pv_current, pv_pf,
                 grid_voltage, grid_current, grid_pf, freq
             ) VALUES (
-                :timestamp, :pv_power, :grid_power, :casa_power,
+                :timestamp, :pv_power, :pv_power_raw, :grid_power, :casa_power,
                 :pv_voltage, :pv_current, :pv_pf,
                 :grid_voltage, :grid_current, :grid_pf, :freq
             )
@@ -170,6 +176,10 @@ def merge_energy(mono):
         return None
 
     pv_power = pv.get("act_power")
+    # Kept unclamped so the alarm rules can tell "no production at all" (the
+    # inverter is down: the meter really reads 0) from the noise band that the
+    # deadband below flattens to 0 anyway.
+    pv_power_raw = pv_power
     # Below the threshold the inverter is not really producing (clamp leakage,
     # standby draw); record a clean 0 W so the series and the derived house
     # load do not carry that noise.
@@ -187,6 +197,7 @@ def merge_energy(mono):
     return {
         "timestamp":    now(),
         "pv_power":     pv_power,
+        "pv_power_raw": pv_power_raw,
         "grid_power":   grid_power,
         "casa_power":   casa_power,
         "pv_voltage":   pv.get("voltage"),

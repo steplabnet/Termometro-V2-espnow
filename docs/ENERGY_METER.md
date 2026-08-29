@@ -54,6 +54,31 @@ logged before it existed are cleaned on the way out:
 The grid channel is **not** clamped: small import/export values around zero are
 real and the sign matters.
 
+The unclamped reading is kept too: `mqtt_receiver.py` writes it to the
+`pv_power_raw` column of `energia` (and to the tmpfs snapshot) alongside the
+clamped `pv_power`. Nothing displays it — it exists so an alarm rule can tell
+"the meter really reads nothing" (inverter down) from "production is just low",
+which the deadband makes indistinguishable everywhere else.
+
+### Alarm on zero production
+
+`alarm_watcher.py` merges the latest `energia` row into the reading it
+evaluates, under four sources selectable in **alarms.php**:
+
+| Source | Column | Note |
+|--------|--------|------|
+| Shelly — Produzione reale (`pv_raw`) | `pv_power_raw` | unclamped |
+| Shelly — Produzione (`pv_power`) | `pv_power` | deadbanded |
+| Shelly — Scambio rete (`grid_power`) | `grid_power` | signed |
+| Shelly — Consumo casa (`casa_power`) | `casa_power` | derived |
+
+So the alarm is an ordinary rule with the usual custom Telegram message and bot:
+a value condition **Produzione reale = 0**, normally plus a time window so it
+stays quiet at night. Readings older than `ENERGY_STALE_S` (10 min) count as
+missing rather than as zero, so a stopped receiver or a dead meter does not
+masquerade as a stopped inverter — use a "Non trasmette" condition on one of
+these sources for that case instead.
+
 ---
 
 ## Data flow
