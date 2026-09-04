@@ -64,6 +64,16 @@ $fields = [
   'temp', 'humi', 'wind', 'rain', 'pres', 'chip', 'gust',
   'tombra', 'hombra', 'tMobile', 'tempCpu', 'fan', 'power',
   'pvPower', 'gridPower',
+  // Marstek Venus E: power (+ charging), state of charge, hottest cell, and
+  // the moment the battery itself was read -- battTs is what lets the
+  // dashboard tell a live reading from one left behind by a bridge that
+  // stopped.
+  'battPower', 'battSoc', 'battTemp', 'battTs',
+  // Diagnostics: every temperature, voltage and current the pack reports.
+  // Live row only -- see BATTERY_LIVE_FIELDS in store_lib.php.
+  'battTempMin', 'battTempInt', 'battTempMos1', 'battTempMos2',
+  'battVolt', 'battCurr', 'battCellVMax', 'battCellVMin',
+  'battAcV', 'battAcHz', 'battAcW',
 ];
 $reading = [];
 foreach ($fields as $f) {

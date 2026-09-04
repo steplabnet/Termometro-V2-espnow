@@ -79,10 +79,13 @@ energy_lock = threading.Lock()
 BATTERY_WRITE_INTERVAL = 60          # seconds between batteria rows
 BATTERY_LATEST_PATH = "/dev/shm/battery_latest.json"
 # Sign convention stored and displayed: battery_power > 0 charging, < 0
-# discharging. Set to -1 if the source publishes it the other way round — the
-# Venus E does: measured on 2026-09-03, ongrid_power sat at -1850 W while the
-# residual capacity and the grid-input counter both climbed.
-BATTERY_POWER_SIGN = -1
+# discharging. Set to -1 if the source publishes it the other way round.
+# It was -1 while the source was the Marstek local API, whose ongrid_power is
+# the AC side and reads negative while charging. Since 2026-09-04 the source is
+# the pack's own figure over Modbus (register 30001), which reads POSITIVE while
+# charging: measured +786 W with state=Charge, 53.96 V x 13.8 A = 745 W DC.
+# So: no flip. Do not change this without re-measuring with --check.
+BATTERY_POWER_SIGN = 1
 
 # Source field name -> canonical column. Every alias a bridge might publish is
 # listed here so the mapping lives in one place; unknown keys are ignored.
@@ -128,6 +131,19 @@ BATTERY_ALIASES = {
         "discharge_total", "total_discharging_energy", "total_discharge_energy",
         "discharge_energy", "energy_discharged",
     ),
+    # The two MOS sensors, kept apart from `temperature` (the internal
+    # reading) so a cooling problem is visible as a divergence between them.
+    "temp_mos1": ("temp_mos1", "internal_mos1_temperature", "mos1_temp"),
+    "temp_mos2": ("temp_mos2", "internal_mos2_temperature", "mos2_temp"),
+    # Cell voltage extremes: their spread is the pack-balance indicator.
+    "cell_voltage_max": (
+        "cell_voltage_max", "max_cell_voltage", "cell_volt_max",
+    ),
+    "cell_voltage_min": (
+        "cell_voltage_min", "min_cell_voltage", "cell_volt_min",
+    ),
+    "ac_voltage": ("ac_voltage", "grid_voltage", "voltage_ac"),
+    "ac_frequency": ("ac_frequency", "freq", "frequency", "grid_frequency"),
     "mode": ("mode", "work_mode", "workmode", "working_mode"),
     "state": ("state", "status", "device_state", "work_state", "battery_state"),
 }
@@ -135,6 +151,8 @@ BATTERY_ALIASES = {
 BATTERY_NUMERIC = {
     "soc", "battery_power", "ac_power", "battery_voltage", "battery_current",
     "temperature", "cell_temp_max", "cell_temp_min",
+    "temp_mos1", "temp_mos2", "cell_voltage_max", "cell_voltage_min",
+    "ac_voltage", "ac_frequency",
     "charge_total", "discharge_total",
 }
 
@@ -211,6 +229,12 @@ def init_db():
             temperature     REAL,
             cell_temp_max   REAL,
             cell_temp_min   REAL,
+            temp_mos1       REAL,
+            temp_mos2       REAL,
+            cell_voltage_max REAL,
+            cell_voltage_min REAL,
+            ac_voltage      REAL,
+            ac_frequency    REAL,
             charge_total    REAL,
             discharge_total REAL,
             mode            TEXT,
@@ -219,10 +243,14 @@ def init_db():
             casa_power      REAL
         )
     """)
-    # Cell temperatures were added after the battery page first shipped; a
-    # meteo.db created before that has the table without them.
+    # Columns added after the battery page first shipped; a meteo.db created
+    # before them has the table without them. The cell temperatures came with
+    # the first version, the rest when the bridge moved to Modbus and could
+    # finally read the pack in detail.
     bcols = {r[1] for r in con.execute("PRAGMA table_info(batteria)")}
-    for col in ("cell_temp_max", "cell_temp_min"):
+    for col in ("cell_temp_max", "cell_temp_min", "temp_mos1", "temp_mos2",
+                "cell_voltage_max", "cell_voltage_min", "ac_voltage",
+                "ac_frequency"):
         if col not in bcols:
             con.execute(f"ALTER TABLE batteria ADD COLUMN {col} REAL")
     con.commit()
@@ -451,13 +479,15 @@ def db_store_battery(row):
             INSERT INTO batteria (
                 timestamp, soc, battery_power, ac_power,
                 battery_voltage, battery_current, temperature,
-                cell_temp_max, cell_temp_min,
+                cell_temp_max, cell_temp_min, temp_mos1, temp_mos2,
+                cell_voltage_max, cell_voltage_min, ac_voltage, ac_frequency,
                 charge_total, discharge_total, mode, state,
                 pv_power, casa_power
             ) VALUES (
                 :timestamp, :soc, :battery_power, :ac_power,
                 :battery_voltage, :battery_current, :temperature,
-                :cell_temp_max, :cell_temp_min,
+                :cell_temp_max, :cell_temp_min, :temp_mos1, :temp_mos2,
+                :cell_voltage_max, :cell_voltage_min, :ac_voltage, :ac_frequency,
                 :charge_total, :discharge_total, :mode, :state,
                 :pv_power, :casa_power
             )

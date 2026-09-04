@@ -4,9 +4,9 @@ Local dashboard for the home battery, built on the same chain as the Shelly
 energy meter: MQTT → `mqtt_receiver.py` → SQLite `/dev/shm/meteo.db` → PHP page
 on the Pi.
 
-Status: **live since 2026-09-03.** A VenusE 3.0 at `192.168.1.217`, on wifi,
-read through its local API by `battery_bridge.py` (`meteo-battery.service` on
-the Pi) and stored one row a minute.
+Status: **live since 2026-09-03**, on Modbus TCP since **2026-09-04.** A
+VenusE 3.0 cabled to the LAN at `192.168.1.153`, read by `battery_bridge.py`
+(`meteo-battery.service` on the Pi) and stored one row a minute.
 
 ---
 
@@ -65,84 +65,60 @@ The Venus has no user-configurable MQTT client (its built-in one talks to the
 Marstek cloud), so a bridge on the Pi polls it and republishes on the house
 broker:
 
-It has two transports, picked with `TRANSPORT` at the top of the file, because
-which one is available depends on how the battery is cabled:
+Modbus TCP is the only transport. It is served on the battery's **wired LAN
+port only** — port 502 does not answer over its wifi at all — and needs
+firmware **V144 or newer** (V146+ also fixes app connectivity).
 
-| `TRANSPORT` | | |
-|---|---|---|
-| `"modbus"` | Transport | Modbus TCP, **wired LAN port only** — not over the battery's wifi |
-| | Firmware | **V144 or newer** (V146+ also fixes app connectivity) |
-| | Port / unit id | 502 / 1 (2, 3… for further units) |
-| | Dependency | `pymodbus` — **not installed on the Pi yet** |
-| `"udp"` | Transport | Marstek **local API**, JSON over UDP — works over the battery's **wifi**; the one in use here |
-| | Firmware | the switch is what matters, not the version: it works on **V144** with "Local API" turned on in the Marstek app |
-| | Port | 30000 (`UDP_PORT`, must match the port the app shows) |
-| | Dependency | none — plain sockets |
+| | |
+|---|---|
+| Transport | Modbus TCP, wired LAN port only |
+| Address | `192.168.1.153` (`BATTERY_HOST`) — the **wired** interface, port 502 |
+| Unit id | 1 (`BATTERY_UNIT`; 2, 3… for further units) |
+| Firmware | V144 or newer |
+| Dependency | `pymodbus` — `sudo apt install python3-pymodbus` |
+| Cadence | one poll every 5 s (`POLL_INTERVAL`), published to `casa/batteria/data` |
 
-Both poll every 5 s (`POLL_INTERVAL`) and publish the same JSON to
-`casa/batteria/data`; the `pymodbus` import is optional, so the UDP transport
-runs on a Pi that does not have it. Neither works through the Marstek cloud:
-the battery has to be on the same LAN as the Pi either way.
+It does not work through the Marstek cloud: the battery has to be on the same
+LAN as the Pi.
 
-### The local API (wifi) — what a VenusE 3.0 on firmware 144 actually gives
+**The two interfaces are two hosts.** The wifi side (`192.168.1.217`, MAC
+`cc:c8:37:a1:c5:f9`) and the wired side (`192.168.1.153`, MAC
+`dc:04:5a:7d:ef:ec`) get separate leases. The wifi one is up and pingable and
+answers the local API, but **refuses** port 502 — `Connection refused`, not a
+timeout, which reads like a firewall problem and is not one. Only the cabled
+address serves Modbus.
 
-| Call | Keys that end up in the DB | Keys ignored |
-|------|---------------------------|--------------|
-| `ES.GetStatus` | `bat_soc` → `soc`, `ongrid_power` → `ac_power`, `total_grid_input_energy` → `charge_total`, `total_grid_output_energy` → `discharge_total` (Wh → kWh) | `bat_cap`, `pv_power`, `offgrid_power`, `total_pv_energy`, `total_load_energy` — all 0 on a Venus with no PV input |
-| `Bat.GetStatus` | `bat_temp` → `temperature` | `bat_capacity` (Wh left), `rated_capacity` (5120 Wh), `charg_flag`/`dischrg_flag` — permissions, not state |
-| `ES.GetMode` | `mode` (`Auto`) | a second copy of the power figures, and the CT meter's |
+**The server is brittle, and this shapes the code.** A request the battery
+does not implement is not just refused: it drops the TCP session, and then
+refuses new connections for several seconds. So one bad block costs the whole
+poll and part of the next. Two consequences, both deliberate:
 
-**The pack side is not exposed at all**: no voltage, no current, no cell
-temperatures, and no DC battery power. So:
+- The blocks must cover implemented registers only — 35003 does not exist, so
+  the old `35000 + 12` block took the temperatures, `state` and `mode` down
+  with it. It is split into `35000+3` and `35010+2`.
+- `read_battery()` abandons the remaining blocks as soon as one fails and the
+  poller reconnects, instead of retrying into a lockout it is itself extending.
 
-- `battery_power` is the inverter's AC figure (`ongrid_power`) standing in for
-  it — same direction, a few per cent higher. Measured: 1850 W AC while the
-  residual capacity climbed 10 Wh every 21 s (≈1715 W DC), the difference being
-  conversion loss. The `batteria` columns `battery_voltage`,
-  `battery_current`, `cell_temp_max` and `cell_temp_min` stay empty, and the
-  temperature card shows only the one reading — which here IS the pack, not the
-  electronics.
-- `state` is derived from the power (`Carica` / `Scarica` / `In attesa`, ±15 W
-  deadband), because `mode` says what the battery is *told* to do, not what it
-  is doing.
-- The grid counters are mapped to `charge_total` / `discharge_total` on
-  purpose: the Venus has no PV input, so everything in and out of the pack
-  passes the grid port and those two counters are the pack's totals.
+### Why the local API is gone
 
-**Sign, measured not guessed**: `ongrid_power` is **negative while charging**
-(watched `bat_capacity` and `total_grid_input_energy` rise with it at
-−1850 W). `BATTERY_POWER_SIGN = -1` in `mqtt_receiver.py` accordingly, so the
-stored column follows the house convention, + = charging.
+The bridge could also talk the Marstek **local API** ("Open API", JSON over
+UDP :30000), which was the only local way in while the battery sat on wifi.
+That path has been removed. It never exposed the pack side at all — no
+voltage, no current, no cell temperatures and no DC power — so `battery_power`
+had to be stood in for by the inverter's AC figure (`ongrid_power`, a few per
+cent above the DC one: measured 1850 W AC while the residual capacity climbed
+10 Wh every 21 s, ≈1715 W DC), `state` had to be derived from that power with
+a ±15 W deadband, and four `batteria` columns stayed permanently empty. Modbus
+reads all of them directly, so the workarounds went with it — along with the
+UDP pacing (the battery dropped calls fired back to back) and the alias table
+that absorbed key names changing between firmwares.
 
-**Pacing**: the battery drops requests that arrive on top of each other —
-fired back to back, two of the three calls go unanswered. `UDP_GAP = 1.0` s
-between calls and `UDP_RETRIES = 3` fixed it; the odd call is still dropped now
-and then, and costs only its own fields.
-
-### The local API (wifi) — protocol
-
-One UDP datagram per call, `{"id": 1, "method": "ES.GetStatus", "params":
-{"id": 0}}`, answered by `{"id": 1, "result": {…}}`. Three calls per poll
-(`UDP_CALLS`): `ES.GetStatus` (SoC, battery and AC power), `Bat.GetStatus`
-(voltage, current, temperatures) and `ES.GetMode`. The results are merged into
-one flat dict — first call in `UDP_CALLS` wins a repeated key — and mapped onto
-the canonical column names through `UDP_ALIASES`.
-
-The key names differ between firmwares and the API is young, so the lookup is
-alias-based like the receiver's, and `--check` prints the **raw answers**
-before the decoded payload: a field that comes out missing is either genuinely
-absent or spelled differently, and in the second case the spelling only has to
-be added to `UDP_ALIASES`.
-
-Two details that cost time otherwise: the socket binds local port 30000 when it
-can, because some firmwares answer only a request that came from the port they
-listen on (it falls back to an ephemeral port with a log line), and datagrams
-the battery sends on its own — notifications, late answers to an earlier call —
-are skipped rather than mistaken for the answer in hand.
-
-Grid counters (`total_grid_input_energy` / `total_grid_output_energy`) are
-deliberately **not** mapped to `charge_total` / `discharge_total`: they measure
-the grid side, not the pack.
+**The sign changed with the transport.** `BATTERY_POWER_SIGN` was `-1` for the
+local API, whose `ongrid_power` is the AC side and negative while charging.
+Register 30001 is the pack's own figure and reads **positive** while charging,
+so the constant is back to **`1`**. Measured 2026-09-04 with the battery
+charging: `battery_power` +786 W, `state` = Charge, 53.96 V × 13.8 A = 745 W
+DC (the AC figure sat at −797 W at the same moment, the old convention).
 
 The register map is taken from `ViperRNMC/marstek_venus_modbus`
 (`registers/e_v3.yaml`), whose author flags the v3 map as only partially
@@ -155,16 +131,35 @@ validated on hardware — hence `--check` below.
 | 30100 / 30101 | uint16 / int16 | 0.01 / 0.1 | `battery_voltage` / `battery_current` |
 | 33000 / 33002 | uint32 / int32 | 0.01 | `charge_total` / `discharge_total` (kWh) |
 | 34002 | uint16 | 0.1 | `soc` (%) |
-| 35000 | int16 | 0.1 | `temperature` (°C, electronics/MOS area) |
+| 32200 / 32204 | uint16 | 0.1 | `ac_voltage` (V) / `ac_frequency` (Hz) |
+| 35000 | int16 | 0.1 | `temperature` (°C, electronics/MOS area — reads ~39 °C with the pack at 33) |
+| 35001 / 35002 | int16 | 0.1 | `temp_mos1` / `temp_mos2` (°C) — free, they sit in the 35000 block |
+| 37007 / 37008 | int16 | 0.001 | `cell_voltage_max` / `cell_voltage_min` (V) |
 | 35010 / 35011 | int16 | 0.1 | `cell_temp_max` / `cell_temp_min` (°C) |
 | 35100 | uint16 | — | `state`: Sleep / Standby / Charge / Discharge / Backup / OTA / Bypass |
 | 43000 | uint16 | — | `mode`: Manual / Anti-feed / Trade |
 
-They are read in seven block reads per poll, and a block that fails costs its
-own fields only — the rest of the message is still published. When every block
-fails the battery is logged as unreachable **once**, not once per poll, and
-nothing is published, so the dashboard's snapshot goes stale (150 s) and the
-"nessun dato" banner comes back on its own.
+**Register 37004 is deliberately NOT read.** The community map calls it
+`ac_current`, but on this firmware it returns the AC *power* — the same word as
+30006, verified over three consecutive samples (−796/−796, −797/−797,
+−797/−796). Both dashboards derive the AC current from `|ac_power| / ac_voltage`
+and label it as derived rather than publish a mislabelled register.
+
+**Only one Modbus client at a time.** The Venus accepts a single TCP
+connection: while `meteo-battery.service` holds it, every other client gets
+`noconn`, which looks exactly like the lockout an illegal register causes and
+is not the same thing. To probe by hand, stop the service first —
+`sudo systemctl stop meteo-battery`, probe, start it again.
+
+They are read in eleven block reads per poll (see the register-range note
+above for why the 35000 range is split in two). A poll that breaks off part
+way still publishes what it got; when the very first block fails the battery
+is logged as unreachable **once**, not once per poll, and nothing is
+published, so the dashboard's snapshot goes stale (150 s) and the "nessun
+dato" banner comes back on its own. `pymodbus`'s own logger is turned down to
+CRITICAL for the same reason: it prints a full ERROR line per refused
+connection, which would otherwise fill the journal at one line every 5 s while
+the battery is down.
 
 The published sign is whatever the battery reports. The house convention
 (+ = charging) is applied in one place only, `BATTERY_POWER_SIGN` in
@@ -176,7 +171,7 @@ The published sign is whatever the battery reports. The house convention
 
 ```
 Marstek Venus E 3.0
-      │ Modbus TCP :502 (wired LAN)  — or —  local API UDP :30000 (wifi)
+      │ Modbus TCP :502 (wired LAN)
       ▼
 battery_bridge.py  ──MQTT casa/batteria/data──┐
                                               │
@@ -292,19 +287,14 @@ The figures are therefore a good estimate, not a revenue-grade meter reading.
 
 ## Bringing the battery online
 
-1. Give the battery a fixed address on the house LAN (DHCP reservation), then
-   pick the transport:
-   - **Cabled to the LAN**, firmware V144+: leave `TRANSPORT = "modbus"`.
-   - **On wifi**: set `TRANSPORT = "udp"` and turn the
-     "Local API" / "Open API" switch on in the Marstek app (device settings);
-     it shows the port, which must match `UDP_PORT` (30000 by default).
-     Modbus is simply not served over wifi — port 502 does not answer at all,
-     so `--check` reporting "cannot reach" on a wifi battery is expected, not a
-     fault.
+1. Cable the battery to the LAN — Modbus is served on the wired port only, so
+   `--check` reporting "cannot reach" against the wifi address is expected,
+   not a fault — and give that interface (its own MAC, its own lease) a fixed
+   address. Firmware must be V144 or newer. To find it, scan the LAN for a
+   host with 502 open and read register 34002: it must come back as SoC × 10.
 2. Set `BATTERY_HOST` in `battery_bridge.py` to that address.
-3. Only for `"modbus"`, on the Pi, once: `sudo apt install python3-pymodbus`
-   (or `pip3 install --break-system-packages pymodbus`). The UDP transport
-   needs nothing installed.
+3. On the Pi, once: `sudo apt install python3-pymodbus`
+   (or `pip3 install --break-system-packages pymodbus`).
 4. Deploy: `./deploy_pi.sh battery_bridge.py` — `meteo-battery.service` is not
    installed yet, so the script says it is skipping that restart, which is
    expected.
@@ -315,11 +305,11 @@ The figures are therefore a good estimate, not a revenue-grade meter reading.
    python3 /var/www/html/battery_bridge.py --check
    ```
 
-   It prints one decoded reading — on `"udp"`, the raw answers first. Check SoC
-   against the app, that the voltage is plausible, and that the sign of
-   `battery_power` matches what the battery is actually doing. On `"udp"`, also
-   look for fields missing from the decoded payload but present in the raw
-   answers under another name, and add that name to `UDP_ALIASES`.
+   It prints one decoded reading. Check SoC against the app, that the voltage
+   is plausible, that the cell temperatures are not wild, and that the sign of
+   `battery_power` matches what the battery is actually doing — the map is
+   community-sourced, so a field that comes out absurd is a wrong register,
+   not a broken battery.
 6. Install the service:
 
    ```
@@ -337,22 +327,68 @@ The figures are therefore a good estimate, not a revenue-grade meter reading.
    minute.
 8. Open `http://stazionemeteo.local/batteria.php` — the banner disappears with
    the first message.
-9. If a charging battery reads "in scarica", set `BATTERY_POWER_SIGN = -1` in
-   `mqtt_receiver.py` and redeploy that file.
+9. If a charging battery reads "in scarica", flip `BATTERY_POWER_SIGN` in
+   `mqtt_receiver.py` and redeploy that file. It is `1` for the Modbus source.
 
 Deploy targets: `./deploy_pi.sh batteria.php mqtt_receiver.py battery_bridge.py`
 (the script verifies each file by md5 and restarts the units that exist).
 
 ---
 
+## The remote dashboard (`server_remoto/`)
+
+Since 2026-09-04 the battery also reaches `cesana.steplab.net`, over the same
+path the weather reading already took: `meteo.py` reads the tmpfs snapshot,
+puts three keys in its MQTT payload, and `mqtt_ingest.py` -> `ingest.php` ->
+`store_lib.php` stores them.
+
+| Key | Column | Meaning |
+|-----|--------|---------|
+| `battPower` | `battPower` | W, + charging (house convention, already flipped by the receiver) |
+| `battSoc` | `battSoc` | % |
+| `battTemp` | `battTemp` | °C, **hottest cell** — `cell_temp_max`, falling back to the MOS reading |
+| `battTs` | `battTs` (live row only) | unix seconds, when the BATTERY was read |
+
+`battTemp` is the pack, not the box: `temperature` (register 35000) is the
+electronics/MOS area and runs some 6 °C above the cells (38 °C against 32 °C on
+2026-09-04), and it is the cell figure the BMS limits work from — no charging
+below 0 °C, derating above 45 °C. The remote card colours it on those
+thresholds and says *carica bloccata dal BMS* below zero, which is a state and
+not a fault.
+
+`battTs` is the one that is not obvious. The server keeps the last value it was
+sent for every field — a message that omits a key leaves the stored one alone,
+which is what stops a partial reading from zeroing good data. For the battery
+that rule is dangerous: a bridge that died at 800 W would have the dashboard
+subtracting 800 W from the house load for ever. So the battery figures carry
+their own age, `meteo.py` sends the three together or not at all, and
+`instant_lib.php` treats anything older than `BATT_MAX_AGE` (300 s) as no
+battery at all — the card disappears and `casa` goes back to `pv + grid`.
+
+History rows need none of this: a `dati_meteo` row is already stamped, and a
+NULL `battPower` there means the battery said nothing in that ten-minute
+window. `casa_power()` in `grafico.php` therefore keeps the plain sum when the
+column is NULL, so charts that predate the battery are unaffected.
+
+What the house load means changed with it — see `ENERGY_METER.md`.
+
+---
+
 ## Not done yet
 
-- **The Modbus transport is still unvalidated on hardware** — the v3 register
-  map is community-sourced and has never been run against this battery, which
-  is on wifi. The UDP transport is the tested one; if the Venus is ever cabled,
-  `--check` on `TRANSPORT = "modbus"` is a required step, not a formality.
+- **The register map is now validated where it is used** — all ten fields
+  above read plausible values on 2026-09-04 (SoC 70 % against the app,
+  53.96 V × 13.8 A ≈ 745 W against `battery_power` 770 W, cells 30–32 °C,
+  state Charge while charging). What is *not* mapped is still unchecked, and
+  probing for more registers is not free: a wrong address locks the Modbus
+  server out for seconds (see above), so it is worth doing deliberately, not
+  by sweeping.
 - **Alarms** — `alarm_watcher.py` has no battery sources; a "SoC sotto il 15 %"
   or "non trasmette" rule would need `batteria` merged into the reading it
   evaluates, the way `energia` already is (see `ENERGY_METER.md`).
-- **Remote server** — `meteo.py` does not forward battery figures to
-  `carica_dati.php`, so the battery appears only on the LAN dashboard.
+- **Local dashboards still show the gross house load** — `casa_power` in
+  `mqtt_receiver.py` (and so `rapsberry meteo/index.php` and `batteria.php`) is
+  still `pv_power + grid_power`, which counts a charging battery as
+  consumption. Only the remote dashboard subtracts it. Changing the local one
+  means changing what the `energia` table has always meant, so it was left
+  alone deliberately rather than overlooked.

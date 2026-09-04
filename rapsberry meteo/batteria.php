@@ -361,6 +361,20 @@ if ($api !== '') {
       margin-bottom: .75rem;
     }
 
+    /* Sotto-titolo dentro un gruppo, per separare le tre famiglie di misure. */
+    .diag-title {
+      font-size: .72rem;
+      text-transform: uppercase;
+      letter-spacing: .06em;
+      color: #94a3b8;
+      font-weight: 600;
+      margin: .9rem 0 .4rem;
+    }
+
+    .diag-title:first-of-type {
+      margin-top: .2rem;
+    }
+
     .stat {
       display: flex;
       flex-direction: column;
@@ -624,9 +638,12 @@ if ($api !== '') {
       <span class="sub">ieri <span id="c-discharge-yday">—</span> kWh</span>
     </div>
     <div class="card">
-      <span class="label">Temperatura</span>
+      <span class="label">Temperatura celle</span>
       <span class="value c-purple" id="c-temp">—</span>
       <span class="unit">°C</span>
+      <!-- L'elettronica gira parecchio piu' calda del pacco: tenerla qui sotto
+           evita di confonderla con la temperatura su cui lavora il BMS. -->
+      <span class="sub">min <span id="c-temp-min">—</span>° · &Delta; <span id="c-temp-spread">—</span>° · elettronica <span id="c-temp-mos">—</span>°</span>
     </div>
     <div class="card">
       <span class="label">SoC min/max oggi</span>
@@ -677,6 +694,63 @@ if ($api !== '') {
             class="unit">%</span></div>
       </div>
       <canvas id="chart-power" height="140"></canvas>
+    </div>
+
+    <!-- ── Everything the pack reports about itself ──
+         Tre temperature, quattro tensioni, due correnti: separate per fascia
+         perche' rispondono a domande diverse. Le celle dicono se il pacco sta
+         bene, l'elettronica se il raffreddamento tiene, gli scarti (Δ) se il
+         pacco e' bilanciato. -->
+    <div class="group">
+      <h2>
+        <svg class="icon-bolt" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+          stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M14 4v10.5a4 4 0 1 1-4 0V4a2 2 0 0 1 4 0z" />
+          <line x1="14" y1="8" x2="17" y2="8" />
+          <line x1="14" y1="12" x2="17" y2="12" />
+        </svg>
+        Temperature, tensioni e correnti
+      </h2>
+
+      <h3 class="diag-title">Temperature</h3>
+      <div class="group-stats">
+        <div class="stat"><span class="label">Cella max</span><span class="value" id="d-cell-max">—</span><span
+            class="unit">°C</span></div>
+        <div class="stat"><span class="label">Cella min</span><span class="value" id="d-cell-min">—</span><span
+            class="unit">°C</span></div>
+        <div class="stat"><span class="label">&Delta; celle</span><span class="value" id="d-cell-spread">—</span><span
+            class="unit">°C · sopra 5 sbilanciato</span></div>
+        <div class="stat"><span class="label">Interna</span><span class="value c-purple" id="d-t-int">—</span><span
+            class="unit">°C</span></div>
+        <div class="stat"><span class="label">MOS 1</span><span class="value c-purple" id="d-t-mos1">—</span><span
+            class="unit">°C</span></div>
+        <div class="stat"><span class="label">MOS 2</span><span class="value c-purple" id="d-t-mos2">—</span><span
+            class="unit">°C</span></div>
+      </div>
+
+      <h3 class="diag-title">Tensioni</h3>
+      <div class="group-stats">
+        <div class="stat"><span class="label">Pacco</span><span class="value c-teal" id="d-v-pack">—</span><span
+            class="unit">V</span></div>
+        <div class="stat"><span class="label">Cella max</span><span class="value c-teal" id="d-v-cmax">—</span><span
+            class="unit">V</span></div>
+        <div class="stat"><span class="label">Cella min</span><span class="value c-teal" id="d-v-cmin">—</span><span
+            class="unit">V</span></div>
+        <div class="stat"><span class="label">&Delta; celle</span><span class="value" id="d-v-spread">—</span><span
+            class="unit">mV · sopra 50 sbilanciato</span></div>
+        <div class="stat"><span class="label">Rete AC</span><span class="value c-blue" id="d-v-ac">—</span><span
+            class="unit">V · <span id="d-hz">—</span> Hz</span></div>
+      </div>
+
+      <h3 class="diag-title">Correnti</h3>
+      <div class="group-stats">
+        <div class="stat"><span class="label">Pacco</span><span class="value c-green" id="d-i-pack">—</span><span
+            class="unit">A</span></div>
+        <!-- Il registro 37004 della mappa restituisce la potenza, non la
+             corrente: questa e' ricavata da |W| / V, e lo dice. -->
+        <div class="stat"><span class="label">Rete AC</span><span class="value c-blue" id="d-i-ac">—</span><span
+            class="unit">A stimata da W/V</span></div>
+      </div>
     </div>
 
     <!-- ── Flow against the Shelly meter ── -->
@@ -879,6 +953,51 @@ if ($api !== '') {
       return '';
     }
 
+    /** Every temperature, voltage and current the pack reports. */
+    function renderDiagnostics(b) {
+      const set = (id, v, dec) => {
+        document.getElementById(id).textContent = fmt(v, dec);
+      };
+      const cellMax = num(b.cell_temp_max), cellMin = num(b.cell_temp_min);
+      set('d-cell-max', cellMax, 1);
+      set('d-cell-min', cellMin, 1);
+      set('d-t-int', num(b.temperature), 1);
+      set('d-t-mos1', num(b.temp_mos1), 1);
+      set('d-t-mos2', num(b.temp_mos2), 1);
+
+      const tSpread = (cellMax !== null && cellMin !== null) ? cellMax - cellMin : null;
+      const tSpreadEl = document.getElementById('d-cell-spread');
+      tSpreadEl.textContent = fmt(tSpread, 1);
+      tSpreadEl.className = 'value ' + (tSpread !== null && tSpread > 5 ? 'c-orange' : 'c-gray');
+
+      // Cell colour follows the BMS thresholds, same as the card above.
+      document.getElementById('d-cell-max').className = 'value ' + (cellTempClass(cellMax) || 'c-teal');
+      document.getElementById('d-cell-min').className = 'value ' +
+        (cellMin !== null && cellMin < 0 ? 'c-blue' : 'c-teal');
+
+      const vMax = num(b.cell_voltage_max), vMin = num(b.cell_voltage_min);
+      set('d-v-pack', num(b.battery_voltage), 2);
+      set('d-v-cmax', vMax, 3);
+      set('d-v-cmin', vMin, 3);
+      set('d-v-ac', num(b.ac_voltage), 1);
+      set('d-hz', num(b.ac_frequency), 2);
+
+      // In mV: the interesting numbers here are tens of millivolts, and three
+      // decimals of a volt hide exactly the digit that matters.
+      const vSpread = (vMax !== null && vMin !== null) ? (vMax - vMin) * 1000 : null;
+      const vSpreadEl = document.getElementById('d-v-spread');
+      vSpreadEl.textContent = fmt(vSpread, 0);
+      vSpreadEl.className = 'value ' + (vSpread !== null && vSpread > 50 ? 'c-orange' : 'c-gray');
+
+      set('d-i-pack', num(b.battery_current), 1);
+
+      // Derived, not read: register 37004 ("ac_current" in the community map)
+      // returns the AC power on this firmware, so it is not published at all.
+      const acW = num(b.ac_power), acV = num(b.ac_voltage);
+      const acA = (acW !== null && acV !== null && acV > 50) ? Math.abs(acW) / acV : null;
+      set('d-i-ac', acA, 1);
+    }
+
     function setBadge(id, label, cls) {
       const el = document.getElementById(id);
       el.textContent = label;
@@ -911,12 +1030,32 @@ if ($api !== '') {
       document.getElementById('s-power').textContent = power === null ? '—' : power.toFixed(0);
       document.getElementById('s-ac').textContent = fmt(b.ac_power, 0);
 
-      // The one temperature the battery publishes is the pack's own, so it
-      // takes the cell thresholds below rather than being left uncoloured.
-      const temp = num(b.temperature);
+      // The headline temperature is the HOTTEST CELL, which is what the BMS
+      // limits work from. `temperature` (register 35000) is the electronics /
+      // MOS area and runs a good 6 °C above the pack -- colouring that one
+      // with the cell thresholds below would raise a warning about a battery
+      // that is perfectly happy. Over the local API the pack was the only
+      // reading there was, hence the old behaviour; Modbus publishes both.
+      // meteo.py picks the same figure for the remote dashboard, so the two
+      // agree: see read_latest_battery().
+      const cellMax = num(b.cell_temp_max);
+      const cellMin = num(b.cell_temp_min);
+      const mos = num(b.temperature);
+      const temp = cellMax !== null ? cellMax : mos;
       const tempEl = document.getElementById('c-temp');
       tempEl.textContent = fmt(temp, 1);
       tempEl.className = 'value ' + (cellTempClass(temp) || 'c-purple');
+      document.getElementById('c-temp-min').textContent = fmt(cellMin, 1);
+      document.getElementById('c-temp-mos').textContent = fmt(mos, 1);
+      // The spread matters as much as the absolute value: above ~5 °C it
+      // points at a weak or badly balanced cell even while both ends look
+      // fine, which is why BATTERY_VENUS.md asks for it on this card.
+      const spread = (cellMax !== null && cellMin !== null) ? cellMax - cellMin : null;
+      const spreadEl = document.getElementById('c-temp-spread');
+      spreadEl.textContent = fmt(spread, 1);
+      spreadEl.className = (spread !== null && spread > 5) ? 'c-orange' : '';
+
+      renderDiagnostics(b);
 
       // Residual energy is an estimate: the Venus publishes no kWh gauge, so
       // it is usable capacity × SoC, and the card says "stimati".

@@ -32,6 +32,7 @@ const PORTATA_TTL = 600;
  */
 const ICACHE_INTERVAL = 300;
 
+
 const ARPA_PORTATA_URL =
   'https://api.arpa.veneto.it/REST/v1/meteo_meteogrammi_tabella?codseqst=300001781&rnd=0.26636924190339917';
 
@@ -188,7 +189,8 @@ function store_write_minmax(mysqli $link, int $now): void
  *
  * $r accepts the field names the station has always used:
  *   temp, humi, wind, rain, pres, chip, gust, tombra, hombra, tMobile,
- *   tempCpu, fan, power, pvPower, gridPower
+ *   tempCpu, fan, power, pvPower, gridPower, battPower, battSoc, battTemp,
+ *   battTs
  * Missing entries are stored as NULL in the history row and left untouched in
  * dati_instant, so a partial message never overwrites good data with zeroes.
  *
@@ -205,6 +207,34 @@ function meteo_store_reading(mysqli $link, array $r): array
     $pvPower = 0.0;
   }
   $gridPower = isset($r['gridPower']) && is_numeric($r['gridPower']) ? (float) $r['gridPower'] : null;
+
+  // Marstek Venus E. battPower is signed the house way (+ = charging) and is
+  // subtracted from the house load downstream, so a value with no companion
+  // battTs is refused: an undated power figure is exactly the one that would
+  // go on being subtracted after the battery bridge died.
+  $battPower = isset($r['battPower']) && is_numeric($r['battPower']) ? (float) $r['battPower'] : null;
+  $battSoc = isset($r['battSoc']) && is_numeric($r['battSoc']) ? (float) $r['battSoc'] : null;
+  // The hottest cell, not the electronics: see read_latest_battery() in meteo.py.
+  $battTemp = isset($r['battTemp']) && is_numeric($r['battTemp']) ? (float) $r['battTemp'] : null;
+  $battTs = isset($r['battTs']) && is_numeric($r['battTs']) ? (int) $r['battTs'] : null;
+
+  // The diagnostics ride on the same timestamp: undated, they would sit on the
+  // card looking live long after the bridge stopped. The history row needs no
+  // such guard -- it is stamped by `data` like every other column in it.
+  $battLive = [];
+  if ($battTs !== null) {
+    foreach (BATTERY_DIAG_FIELDS as $f) {
+      if (isset($r[$f]) && is_numeric($r[$f])) {
+        $battLive[$f] = (float) $r[$f];
+      }
+    }
+  }
+
+  if ($battTs === null) {
+    $battPower = null;
+    $battSoc = null;
+    $battTemp = null;
+  }
 
   $get = static fn(string $k) => (isset($r[$k]) && $r[$k] !== '') ? $r[$k] : null;
 
@@ -226,6 +256,18 @@ function meteo_store_reading(mysqli $link, array $r): array
     foreach (['dati_meteo', 'dati_instant'] as $t) {
       ensure_column($link, $t, 'pvPower', 'FLOAT NULL');
       ensure_column($link, $t, 'gridPower', 'FLOAT NULL');
+      ensure_column($link, $t, 'battPower', 'FLOAT NULL');
+      ensure_column($link, $t, 'battSoc', 'FLOAT NULL');
+      ensure_column($link, $t, 'battTemp', 'FLOAT NULL');
+    }
+    // Only the live row carries the battery's own read time: a history row is
+    // already stamped with `data`, and a NULL battPower there simply means the
+    // battery said nothing in that ten-minute window.
+    ensure_column($link, 'dati_instant', 'battTs', 'INT NULL');
+    // Both tables: the diagnostics are charted from `dati_meteo` now.
+    foreach (BATTERY_DIAG_FIELDS as $c) {
+      ensure_column($link, 'dati_instant', $c, 'FLOAT NULL');
+      ensure_column($link, 'dati_meteo', $c, 'FLOAT NULL');
     }
 
     // Validation to prevent bad sensor readings (-50)
@@ -250,7 +292,10 @@ function meteo_store_reading(mysqli $link, array $r): array
       'portata' => $portata,
       'pvPower' => $pvPower,
       'gridPower' => $gridPower,
-    ];
+      'battPower' => $battPower,
+      'battSoc' => $battSoc,
+      'battTemp' => $battTemp,
+    ] + $battLive;
 
     $names = implode(', ', array_map(static fn($c) => "`$c`", array_keys($cols)));
     $values = implode(', ', array_map(static fn($v) => store_sql($link, $v), $cols));
@@ -283,6 +328,23 @@ function meteo_store_reading(mysqli $link, array $r): array
   if ($gridPower !== null) {
     $instant['gridPower'] = $gridPower;
   }
+  // battTs goes with them: the three are written together or not at all, so
+  // the stored age always belongs to the stored figures.
+  if ($battPower !== null || $battSoc !== null || $battTemp !== null || $battLive) {
+    if ($battPower !== null) {
+      $instant['battPower'] = $battPower;
+    }
+    if ($battSoc !== null) {
+      $instant['battSoc'] = $battSoc;
+    }
+    if ($battTemp !== null) {
+      $instant['battTemp'] = $battTemp;
+    }
+    foreach ($battLive as $f => $v) {
+      $instant[$f] = $v;
+    }
+    $instant['battTs'] = $battTs;
+  }
 
   $sets = [];
   foreach ($instant as $col => $val) {
@@ -292,7 +354,23 @@ function meteo_store_reading(mysqli $link, array $r): array
     $sets[] = "`$col` = " . store_sql($link, $val);
   }
   if ($sets) {
-    $link->query("UPDATE `dati_instant` SET " . implode(', ', $sets) . " WHERE id = 1");
+    $sql = "UPDATE `dati_instant` SET " . implode(', ', $sets) . " WHERE id = 1";
+    try {
+      $link->query($sql);
+    } catch (Throwable $e) {
+      // Almost always an unknown column: a field is being sent for the first
+      // time and the ten-minute path that adds columns has not run yet. On
+      // PHP 8.1+ mysqli raises that, which would fail the whole ingest and
+      // lose a perfectly good reading, so the columns are created here and the
+      // write is retried once. A second failure is a real error and is left to
+      // the caller.
+      foreach (array_merge(['pvPower', 'gridPower', 'battPower', 'battSoc', 'battTemp'],
+                          BATTERY_DIAG_FIELDS) as $c) {
+        ensure_column($link, 'dati_instant', $c, 'FLOAT NULL');
+      }
+      ensure_column($link, 'dati_instant', 'battTs', 'INT NULL');
+      $link->query($sql);
+    }
   }
 
   /** ---------- 3. DERIVED FILES ---------- */

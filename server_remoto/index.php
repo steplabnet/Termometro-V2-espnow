@@ -379,6 +379,110 @@ function showStyle($cond): string
       color: var(--accent-purple);
     }
 
+    .border-casabatt {
+      border-top-color: var(--accent-teal);
+    }
+
+    .icon-casabatt {
+      color: var(--accent-teal);
+    }
+
+    /* Batteria: verde mentre carica o riposa, arancione mentre scarica --
+       stessa logica del bordo e dell'icona, cosi' il colore si legge da lontano. */
+    .border-batt {
+      border-top-color: var(--accent-green);
+    }
+
+    .border-batt.discharging {
+      border-top-color: var(--accent-orange);
+    }
+
+    .icon-batt {
+      color: var(--accent-green);
+    }
+
+    .border-batt.discharging .icon-batt {
+      color: var(--accent-orange);
+    }
+
+    /* Card diagnostica: una griglia etichetta/valore, tre famiglie separate da
+       un titoletto. Non e' una card da un solo numero grande, quindi non usa
+       .card-value: qui contano quattordici numeri piccoli e leggibili. */
+    .border-diag {
+      border-top-color: var(--accent-ice);
+    }
+
+    .icon-diag {
+      color: var(--accent-ice);
+    }
+
+    .diag-group {
+      width: 100%;
+      font-size: 0.62rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #9ca3af;
+      margin: 10px 0 3px;
+      text-align: left;
+    }
+
+    .diag-rows {
+      width: 100%;
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 1px 8px;
+      font-size: 0.72rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .diag-rows .k {
+      color: var(--text-muted);
+      text-align: left;
+    }
+
+    .diag-rows .v {
+      font-weight: 700;
+      text-align: right;
+    }
+
+    /* Ogni valore e' un link al proprio grafico. La regola globale su <a> in
+       cima al file li stira a colonna a piena altezza (serve alle card, che
+       sono interamente cliccabili): qui va annullata, altrimenti la griglia
+       si sfascia. */
+    .diag-rows a {
+      display: inline;
+      width: auto;
+      height: auto;
+      border-bottom: 1px dotted rgba(107, 114, 128, 0.5);
+    }
+
+    .diag-rows a:hover {
+      border-bottom-style: solid;
+      color: var(--accent-ice);
+    }
+
+    .diag-rows .v.warn {
+      color: var(--accent-orange);
+    }
+
+    /* Livello di carica: la barra dice a colpo d'occhio cio' che la percentuale
+       dice con precisione. La larghezza arriva dal payload (batt.fill). */
+    .batt-bar {
+      width: 100%;
+      height: 8px;
+      margin-top: 10px;
+      border-radius: 999px;
+      background: #e5e7eb;
+      overflow: hidden;
+    }
+
+    .batt-fill {
+      height: 100%;
+      border-radius: 999px;
+      transition: width 0.4s ease, background-color 0.4s ease;
+    }
+
     .flow-state {
       font-weight: 800;
       font-size: 0.78rem;
@@ -882,6 +986,134 @@ function showStyle($cond): string
           </div>
         </a>
       </div>
+      <?php if (!empty($p['battAvailable'])): ?>
+        <!-- 10b. Casa + batteria: quello che l'impianto tira davvero mentre
+             riempie anche il pacco. La batteria entra solo se sta caricando:
+             in scarica non e' un consumo, e' la sorgente.
+
+             Fuori dalla carica la card sparisce del tutto, invece di ripetere
+             il valore della card Consumo Casa qui accanto. Resta pero' nel
+             DOM, nascosta: cosi' il poller la fa ricomparire appena la
+             batteria riprende a caricare, senza ricaricare la pagina (e' la
+             stessa ragione per cui esistono le varianti di icona altrove). -->
+        <div class="card border-casabatt" data-card="casaBatt"
+          style="<?php echo showStyle($p['casaBatt']['charging']); ?>"
+          data-live-show="casaBatt.charging">
+          <a href="grafico.php?var=casaBatt">
+            <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-casabatt" viewBox="0 0 24 24"
+              fill="currentColor">
+              <path d="M9 2 1 9h2.5v7h5v-4h1v4h5V9H17L9 2z" opacity="0.9" />
+              <path d="M16.5 12H22a1 1 0 0 1 1 1v7a1 1 0 0 1-1 1h-5.5a1 1 0 0 1-1-1v-7a1 1 0 0 1 1-1zm.5 2v5h4v-5h-4z" />
+              <path d="M18 10h3v1.5h-3V10z" />
+            </svg>
+            <div class="card-label">Casa + Batteria</div>
+            <div class="card-value"><span data-live="casaBatt.val"><?php echo $p['casaBatt']['val']; ?></span><span
+                class="card-unit">W</span></div>
+            <div class="flow-state" style="color:<?php echo $p['casaBatt']['breakdownColor']; ?>;"
+              data-live="casaBatt.breakdown" data-live-color="casaBatt.breakdownColor">
+              <?php echo $p['casaBatt']['breakdown']; ?>
+            </div>
+            <div class="minmax-row">
+              <div class="minmax-item"><span class="minmax-label">Picco 24h</span><span class="minmax-val"
+                  data-live="casaBatt.peak"><?php echo $p['casaBatt']['peak']; ?></span></div>
+            </div>
+          </a>
+        </div>
+      <?php endif; ?>
+    <?php endif; ?>
+
+    <?php if (!empty($p['battAvailable'])): ?>
+      <!-- 11. Batteria Marstek Venus E. Il consumo casa qui sopra e' gia' al
+           netto di questa: quando la batteria carica, quei watt non sono
+           consumo della casa ma accumulo. -->
+      <div class="card border-batt <?php echo $p['batteria']['discharging'] ? 'discharging' : ''; ?>"
+        data-card="batteria">
+        <a href="grafico.php?var=battSoc">
+          <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-batt" viewBox="0 0 24 24"
+            fill="currentColor">
+            <path d="M4 7h13a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2zm0 2v6h13V9H4z" />
+            <path d="M20 10h2v4h-2v-4z" />
+            <path d="M11 8.5 7.5 13H10l-1 3.5L12.5 12H10l1-3.5z" />
+          </svg>
+          <div class="card-label">Batteria</div>
+          <div class="card-value"><span data-live="batteria.val"><?php echo $p['batteria']['val']; ?></span><span
+              class="card-unit">%</span></div>
+
+          <div class="batt-bar">
+            <div class="batt-fill" data-live-width="batteria.fill" data-live-bg="batteria.fillColor"
+              style="width:<?php echo $p['batteria']['fill']; ?>; background:<?php echo $p['batteria']['fillColor']; ?>;">
+            </div>
+          </div>
+
+          <div class="flow-state" style="color:<?php echo $p['batteria']['flowColor']; ?>;"
+            data-live-html="batteria.flow" data-live-color="batteria.flowColor">
+            <?php echo $p['batteria']['flow']; ?>
+          </div>
+
+          <!-- Cella piu' calda, non l'elettronica: e' quella su cui lavorano i
+               limiti del BMS. Sotto 0 gradi la carica si ferma da sola. -->
+          <div style="margin-top:4px; font-size:0.7rem; font-weight:700; color:<?php echo $p['batteria']['tempColor']; ?>; <?php echo showStyle($p['batteria']['tempShow']); ?>"
+            data-live-show="batteria.tempShow" data-live-color="batteria.tempColor">
+            &#127777; <span data-live="batteria.temp"><?php echo $p['batteria']['temp']; ?></span><span
+              data-live="batteria.tempNote"><?php echo $p['batteria']['tempNote']; ?></span>
+          </div>
+
+          <div class="minmax-row">
+            <div class="minmax-item"><span class="minmax-label">Potenza</span><span class="minmax-val"
+                data-live="batteria.power"><?php echo $p['batteria']['power']; ?></span></div>
+            <div class="minmax-item"><span class="minmax-label">Residuo</span><span class="minmax-val"
+                data-live="batteria.residuo"><?php echo $p['batteria']['residuo']; ?></span></div>
+            <div class="minmax-item"><span class="minmax-label">Range 24h</span><span class="minmax-val"
+                data-live="batteria.range"><?php echo $p['batteria']['range']; ?></span></div>
+          </div>
+        </a>
+      </div>
+    <?php endif; ?>
+
+    <?php if (!empty($p['battAvailable']) && !empty($p['battDiag']['show'])): ?>
+      <!-- 12. Tutto quello che il pacco dice di se'. La corrente AC e' ricavata
+           da |W| / V: il registro che la mappa chiama ac_current, su questo
+           firmware, restituisce la potenza. -->
+      <!-- Questa card NON e' avvolta in un <a> come le altre: ogni valore
+           porta al proprio grafico, e un link dentro un link non e' HTML
+           valido. Da qui il markup a mano e la regola CSS .diag-rows a. -->
+      <div class="card border-diag" data-card="battDiag"
+        style="display:flex; flex-direction:column; align-items:center;">
+        <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-diag" viewBox="0 0 24 24"
+          fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M14 4v10.5a4 4 0 1 1-4 0V4a2 2 0 0 1 4 0z" />
+          <line x1="14" y1="8" x2="17.5" y2="8" />
+          <line x1="14" y1="12" x2="17.5" y2="12" />
+        </svg>
+        <div class="card-label">Diagnostica Batteria</div>
+        <div style="font-size:0.6rem; color:var(--text-muted); margin-bottom:2px;">tocca un valore per il grafico</div>
+
+        <div class="diag-group">Temperature</div>
+        <div class="diag-rows">
+            <span class="k">Cella max</span><span class="v"><a href="grafico.php?var=battTemp" data-live="battDiag.tCellMax"><?php echo $p['battDiag']['tCellMax']; ?></a></span>
+            <span class="k">Cella min</span><span class="v"><a href="grafico.php?var=battTempMin" data-live="battDiag.tCellMin"><?php echo $p['battDiag']['tCellMin']; ?></a></span>
+            <span class="k">&Delta; celle</span><span class="v <?php echo $p['battDiag']['tSpreadWarn'] ? 'warn' : ''; ?>" data-live-warn="battDiag.tSpreadWarn"><a href="grafico.php?var=battTempSpread" data-live="battDiag.tSpread"><?php echo $p['battDiag']['tSpread']; ?></a></span>
+            <span class="k">Interna</span><span class="v"><a href="grafico.php?var=battTempInt" data-live="battDiag.tInt"><?php echo $p['battDiag']['tInt']; ?></a></span>
+            <span class="k">MOS 1</span><span class="v"><a href="grafico.php?var=battTempMos1" data-live="battDiag.tMos1"><?php echo $p['battDiag']['tMos1']; ?></a></span>
+            <span class="k">MOS 2</span><span class="v"><a href="grafico.php?var=battTempMos2" data-live="battDiag.tMos2"><?php echo $p['battDiag']['tMos2']; ?></a></span>
+        </div>
+
+        <div class="diag-group">Tensioni</div>
+        <div class="diag-rows">
+            <span class="k">Pacco</span><span class="v"><a href="grafico.php?var=battVolt" data-live="battDiag.vPack"><?php echo $p['battDiag']['vPack']; ?></a></span>
+            <span class="k">Cella max</span><span class="v"><a href="grafico.php?var=battCellVMax" data-live="battDiag.vCellMax"><?php echo $p['battDiag']['vCellMax']; ?></a></span>
+            <span class="k">Cella min</span><span class="v"><a href="grafico.php?var=battCellVMin" data-live="battDiag.vCellMin"><?php echo $p['battDiag']['vCellMin']; ?></a></span>
+            <span class="k">&Delta; celle</span><span class="v <?php echo $p['battDiag']['vSpreadWarn'] ? 'warn' : ''; ?>" data-live-warn="battDiag.vSpreadWarn"><a href="grafico.php?var=battCellVSpread" data-live="battDiag.vSpread"><?php echo $p['battDiag']['vSpread']; ?></a></span>
+            <span class="k">Rete AC</span><span class="v"><a href="grafico.php?var=battAcV" data-live="battDiag.vAc"><?php echo $p['battDiag']['vAc']; ?></a></span>
+            <span class="k">Frequenza</span><span class="v"><a href="grafico.php?var=battAcHz" data-live="battDiag.hz"><?php echo $p['battDiag']['hz']; ?></a></span>
+        </div>
+
+        <div class="diag-group">Correnti</div>
+        <div class="diag-rows">
+            <span class="k">Pacco</span><span class="v"><a href="grafico.php?var=battCurr" data-live="battDiag.iPack"><?php echo $p['battDiag']['iPack']; ?></a></span>
+            <span class="k">Rete AC (da W/V)</span><span class="v"><a href="grafico.php?var=battAcCurr" data-live="battDiag.iAc"><?php echo $p['battDiag']['iAc']; ?></a></span>
+        </div>
+      </div>
     <?php endif; ?>
 
     <!-- 10. Feedback Previsioni -->
@@ -939,6 +1171,7 @@ function showStyle($cond): string
     (function () {
       var rev = <?php echo $rev; ?>;
       var emAvailable = <?php echo $emAvailable ? 'true' : 'false'; ?>;
+      var battAvailable = <?php echo !empty($p['battAvailable']) ? 'true' : 'false'; ?>;
       var backoff = 0;          // grows only while the endpoint is failing
       var inFlight = false;
       var firstPoll = true;     // the first request skips the server-side hold
@@ -1027,6 +1260,32 @@ function showStyle($cond): string
           if (next === '') pulse(el);   // blink only when a block appears
         });
 
+        // The battery's fill bar: a width and a colour rather than text, so it
+        // gets its own two hooks instead of squeezing into data-live.
+        document.querySelectorAll('[data-live-width]').forEach(function (el) {
+          var k = el.getAttribute('data-live-width');
+          if (!(k in f) || el.style.width === f[k]) return;
+          el.style.width = f[k];
+        });
+
+        document.querySelectorAll('[data-live-bg]').forEach(function (el) {
+          var k = el.getAttribute('data-live-bg');
+          if (!(k in f)) return;
+          // Same reason as data-live-color: the browser rewrites the value it
+          // stores, so the comparison is against what we last set.
+          if (el.__liveBg === f[k]) return;
+          el.style.background = f[k];
+          el.__liveBg = f[k];
+        });
+
+        // Amber when a spread goes out of range: a class, not a colour, so
+        // the threshold stays in PHP with the value it judges.
+        document.querySelectorAll('[data-live-warn]').forEach(function (el) {
+          var k = el.getAttribute('data-live-warn');
+          if (!(k in f)) return;
+          el.classList.toggle('warn', !!f[k]);
+        });
+
         document.querySelectorAll('[data-live-href]').forEach(function (el) {
           var k = el.getAttribute('data-live-href');
           if (k in f) el.setAttribute('href', f[k]);
@@ -1058,6 +1317,9 @@ function showStyle($cond): string
         if (card('piave')) card('piave').classList.toggle('river-dry', p.piave.status === 'dry');
         if (card('grid')) card('grid').classList.toggle('exporting', !!p.grid.exporting);
         if (card('prelievo')) card('prelievo').classList.toggle('drawing', !!p.prelievo.drawing);
+        if (card('batteria') && p.batteria) {
+          card('batteria').classList.toggle('discharging', !!p.batteria.discharging);
+        }
       }
 
       function schedule(ms) {
@@ -1100,6 +1362,9 @@ function showStyle($cond): string
               // The two meter cards only exist in the markup when the Shelly is
               // reporting; if that flips, the layout itself has to change.
               if (!!data.emAvailable !== emAvailable) { location.reload(); return; }
+              // Same for the battery card: it is in the markup only while the
+              // battery reports, so its arrival or departure is a layout change.
+              if (!!data.battAvailable !== battAvailable) { location.reload(); return; }
               rev = data.rev;
               apply(data);
             }

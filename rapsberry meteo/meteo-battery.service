@@ -1,5 +1,5 @@
 [Unit]
-Description=Marstek Venus E battery (local API / Modbus) -> MQTT bridge
+Description=Marstek Venus E battery (Modbus TCP) -> MQTT bridge
 After=network-online.target mosquitto.service
 Wants=network-online.target
 

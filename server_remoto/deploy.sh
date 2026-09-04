@@ -34,6 +34,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 PHP_FILES=(
   index.php
   previsioni.php
+  grafico.php
   live.php
   instant_lib.php
   instant_store.php

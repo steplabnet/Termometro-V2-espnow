@@ -77,11 +77,23 @@ PUBLISH_DEADBAND = {
     "pres": 1, "tempCpu": 0.5,
     "power": 20,
     "pvPower": 10, "gridPower": 10, "casaPower": 10,
+    "battPower": 10, "battSoc": 0.5, "battTemp": 0.5,
+    # The diagnostic set moves constantly and must not drive publishes on its
+    # own: wide deadbands, so it rides along with a reading that was going out
+    # anyway. battAcV in particular wanders a volt at a time all day.
+    "battTempMin": 0.5, "battTempInt": 1, "battTempMos1": 1, "battTempMos2": 1,
+    "battVolt": 0.1, "battCurr": 0.5, "battAcV": 2, "battAcHz": 0.1,
+    "battAcW": 20,
+    "battCellVMax": 0.01, "battCellVMin": 0.01,
 }
 
 # Diagnostics that ride along in the payload but must never trigger a publish
 # on their own: the raw ADC figures change on every single read.
-PUBLISH_IGNORE = {"timestamp", "mean_voltage", "adc_voltage", "adc_raw"}
+# battTs rides along for the same reason: it moves on every single read, and
+# it is only there so the server can tell a fresh battery reading from a stale
+# one -- it must never be the reason a message goes out.
+PUBLISH_IGNORE = {"timestamp", "mean_voltage", "adc_voltage", "adc_raw",
+                  "battTs"}
 
 # -------- Globals --------
 log_int = 1000  # seconds
@@ -98,6 +110,11 @@ ENERGY_MAX_AGE = 300  # seconds; older Shelly readings are not forwarded
 # the payload (and the remote server) within a loop instead of waiting for the
 # throttled `energia` row.
 ENERGY_LATEST_PATH = "/dev/shm/energy_latest.json"
+# Marstek Venus E, written by mqtt_receiver.py on every battery message. Same
+# arrangement as the Shelly snapshot above, and the same reason: the remote
+# dashboard should see the battery move when it moves, not a minute later.
+BATTERY_LATEST_PATH = "/dev/shm/battery_latest.json"
+BATTERY_MAX_AGE = 300        # seconds; an older battery reading is not forwarded
 PV_ZERO_THRESHOLD = 10.0     # PV production below this is noise -> treated as 0 W
 ROLES_PATH = "/var/www/html/sensor_roles.json"  # persisted role->id map; survives reboot
 ONLINE_THRESHOLD = 1200  # seconds; a sensor is "online" if it transmitted more recently than this
@@ -231,6 +248,65 @@ def read_latest_energy(max_age=ENERGY_MAX_AGE):
         energy["casa_power"] = grid if grid is not None else energy.get("casa_power")
 
     return energy
+
+
+def read_latest_battery(max_age=BATTERY_MAX_AGE):
+    """Latest Venus E snapshot, or {} when it is missing or stale.
+
+    Only the two figures the remote dashboard stores are returned. Everything
+    else the battery reports (voltages, cell temperatures, lifetime counters)
+    stays on the LAN, where batteria.php reads the full row: sending it to the
+    remote server would mean columns nothing over there displays.
+
+    Staleness matters more here than for the Shelly. A battery bridge that
+    died would otherwise leave a fixed battPower in the payload, and the house
+    load derived from it (pvPower + gridPower - battPower) would be wrong by
+    that amount for as long as it took someone to notice.
+    """
+    try:
+        with open(BATTERY_LATEST_PATH) as f:
+            row = json.load(f)
+    except FileNotFoundError:
+        return {}
+    except Exception as e:
+        print("Battery snapshot read error:", e)
+        return {}
+    if not isinstance(row, dict) or not _energy_is_fresh(row, max_age):
+        return {}
+    # battTs is when the battery was read, not when this payload was built:
+    # the server keeps the last value it was sent for every field, so without
+    # an age of its own a bridge that died at 800 W would keep subtracting
+    # 800 W from the house load indefinitely.
+    # The temperature forwarded is the HOTTEST CELL, not the `temperature`
+    # field: that one is the electronics/MOS area, which runs a good 6 degrees
+    # above the pack and is not what the BMS limits work from. The MOS figure
+    # stands in only when the cell registers were not read, so the card shows
+    # something rather than nothing.
+    temp = row.get("cell_temp_max")
+    if temp is None:
+        temp = row.get("temperature")
+
+    return {
+        "battPower": row.get("battery_power"),
+        "battSoc": row.get("soc"),
+        "battTemp": temp,
+        # The rest of what the pack reports about itself, for the remote
+        # dashboard's diagnostics card. AC current is deliberately absent: the
+        # register the map calls ac_current returns the AC power on this
+        # firmware, so the dashboards derive it from |W| / V instead.
+        "battTempMin": row.get("cell_temp_min"),
+        "battTempInt": row.get("temperature"),
+        "battTempMos1": row.get("temp_mos1"),
+        "battTempMos2": row.get("temp_mos2"),
+        "battVolt": row.get("battery_voltage"),
+        "battCurr": row.get("battery_current"),
+        "battCellVMax": row.get("cell_voltage_max"),
+        "battCellVMin": row.get("cell_voltage_min"),
+        "battAcV": row.get("ac_voltage"),
+        "battAcHz": row.get("ac_frequency"),
+        "battAcW": row.get("ac_power"),
+        "battTs": int(time()),
+    }
 
 
 def db_store_payload(payload):
@@ -814,6 +890,7 @@ def main():
 
         # Shelly Pro EM-50, written to the local DB by mqtt_receiver.py.
         energy = read_latest_energy()
+        battery = read_latest_battery()
 
         payload = {
             "tMobile": weather["tMobile"],
@@ -839,6 +916,10 @@ def main():
             "pvPower": energy.get("pv_power"),
             "gridPower": energy.get("grid_power"),
             "casaPower": energy.get("casa_power"),
+            # Absent (not null) when the battery is silent, so ingest.php
+            # leaves the stored value alone rather than blanking it. Both keys
+            # appear together or not at all.
+            **battery,
             "timestamp": datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
         }
 

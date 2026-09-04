@@ -83,13 +83,61 @@ switch ($variable) {
     $titolo = "Prelievo Rete";
     $unit = "W";
     break;
+  case 'battPower':
+    $titolo = "Potenza Batteria";
+    $unit = "W";
+    break;
+  case 'battSoc':
+    $titolo = "Carica Batteria";
+    $unit = "%";
+    break;
+  case 'battTemp':
+    $titolo = "Temperatura Batteria";
+    $unit = "°C";
+    break;
+  case 'casaBatt':
+    $titolo = "Casa + Batteria";
+    $unit = "W";
+    break;
+}
+
+/**
+ * The battery diagnostics, every one of them plottable from the card on
+ * index.php. Label and unit only -- the values are plain columns of
+ * dati_meteo (or, for the three derived ones, computed from them below).
+ */
+$BATT_DIAG_VARS = [
+  'battTempMin'    => ['Temp Cella Min',      '°C'],
+  'battTempInt'    => ['Temp Interna',        '°C'],
+  'battTempMos1'   => ['Temp MOS 1',          '°C'],
+  'battTempMos2'   => ['Temp MOS 2',          '°C'],
+  'battVolt'       => ['Tensione Pacco',      'V'],
+  'battCurr'       => ['Corrente Pacco',      'A'],
+  'battCellVMax'   => ['Tensione Cella Max',  'V'],
+  'battCellVMin'   => ['Tensione Cella Min',  'V'],
+  'battAcV'        => ['Tensione Rete',       'V'],
+  'battAcHz'       => ['Frequenza Rete',      'Hz'],
+  'battAcW'        => ['Potenza AC Batteria', 'W'],
+  // Derived, see the calc functions below.
+  'battTempSpread' => ['Δ Temperatura Celle', '°C'],
+  'battCellVSpread'=> ['Δ Tensione Celle',    'mV'],
+  'battAcCurr'     => ['Corrente Rete',       'A'],
+];
+if (isset($BATT_DIAG_VARS[$variable])) {
+  [$titolo, $unit] = $BATT_DIAG_VARS[$variable];
 }
 
 // Shelly power channels legitimately go far below zero (grid export), so the
 // "< -50 means dead sensor" rule that guards the temperature series must not be
 // applied to them. 'casa' (pvPower + gridPower) and 'prelievo' (the imported
 // half of gridPower) are derived, not DB columns.
-$POWER_VARS = ['pvPower', 'gridPower', 'casa', 'prelievo'];
+// battPower belongs here too: it is negative while the battery discharges.
+// battSoc does not -- it is a percentage that never legitimately goes below 0,
+// so it keeps the dead-sensor guard.
+// battCurr and battAcW are signed too (the pack discharging), and the two
+// spreads are differences that can legitimately come out at zero or below.
+$POWER_VARS = ['pvPower', 'gridPower', 'casa', 'prelievo', 'battPower', 'casaBatt',
+               'battCurr', 'battAcW', 'battTempSpread', 'battCellVSpread'];
 $skipSentinelFilter = in_array($variable, $POWER_VARS, true);
 
 $now = time();
@@ -109,6 +157,10 @@ $MULTI_CATALOG = [
   'gridPower'   => ['label' => 'Scambio Rete',  'unit' => 'W',    'color' => '#0ea5e9', 'src' => 'db',   'signed' => true],
   'casa'        => ['label' => 'Consumo Casa',  'unit' => 'W',    'color' => '#a855f7', 'src' => 'calc', 'signed' => true],
   'prelievo'    => ['label' => 'Prelievo Rete', 'unit' => 'W',    'color' => '#dc2626', 'src' => 'calc'],
+  'battPower'   => ['label' => 'Potenza Batteria', 'unit' => 'W',  'color' => '#16a34a', 'src' => 'db',   'signed' => true],
+  'battSoc'     => ['label' => 'Carica Batteria',  'unit' => '%',  'color' => '#10b981', 'src' => 'db'],
+  'battTemp'    => ['label' => 'Temp Batteria',    'unit' => '°C', 'color' => '#f43f5e', 'src' => 'db'],
+  'casaBatt'    => ['label' => 'Casa + Batteria',  'unit' => 'W',  'color' => '#14b8a6', 'src' => 'calc', 'signed' => true],
 ];
 
 /** PV production under this many watts is noise, not production. */
@@ -124,7 +176,16 @@ function pv_clean($val)
   return (abs($val) < PV_ZERO_THRESHOLD) ? 0.0 : $val;
 }
 
-/** House load: what the panels make plus what the grid supplies (export is negative). */
+/**
+ * House load: what the panels make plus what the grid supplies (export is
+ * negative), minus what the battery is storing.
+ *
+ * The Venus E sits on the house side of the meter, so without that last term a
+ * pack charging at 800 W reads as 800 W of consumption -- and as a saving of
+ * the same size while it gives the energy back. Rows logged before the battery
+ * existed have battPower NULL and simply keep the old sum; the dashboard card
+ * (instant_lib.php) derives the same figure the same way.
+ */
 function casa_power(array $row)
 {
   $pv = pv_clean($row['pvPower'] ?? null);
@@ -132,7 +193,9 @@ function casa_power(array $row)
   if (!is_numeric($pv) || !is_numeric($grid)) {
     return null;
   }
-  return (float) $pv + (float) $grid;
+  $batt = $row['battPower'] ?? null;
+  $casa = (float) $pv + (float) $grid;
+  return is_numeric($batt) ? $casa - (float) $batt : $casa;
 }
 
 /**
@@ -149,10 +212,72 @@ function prelievo_power(array $row)
   return max(0.0, (float) $grid);
 }
 
+/**
+ * House plus battery: what the whole installation is drawing.
+ *
+ * Only a charging battery counts. A discharging one is not consumption, it is
+ * where the consumption is coming from, and adding it signed would make the
+ * total smaller than the house on its own.
+ */
+function casa_batt_power(array $row)
+{
+  $casa = casa_power($row);
+  if ($casa === null) {
+    return null;
+  }
+  $batt = $row['battPower'] ?? null;
+  return is_numeric($batt) ? $casa + max(0.0, (float) $batt) : $casa;
+}
+
+/**
+ * The three battery figures the card shows but no register holds.
+ *
+ * The spreads are what say whether the pack is balanced -- in millivolts for
+ * the voltage one, because tens of mV is the scale that matters and three
+ * decimals of a volt hide it. The AC current is |W| / V: register 37004,
+ * "ac_current" in the community map, returns the AC power on this firmware.
+ */
+function batt_derived(string $variable, array $row)
+{
+  $n = static fn($k) => is_numeric($row[$k] ?? null) ? (float) $row[$k] : null;
+
+  // Rounded: 3.392 - 3.384 comes out of binary floating point as
+  // 8.000000000000007 mV, and that is what would land in the tooltip.
+  if ($variable === 'battTempSpread') {
+    $max = $n('battTemp');
+    $min = $n('battTempMin');
+    return ($max === null || $min === null) ? null : round($max - $min, 2);
+  }
+  if ($variable === 'battCellVSpread') {
+    $max = $n('battCellVMax');
+    $min = $n('battCellVMin');
+    return ($max === null || $min === null) ? null : round(($max - $min) * 1000, 1);
+  }
+  // battAcCurr
+  $w = $n('battAcW');
+  $v = $n('battAcV');
+  return ($w === null || $v === null || $v <= 50) ? null : round(abs($w) / $v, 2);
+}
+
+/** Variables computed from other columns rather than read from one. */
+const CALC_VARS = [
+  'casa', 'prelievo', 'casaBatt',
+  'battTempSpread', 'battCellVSpread', 'battAcCurr',
+];
+
 /** The derived ('calc') series, by variable name. */
 function calc_power(string $variable, array $row)
 {
-  return ($variable === 'prelievo') ? prelievo_power($row) : casa_power($row);
+  if ($variable === 'prelievo') {
+    return prelievo_power($row);
+  }
+  if ($variable === 'casaBatt') {
+    return casa_batt_power($row);
+  }
+  if ($variable === 'casa') {
+    return casa_power($row);
+  }
+  return batt_derived($variable, $row);
 }
 
 // ---- MULTI (compare) MODE ---------------------------------------------------
@@ -308,13 +433,17 @@ $labels = [];
 while ($row = $result->fetch_array(MYSQLI_ASSOC)) {
   if ($variable == 'press') {
     $val = round(press_qff($row['press'], $row['chip']), 1);
-  } elseif ($variable == 'casa' || $variable == 'prelievo') {
+  } elseif (in_array($variable, CALC_VARS, true)) {
     $val = calc_power($variable, $row);
     if ($val === null) {
       continue;
     }
   } else {
-    $val = ($variable === 'pvPower') ? pv_clean($row[$variable] ?? null) : $row[$variable];
+    // ?? null, not a bare read: a column added by store_lib.php's migration
+    // does not exist on this table until the next history row, and every row
+    // of the chart would otherwise raise "Undefined array key". A missing
+    // value becomes a gap in the series, which is what it is.
+    $val = ($variable === 'pvPower') ? pv_clean($row[$variable] ?? null) : ($row[$variable] ?? null);
   }
 
   // --- FILTER: Discard data < -50 (not for signed power channels) ---
@@ -340,13 +469,13 @@ while ($row = $result2->fetch_array(MYSQLI_ASSOC)) {
     $val = round(press_qff($row['press'], $row['chip']), 1);
   } else if ($variable == 'chip') {
     $val = round($row['cpuTemp'], 1);
-  } elseif ($variable == 'casa' || $variable == 'prelievo') {
+  } elseif (in_array($variable, CALC_VARS, true)) {
     $val = calc_power($variable, $row);
     if ($val === null) {
       continue;
     }
   } else {
-    $val = ($variable === 'pvPower') ? pv_clean($row[$variable] ?? null) : $row[$variable];
+    $val = ($variable === 'pvPower') ? pv_clean($row[$variable] ?? null) : ($row[$variable] ?? null);
   }
 
   // --- FILTER: Discard data < -50 (not for signed power channels) ---
@@ -546,7 +675,7 @@ if ($isMulti) {
   <?php
   // ENERGY SECTION (Shelly power channels): true kWh, integrated over the real
   // sample timestamps instead of assuming a fixed cadence.
-  if (in_array($variable, ['pvPower', 'gridPower', 'casa', 'prelievo'], true) && !$isMulti):
+  if (in_array($variable, ['pvPower', 'gridPower', 'casa', 'prelievo', 'battPower', 'casaBatt'], true) && !$isMulti):
 
     /**
      * Integrate a power channel between two timestamps.
@@ -559,7 +688,9 @@ if ($isMulti) {
       $empty = ['kwh' => 0.0, 'pos' => 0.0, 'neg' => 0.0];
       try {
         // mysqli throws when the columns are not there yet (PHP 8.1+).
-        $res = $link->query("SELECT data, pvPower, gridPower FROM dati_meteo WHERE data > $timedw AND data < $timeup ORDER BY data ASC");
+        // battPower is fetched even for the pvPower/gridPower series: it costs
+        // nothing and casa_power() needs it on the same rows.
+        $res = $link->query("SELECT data, pvPower, gridPower, battPower FROM dati_meteo WHERE data > $timedw AND data < $timeup ORDER BY data ASC");
       } catch (Throwable $e) {
         return $empty;
       }
@@ -572,7 +703,8 @@ if ($isMulti) {
       $prevT = null;
       $prevV = null;
       while ($row = $res->fetch_assoc()) {
-        $v = ($variable === 'casa' || $variable === 'prelievo') ? calc_power($variable, $row)
+        $v = ($variable === 'casa' || $variable === 'prelievo' || $variable === 'casaBatt')
+          ? calc_power($variable, $row)
           : (($variable === 'pvPower') ? pv_clean($row[$variable] ?? null) : ($row[$variable] ?? null));
         if ($v === null || !is_numeric($v)) {
           continue;
@@ -607,6 +739,21 @@ if ($isMulti) {
         <div class="mini-stat">
           <div class="label">Saldo ieri</div>
           <div class="value"><?php echo number_format($eIeri['kwh'], 2); ?> kWh</div>
+        </div>
+      <?php elseif ($variable === 'battPower'): ?>
+        <!-- Same split as the grid: charge and discharge are two different
+             questions, and a net figure hides both. -->
+        <div class="mini-stat">
+          <div class="label">Caricato oggi</div>
+          <div class="value"><?php echo number_format($eOggi['pos'], 2); ?> kWh</div>
+        </div>
+        <div class="mini-stat">
+          <div class="label">Scaricato oggi</div>
+          <div class="value"><?php echo number_format(abs($eOggi['neg']), 2); ?> kWh</div>
+        </div>
+        <div class="mini-stat">
+          <div class="label">Caricato ieri</div>
+          <div class="value"><?php echo number_format($eIeri['pos'], 2); ?> kWh</div>
         </div>
       <?php else: ?>
         <div class="mini-stat">

@@ -20,6 +20,36 @@ require_once __DIR__ . '/instant_store.php';
 // two files must stay includable together.
 defined('PV_ZERO_THRESHOLD') || define('PV_ZERO_THRESHOLD', 10.0);
 
+/** Battery power under this many watts is the pack feeding its own
+ * electronics, not charging or discharging. Same deadband as IDLE_W in the
+ * Pi's batteria.php, so the two dashboards never disagree about "in attesa". */
+defined('BATT_IDLE_W') || define('BATT_IDLE_W', 15.0);
+
+/** A battery reading older than this is not used: see battTs in store_lib.php. */
+defined('BATT_MAX_AGE') || define('BATT_MAX_AGE', 300);
+
+/**
+ * Battery diagnostics: three temperatures, four voltages, a current, plus the
+ * AC power the derived AC current is computed from.
+ *
+ * These started as live-row-only fields -- read by one card, charted by
+ * nothing. They are now written to `dati_meteo` as well, because every one of
+ * them is plottable from the diagnostics card and a chart needs a history to
+ * draw. Rows logged before that are simply NULL here and show as gaps.
+ *
+ * Defined here rather than in store_lib.php because both files need it and
+ * only this one is included by index.php.
+ */
+defined('BATTERY_DIAG_FIELDS') || define('BATTERY_DIAG_FIELDS', [
+  'battTempMin', 'battTempInt', 'battTempMos1', 'battTempMos2',
+  'battVolt', 'battCurr', 'battCellVMax', 'battCellVMin',
+  'battAcV', 'battAcHz', 'battAcW',
+]);
+
+/** Usable capacity of the pack, kWh — only to turn SoC into a "residuo".
+ * 5.12 kWh is what the Venus E 3.0 reports as its rated capacity. */
+defined('BATT_CAPACITY_KWH') || define('BATT_CAPACITY_KWH', 5.12);
+
 /** ---------- FORMATTING HELPERS ---------- */
 
 function fmt($val, $decimals = 1, $default = '--')
@@ -242,7 +272,77 @@ function meteo_build_payload(mysqli $link): array
   // pvPower/gridPower, and empty cards look broken.
   $emAvailable = ($safePv0 !== null || $safeGrid0 !== null);
 
+  /** ---------- 2c. MARSTEK VENUS E (HOME BATTERY) ----------
+   * battPower is signed the house way: > 0 charging, < 0 discharging.
+   * battTs is when the BATTERY was read, which is not when this page is being
+   * built: meteo.py keeps sending the rest of the reading while the battery
+   * bridge is down, and the stored figures would otherwise stay in the house
+   * load for ever. Past BATT_MAX_AGE the battery is simply treated as absent.
+   */
+  $safeBattPower0 = null;
+  $safeBattSoc0 = null;
+  $safeBattTemp0 = null;
+  // Diagnostics: field => value, only the ones actually stored. Kept as an
+  // array so a column the bridge does not publish yet simply does not appear,
+  // and the card shows a dash for it instead of a zero.
+  $battDiag = [];
+  $battAge = null;
+  try {
+    $resB = $link->query("SELECT `battPower`,`battSoc`,`battTemp`,`battTs` FROM `dati_instant` WHERE `id` = 1");
+    if ($resB instanceof mysqli_result && $rowB = $resB->fetch_assoc()) {
+      $battTs = is_numeric($rowB['battTs']) ? (int) $rowB['battTs'] : null;
+      $battAge = ($battTs !== null) ? $now - $battTs : null;
+      if ($battAge !== null && $battAge <= BATT_MAX_AGE) {
+        $safeBattPower0 = is_numeric($rowB['battPower']) ? (float) $rowB['battPower'] : null;
+        $safeBattSoc0 = is_numeric($rowB['battSoc']) ? (float) $rowB['battSoc'] : null;
+        // Hottest cell (the pack), not the electronics -- meteo.py picks it.
+        $safeBattTemp0 = is_numeric($rowB['battTemp']) ? (float) $rowB['battTemp'] : null;
+
+        // A second query, its own try/catch: these columns arrive with the
+        // diagnostics card and must not be able to take the three above down
+        // with them on a database that predates them.
+        try {
+          $cols = implode(',', array_map(
+            static fn($c) => "`$c`", BATTERY_DIAG_FIELDS));
+          $resD = $link->query("SELECT $cols FROM `dati_instant` WHERE `id` = 1");
+          if ($resD instanceof mysqli_result && $rowD = $resD->fetch_assoc()) {
+            foreach ($rowD as $k => $v) {
+              if (is_numeric($v)) {
+                $battDiag[$k] = (float) $v;
+              }
+            }
+          }
+        } catch (Throwable $e) {
+          // Diagnostics columns not created yet: the card shows dashes.
+        }
+      }
+    }
+  } catch (Throwable $e) {
+    // Columns not created yet (store_lib.php adds them on its first history row).
+  }
+
+  $battAvailable = ($safeBattPower0 !== null || $safeBattSoc0 !== null
+    || $safeBattTemp0 !== null);
+
+  /**
+   * House load, net of the battery.
+   *
+   * The Venus sits behind the grid meter, on the house side, so the Shelly
+   * cannot tell it apart from a dishwasher: pvPower + gridPower counts a pack
+   * charging at 800 W as 800 W of consumption, and hides the same amount while
+   * it discharges. Subtracting battPower leaves what the house is actually
+   * using. Checked against the meters at 09:57 on 2026-09-04: PV 1871 W,
+   * export 877 W, battery charging 770 W -> 224 W of real load, and
+   * 224 + 770 + 877 = 1871 balances exactly.
+   *
+   * With no fresh battery reading this falls back to the old sum, which is the
+   * right answer for a house that has no battery and the best available one
+   * for a house whose bridge is down.
+   */
   $safeCasa0 = ($safePv0 !== null && $safeGrid0 !== null) ? $safePv0 + $safeGrid0 : null;
+  if ($safeCasa0 !== null && $safeBattPower0 !== null) {
+    $safeCasa0 -= $safeBattPower0;
+  }
 
   // 24h extremes for the same two channels (again isolated from the main query).
   $em_max_pv = null;
@@ -267,6 +367,73 @@ function meteo_build_payload(mysqli $link): array
       }
     } catch (Throwable $e) {
       // dati_instant has the columns but dati_meteo does not (yet): no extremes.
+    }
+
+    // The house peak again, this time net of the battery. Deliberately a
+    // SECOND query rather than one more column in the one above: battPower
+    // reaches dati_meteo only when the ten-minute path adds it, and while it
+    // is missing mysqli throws -- which, from inside the same try, would take
+    // the PV and grid extremes down with it. They are unrelated to the
+    // battery and must not depend on it.
+    //
+    // COALESCE, not a bare subtraction: a row logged before the battery
+    // existed has battPower NULL, and NULL would swallow the whole expression
+    // and lose that row's peak.
+    $em_max_casa_batt = null;
+    try {
+      // Two peaks in one pass: the house alone, and the house plus whatever
+      // the battery was drawing. LEAST(...,0) is the algebra for "count the
+      // battery only while it charges" -- casa + max(0,b) is the same as
+      // pv + grid - min(b,0), and this way it stays one SQL expression.
+      $resCasaMM = $link->query(
+        "SELECT MAX(pvPower + gridPower - COALESCE(battPower, 0)) AS max_casa,
+                MAX(pvPower + gridPower - LEAST(COALESCE(battPower, 0), 0)) AS max_casa_batt
+         FROM dati_meteo
+         WHERE data >= {$time24hAgo} AND pvPower IS NOT NULL"
+      );
+      if ($resCasaMM instanceof mysqli_result && $rowCasaMM = $resCasaMM->fetch_assoc()) {
+        if (is_numeric($rowCasaMM['max_casa'])) {
+          $em_max_casa = (float) $rowCasaMM['max_casa'];
+        }
+        if (is_numeric($rowCasaMM['max_casa_batt'])) {
+          $em_max_casa_batt = (float) $rowCasaMM['max_casa_batt'];
+        }
+      }
+    } catch (Throwable $e) {
+      // No battPower column yet: keep the gross peak from the query above.
+    }
+  }
+
+  // 24h extremes for the battery itself: how full it got, how empty, and the
+  // hardest it pushed each way.
+  $batt_min_soc = null;
+  $batt_max_soc = null;
+  $batt_max_charge = null;
+  $batt_max_discharge = null;
+  $batt_min_temp = null;
+  $batt_max_temp = null;
+  if ($battAvailable) {
+    try {
+      $resBMM = $link->query(
+        "SELECT MIN(battSoc + 0) AS min_soc,
+                MAX(battSoc + 0) AS max_soc,
+                MAX(battPower + 0) AS max_charge,
+                MIN(battPower + 0) AS min_charge,
+                MIN(battTemp + 0) AS min_temp,
+                MAX(battTemp + 0) AS max_temp
+         FROM dati_meteo
+         WHERE data >= {$time24hAgo} AND battSoc IS NOT NULL"
+      );
+      if ($resBMM instanceof mysqli_result && $rowBMM = $resBMM->fetch_assoc()) {
+        $batt_min_soc = is_numeric($rowBMM['min_soc']) ? (float) $rowBMM['min_soc'] : null;
+        $batt_max_soc = is_numeric($rowBMM['max_soc']) ? (float) $rowBMM['max_soc'] : null;
+        $batt_max_charge = is_numeric($rowBMM['max_charge']) ? (float) $rowBMM['max_charge'] : null;
+        $batt_max_discharge = is_numeric($rowBMM['min_charge']) ? (float) $rowBMM['min_charge'] : null;
+        $batt_min_temp = is_numeric($rowBMM['min_temp']) ? (float) $rowBMM['min_temp'] : null;
+        $batt_max_temp = is_numeric($rowBMM['max_temp']) ? (float) $rowBMM['max_temp'] : null;
+      }
+    } catch (Throwable $e) {
+      // No battery history yet: the card shows its live figures only.
     }
   }
 
@@ -485,6 +652,91 @@ function meteo_build_payload(mysqli $link): array
     $gridFlow = 'Equilibrio';
   }
 
+  /** ---------- 7b. BATTERY STATE ----------
+   * Derived from the power, not read: `state` on the Venus says what it has
+   * been TOLD to do, not what it is doing. BATT_IDLE_W keeps a pack running
+   * its own electronics from reading as a discharge.
+   */
+  $battCharging = ($safeBattPower0 !== null && $safeBattPower0 > BATT_IDLE_W);
+  $battDischarging = ($safeBattPower0 !== null && $safeBattPower0 < -BATT_IDLE_W);
+  if ($safeBattPower0 === null) {
+    $battFlow = '--';
+    $battColor = 'var(--text-muted)';
+  } elseif ($battCharging) {
+    $battFlow = '&#8595; In carica';
+    $battColor = 'var(--accent-green)';
+  } elseif ($battDischarging) {
+    $battFlow = '&#8593; In scarica';
+    $battColor = 'var(--accent-orange)';
+  } else {
+    $battFlow = 'In attesa';
+    $battColor = 'var(--text-muted)';
+  }
+
+  /* Cell temperature, coloured by what it means for the pack rather than by
+   * how warm it sounds. Below 0 °C the BMS refuses to CHARGE (discharge is
+   * fine down to -20), which is normal on a winter night and worth flagging
+   * as a state, not an alarm; above 45 °C it starts derating. */
+  $battTempColor = 'var(--text-muted)';
+  $battTempNote = '';
+  if ($safeBattTemp0 !== null) {
+    if ($safeBattTemp0 < 0) {
+      $battTempColor = 'var(--accent-ice)';
+      $battTempNote = ' carica bloccata dal BMS';
+    } elseif ($safeBattTemp0 >= 45) {
+      $battTempColor = 'var(--accent-red)';
+      $battTempNote = ' in derating';
+    } elseif ($safeBattTemp0 >= 35) {
+      $battTempColor = 'var(--accent-orange)';
+    } else {
+      $battTempColor = 'var(--accent-teal)';
+    }
+  }
+
+  /* ---------- 7c. PACK DIAGNOSTICS ----------
+   * One card, three families: temperatures, voltages, currents. The two
+   * spreads are the interesting derived numbers -- a pack whose cells sit
+   * within a few mV and a couple of degrees of each other is balanced, and
+   * both go wrong long before either extreme looks alarming on its own.
+   */
+  $d = static fn(string $k) => $battDiag[$k] ?? null;
+  $fmtNum = static fn($v, int $dec, string $unit)
+    => ($v === null) ? '--' : number_format((float) $v, $dec) . ' ' . $unit;
+
+  $cellTempSpread = ($safeBattTemp0 !== null && $d('battTempMin') !== null)
+    ? $safeBattTemp0 - $d('battTempMin') : null;
+  $cellVoltSpread = ($d('battCellVMax') !== null && $d('battCellVMin') !== null)
+    ? ($d('battCellVMax') - $d('battCellVMin')) * 1000 : null;   // in mV
+
+  /* AC current is DERIVED, not read. Register 37004 is `ac_current` in the
+   * community register map, but on this firmware it returns the AC power --
+   * the same word as 30006, checked over three samples. |W| / V is the honest
+   * substitute, and the card says so rather than implying a measurement. */
+  $acCurrent = ($d('battAcW') !== null && $d('battAcV') !== null && $d('battAcV') > 50)
+    ? abs($d('battAcW')) / $d('battAcV') : null;
+
+  /* Casa + batteria: what the house and the pack are drawing together.
+   *
+   * Only a CHARGING battery is added. A discharging one is not consumption --
+   * it is where part of the consumption is coming from, and adding it with its
+   * own sign would subtract, making the total smaller than the house alone.
+   */
+  $battDraw = ($safeBattPower0 !== null) ? max(0.0, $safeBattPower0) : null;
+  $safeCasaBatt0 = ($safeCasa0 !== null)
+    ? $safeCasa0 + ($battDraw ?? 0.0)
+    : null;
+
+  // How much of the load is NOT bought from the grid -- covered by the panels
+  // directly or by the battery giving back. Computed from the import rather
+  // than from pvPower, because with a battery in the middle the PV figure on
+  // its own no longer says what the house consumed.
+  $prelievo0 = ($safeGrid0 === null) ? null : max(0.0, $safeGrid0);
+  $selfShare = null;
+  if ($safeCasa0 !== null && $prelievo0 !== null && $safeCasa0 > 0) {
+    $selfShare = (int) round(min(100, max(0, ($safeCasa0 - $prelievo0) / $safeCasa0 * 100)));
+  }
+  $selfLabel = $battAvailable ? '% da FV e batteria' : '% da fotovoltaico';
+
   /** ---------- 8. RENDER-READY PAYLOAD ---------- */
   return [
     'ts' => $safeData0,
@@ -492,6 +744,9 @@ function meteo_build_payload(mysqli $link): array
     // minute: without them two consecutive updates look identically timed.
     'headerTime' => date('d-m-y H:i:s', $safeData0),
     'emAvailable' => $emAvailable,
+    // Like emAvailable: the card only exists in the markup while the battery
+    // is reporting, so the browser reloads rather than patching when it flips.
+    'battAvailable' => $battAvailable,
 
     'tempSole' => [
       'val' => ($safeTemp0 <= -99 ? '--' : (string) $safeTemp0),
@@ -577,13 +832,89 @@ function meteo_build_payload(mysqli $link): array
       'max' => ($em_max_grid === null ? '--' : fmtW(max(0, $em_max_grid))),
     ],
 
+    // Consumo casa is net of the battery (see the derivation above), so it is
+    // what the appliances are drawing rather than what the meters see.
     'casa' => [
       'val' => ($safeCasa0 === null ? '--' : (string) round($safeCasa0)),
-      'shareShow' => ($safeCasa0 !== null && $safePv0 !== null && $safeCasa0 > 0),
-      'share' => ($safeCasa0 !== null && $safePv0 !== null && $safeCasa0 > 0)
-        ? round(min(100, ($safePv0 / $safeCasa0) * 100)) . '% da fotovoltaico'
-        : '',
+      'shareShow' => ($selfShare !== null),
+      'share' => ($selfShare !== null) ? $selfShare . $selfLabel : '',
       'peak' => fmtW($em_max_casa),
+    ],
+
+    /* Casa + batteria. Deliberately its own card rather than a second figure
+     * on the one above: the two answer different questions -- what the house
+     * is using, and what the whole installation is pulling while it also
+     * fills the battery. */
+    'casaBatt' => [
+      'val' => ($safeCasaBatt0 === null ? '--' : (string) round($safeCasaBatt0)),
+      'charging' => ($battDraw !== null && $battDraw > BATT_IDLE_W),
+      // The split, so the number is never a mystery: house plus battery. The
+      // "solo casa" branch is what the card would say while the battery is
+      // idle -- index.php hides the whole card in that case, and the string is
+      // kept because live.php serves this payload to other consumers too.
+      'breakdown' => ($safeCasa0 === null) ? '--'
+        : (($battDraw !== null && $battDraw > BATT_IDLE_W)
+          ? fmtW($safeCasa0) . ' casa + ' . fmtW($battDraw) . ' batteria'
+          : 'solo casa'),
+      'breakdownColor' => ($battDraw !== null && $battDraw > BATT_IDLE_W)
+        ? 'var(--accent-green)' : 'var(--text-muted)',
+      'peak' => fmtW($em_max_casa_batt ?? $em_max_casa),
+    ],
+
+    /* Everything the pack reports about itself. Rendered as plain strings
+     * with their units: nothing here is charted or compared, it is read. */
+    'battDiag' => [
+      'show' => ($battDiag !== []),
+      'tCellMax'  => $fmtNum($safeBattTemp0, 1, '°C'),
+      'tCellMin'  => $fmtNum($d('battTempMin'), 1, '°C'),
+      'tSpread'   => $fmtNum($cellTempSpread, 1, '°C'),
+      'tSpreadWarn' => ($cellTempSpread !== null && $cellTempSpread > 5),
+      'tInt'      => $fmtNum($d('battTempInt'), 1, '°C'),
+      'tMos1'     => $fmtNum($d('battTempMos1'), 1, '°C'),
+      'tMos2'     => $fmtNum($d('battTempMos2'), 1, '°C'),
+      'vPack'     => $fmtNum($d('battVolt'), 2, 'V'),
+      'vCellMax'  => $fmtNum($d('battCellVMax'), 3, 'V'),
+      'vCellMin'  => $fmtNum($d('battCellVMin'), 3, 'V'),
+      // In mV: the digit that matters here is the one three decimals of a
+      // volt hide.
+      'vSpread'   => ($cellVoltSpread === null) ? '--'
+        : round($cellVoltSpread) . ' mV',
+      'vSpreadWarn' => ($cellVoltSpread !== null && $cellVoltSpread > 50),
+      'vAc'       => $fmtNum($d('battAcV'), 1, 'V'),
+      'hz'        => $fmtNum($d('battAcHz'), 2, 'Hz'),
+      'iPack'     => $fmtNum($d('battCurr'), 1, 'A'),
+      'iAc'       => $fmtNum($acCurrent, 1, 'A'),
+    ],
+
+    'batteria' => [
+      'val' => ($safeBattSoc0 === null ? '--' : (string) round($safeBattSoc0)),
+      // Width of the fill bar, as a CSS length the poller can drop straight in.
+      'fill' => ($safeBattSoc0 === null ? '0%'
+        : max(0, min(100, round($safeBattSoc0))) . '%'),
+      'fillColor' => ($safeBattSoc0 === null ? 'var(--text-muted)'
+        : ($safeBattSoc0 <= 15 ? 'var(--accent-red)'
+          : ($safeBattSoc0 <= 35 ? 'var(--accent-orange)' : 'var(--accent-green)'))),
+      'charging' => $battCharging,
+      'discharging' => $battDischarging,
+      'flow' => $battFlow,
+      'flowColor' => $battColor,
+      // Signed watts as the battery reports them, so the card says how hard it
+      // is working as well as which way.
+      'power' => ($safeBattPower0 === null ? '--' : fmtW(abs($safeBattPower0))),
+      'residuo' => ($safeBattSoc0 === null ? '--'
+        : number_format($safeBattSoc0 / 100 * BATT_CAPACITY_KWH, 2) . ' kWh'),
+      'range' => ($batt_min_soc === null || $batt_max_soc === null) ? '--'
+        : round($batt_min_soc) . '% - ' . round($batt_max_soc) . '%',
+      // Cella piu' calda: e' quella su cui lavorano i limiti del BMS, mentre
+      // `temperature` sulla batteria e' l'elettronica e corre 6 gradi sopra.
+      'temp' => ($safeBattTemp0 === null ? '--' : number_format($safeBattTemp0, 1) . ' °C'),
+      'tempShow' => ($safeBattTemp0 !== null),
+      'tempColor' => $battTempColor,
+      'tempNote' => $battTempNote,
+      'tempRange' => ($batt_min_temp === null || $batt_max_temp === null) ? '--'
+        : round($batt_min_temp) . '° - ' . round($batt_max_temp) . '°',
+      'maxCharge' => ($batt_max_charge === null) ? '--' : fmtW(max(0, $batt_max_charge)),
+      'maxDischarge' => ($batt_max_discharge === null) ? '--' : fmtW(abs(min(0, $batt_max_discharge))),
     ],
   ];
 }

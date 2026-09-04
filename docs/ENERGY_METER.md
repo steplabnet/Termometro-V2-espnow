@@ -30,10 +30,22 @@ before the threshold existed.
 House load is derived, never measured:
 
 ```
-casa_power = pv_power + grid_power
+casa_power = pv_power + grid_power                     (local dashboards)
+casa       = pvPower  + gridPower - battPower          (remote dashboard)
 ```
 
 (export is negative, so it subtracts — exactly what the house is not using.)
+
+The second form is the one to trust since 2026-09-04. The Marstek Venus E sits
+on the **house side** of the meter, so the Shelly cannot tell it from an
+appliance: a pack charging at 800 W reads as 800 W of consumption, and hides
+the same amount while it gives the energy back. Subtracting `battPower`
+(+ = charging) leaves what the house is really using. Checked against all three
+meters at once: PV 1871 W, export 877 W, battery charging 770 W, real load
+224 W — and 224 + 770 + 877 = 1871.
+
+The local dashboards (`rapsberry meteo/index.php`, `batteria.php`) still show
+the gross figure; only the remote one is net. See `BATTERY_VENUS.md`.
 
 ### PV deadband
 
@@ -139,6 +151,15 @@ outage leaves the last known values on screen rather than showing 0 W.
 
 ## Dashboards
 
+### Local (`rapsberry meteo/batteria.php`)
+
+- **Temperature, tensioni e correnti** group: the same fourteen figures as the
+  remote card, in the page's own three-column layout.
+- The headline temperature card shows the **hottest cell** with min, spread and
+  the electronics reading beneath it. It used to show the electronics figure
+  coloured with the *cell* thresholds — harmless over the local API, where that
+  reading really was the pack, and wrong once Modbus started publishing both.
+
 ### Local (`rapsberry meteo/index.php`)
 
 - **Energia (Shelly EM)** panel: produzione FV, scambio rete (with direction
@@ -159,7 +180,45 @@ outage leaves the last known values on screen rather than showing 0 W.
   comes from the ADC series, which is the one with seven days of history behind
   it.
 - **Scambio Rete** and **Consumo Casa** follow the Temperatura Interno card, and
-  appear only once a real reading has been stored.
+  appear only once a real reading has been stored. **Consumo Casa is net of the
+  battery** (see the formula above); while the battery is actually moving, a
+  "Con batteria" figure appears next to the 24 h peak with the gross number the
+  meters see. Its share line reads "% da FV e batteria" rather than
+  "% da fotovoltaico", because with a battery in the middle the PV figure alone
+  no longer says how much of the load was self-covered — it is computed from
+  what was *not* bought (`(casa - prelievo) / casa`).
+- **Casa + Batteria** card: `casa + max(0, battPower)` — what the whole
+  installation is drawing, with the split ("621 W casa + 757 W batteria")
+  under it. Only a *charging* battery is added: a discharging one is not
+  consumption, it is where the consumption is coming from, and adding it
+  signed would make the total smaller than the house alone.
+
+  The card is **hidden unless the battery is charging** (past the ±15 W
+  deadband) — idle or discharging it would only repeat Consumo Casa next to
+  it. It stays in the DOM, hidden, with `data-live-show="casaBatt.charging"`,
+  so the poller brings it back the moment charging resumes instead of waiting
+  for a page reload.
+- **Diagnostica Batteria** card: everything the pack reports about itself, in
+  three groups — temperatures (cell max/min and their spread, internal, both
+  MOS sensors), voltages (pack, cell max/min, their spread in mV, AC with
+  frequency) and currents (pack, and AC *derived* from |W| / V). The two
+  spreads turn amber past 5 °C and 50 mV, which is where a pack stops being
+  balanced. **Every value links to its own chart**, so this is the one card not
+  wrapped in a single `<a>` — a link inside a link is not valid HTML, hence its
+  hand-written markup and the `.diag-rows a` rule that undoes the global anchor
+  styling.
+
+  The eleven fields behind it (`BATTERY_DIAG_FIELDS` in `instant_lib.php`) go
+  to **both** tables. They began as live-row-only — read by one card, charted
+  by nothing — and moved into `dati_meteo` when the card became clickable,
+  because a chart needs a history to draw. Rows logged before that are NULL and
+  show as gaps.
+- **Batteria** card: state of charge with a fill bar, charge/discharge state
+  (green charging, orange discharging, ±15 W deadband), cell temperature
+  (coloured on the BMS thresholds), current power, residual kWh and the 24 h
+  SoC range. It is in the markup only while the battery is
+  reporting, exactly like the two meter cards — `battAvailable` in the payload,
+  and the browser reloads rather than patches when it flips.
 
 ### Charts (`server_remoto/grafico.php`)
 
@@ -167,11 +226,28 @@ outage leaves the last known values on screen rather than showing 0 W.
 |-----|--------|
 | `grafico.php?var=pvPower` | production, today vs yesterday |
 | `grafico.php?var=gridPower` | grid exchange, today vs yesterday |
-| `grafico.php?var=casa` | derived house load, today vs yesterday |
+| `grafico.php?var=casa` | derived house load (net of the battery), today vs yesterday |
+| `grafico.php?var=battPower` | battery power, + charging / − discharging |
+| `grafico.php?var=battSoc` | state of charge, % |
+| `grafico.php?var=battTemp` | hottest cell, °C |
+| `grafico.php?var=casaBatt` | house + charging battery, today vs yesterday |
+| `battTempMin`, `battTempInt`, `battTempMos1`, `battTempMos2` | the other pack temperatures |
+| `battVolt`, `battCellVMax`, `battCellVMin`, `battAcV` | voltages |
+| `battCurr`, `battAcW`, `battAcHz` | pack current, AC power, mains frequency |
+| `battTempSpread`, `battCellVSpread`, `battAcCurr` | derived: the two balance spreads and \|W\| / V |
+
+The diagnostics are single-variable charts only: they are deliberately kept out
+of `MULTI_CATALOG`, which would otherwise grow to two dozen checkboxes in the
+compare toolbar.
 | `grafico.php?var=multi&v[]=pvPower&v[]=gridPower&v[]=casa` | overlay |
 
-These three variables are exempt from the `< -50 = dead sensor` filter that
-guards the temperature series, since grid export is legitimately very negative.
+These variables (plus `battPower`, negative while discharging) are exempt from
+the `< -50 = dead sensor` filter that guards the temperature series, since grid
+export is legitimately very negative. `battSoc` is not exempt: a percentage
+never legitimately goes below zero.
+
+`var=battPower` gets its own kWh boxes, split the way the grid chart is:
+**caricato oggi**, **scaricato oggi**, caricato ieri.
 
 Under each chart the kWh boxes are integrated over the real sample timestamps
 (gaps longer than 1 h are not bridged): production/consumption show today,
