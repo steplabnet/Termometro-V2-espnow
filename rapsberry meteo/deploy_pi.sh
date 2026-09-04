@@ -39,6 +39,8 @@ TARGETS=(
   "bots.php|/var/www/html|"
   "cronotermostato.php|/var/www/html|"
   "index.php|/var/www/html|"
+  "batteria.php|/var/www/html|"
+  "battery_bridge.py|/var/www/html|meteo-battery.service"
   "check_energy.py|/var/www/html|"
 )
 
@@ -82,12 +84,23 @@ if [ ${#deployed[@]} -eq 0 ]; then
   exit 1
 fi
 
-# Restart each unit once, even if several of its files changed.
+# Restart each unit once, even if several of its files changed. A unit that is
+# not installed on the Pi yet (the battery bridge, until its service file is
+# put in place) is skipped instead of aborting the whole deploy.
 if [ ${#units[@]} -gt 0 ]; then
   uniq_units=$(printf '%s\n' "${units[@]}" | sort -u | tr '\n' ' ')
-  echo
-  echo "--> restarting: $uniq_units"
-  sh_remote "sudo systemctl restart $uniq_units"
+  for u in $uniq_units; do
+    if sh_remote "systemctl list-unit-files '$u' --no-legend" | grep -q .; then
+      present="${present:-} $u"
+    else
+      echo "--> skipping restart: $u is not installed on the Pi"
+    fi
+  done
+  if [ -n "${present:-}" ]; then
+    echo
+    echo "--> restarting:$present"
+    sh_remote "sudo systemctl restart$present"
+  fi
 fi
 
 echo
@@ -105,10 +118,10 @@ for path in "${deployed[@]}"; do
   fi
 done
 
-if [ ${#units[@]} -gt 0 ]; then
+if [ -n "${present:-}" ]; then
   echo
-  sh_remote "systemctl --no-pager --property=Id,ActiveState,SubState show $uniq_units | grep -v '^$'" || true
-  sh_remote "pgrep -af 'meteo.py|mqtt_receiver.py|alarm_watcher.py|crono_watcher.py'"
+  sh_remote "systemctl --no-pager --property=Id,ActiveState,SubState show$present | grep -v '^$'" || true
+  sh_remote "pgrep -af 'meteo.py|mqtt_receiver.py|alarm_watcher.py|crono_watcher.py|battery_bridge.py'"
 fi
 
 echo

@@ -1,0 +1,17 @@
+[Unit]
+Description=Marstek Venus E battery (local API / Modbus) -> MQTT bridge
+After=network-online.target mosquitto.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/var/www/html
+ExecStart=/usr/bin/python3 /var/www/html/battery_bridge.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

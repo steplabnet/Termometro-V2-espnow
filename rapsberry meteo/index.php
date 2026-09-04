@@ -896,6 +896,14 @@ if ($api !== '') {
         </svg>
         Cronotermostato
       </a>
+      <a class="header-link" href="batteria.php" title="Batteria Marstek Venus E">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
+          stroke-linejoin="round" aria-hidden="true">
+          <rect x="2" y="7" width="16" height="10" rx="2" />
+          <line x1="22" y1="11" x2="22" y2="13" />
+        </svg>
+        Batteria
+      </a>
       <a class="header-link" href="alarms.php" title="Configura allarmi">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"
           stroke-linejoin="round" aria-hidden="true">
