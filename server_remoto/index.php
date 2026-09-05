@@ -416,6 +416,23 @@ function showStyle($cond): string
       color: var(--accent-ice);
     }
 
+    /* Quadro principale: stessa griglia della diagnostica batteria (riusa
+       .diag-group / .diag-rows), altro colore perche' guarda l'impianto e non
+       il pacco. Nessun valore e' un link: queste letture non sono storicizzate,
+       quindi non c'e' grafico da aprire. */
+    .border-quadro {
+      border-top-color: var(--accent-purple);
+    }
+
+    .icon-quadro {
+      color: var(--accent-purple);
+    }
+
+    .diag-rows .v .dir {
+      font-weight: 600;
+      color: var(--text-muted);
+    }
+
     .diag-group {
       width: 100%;
       font-size: 0.62rem;
@@ -942,7 +959,67 @@ function showStyle($cond): string
         </a>
       </div>
 
-      <!-- 9. Prelievo dalla rete: 0 quando il fotovoltaico copre tutto il
+    <?php endif; ?>
+
+    <?php if (!empty($p['battAvailable'])): ?>
+      <!-- 9. Batteria Marstek Venus E. Il consumo casa qui sopra e' gia' al
+           netto di questa: quando la batteria carica, quei watt non sono
+           consumo della casa ma accumulo. -->
+      <div class="card border-batt <?php echo $p['batteria']['discharging'] ? 'discharging' : ''; ?>"
+        data-card="batteria">
+        <a href="grafico.php?var=battSoc">
+          <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-batt" viewBox="0 0 24 24"
+            fill="currentColor">
+            <path d="M4 7h13a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2zm0 2v6h13V9H4z" />
+            <path d="M20 10h2v4h-2v-4z" />
+            <path d="M11 8.5 7.5 13H10l-1 3.5L12.5 12H10l1-3.5z" />
+          </svg>
+          <div class="card-label">Batteria</div>
+          <div class="card-value"><span data-live="batteria.val"><?php echo $p['batteria']['val']; ?></span><span
+              class="card-unit">%</span></div>
+
+          <div class="batt-bar">
+            <div class="batt-fill" data-live-width="batteria.fill" data-live-bg="batteria.fillColor"
+              style="width:<?php echo $p['batteria']['fill']; ?>; background:<?php echo $p['batteria']['fillColor']; ?>;">
+            </div>
+          </div>
+
+          <div class="flow-state" style="color:<?php echo $p['batteria']['flowColor']; ?>;"
+            data-live-html="batteria.flow" data-live-color="batteria.flowColor">
+            <?php echo $p['batteria']['flow']; ?>
+          </div>
+
+          <!-- Quanto manca, a che potenza media, a che ritmo e fino a che
+               ora: in scarica fino al 12% di riserva, in carica fino al 100%.
+               Sempre sul ritmo dell'ultima mezz'ora. -->
+          <div style="margin-top:4px; font-size:0.7rem; font-weight:700; color:<?php echo $p['batteria']['etaColor']; ?>; <?php echo showStyle($p['batteria']['etaShow']); ?>"
+            data-live-show="batteria.etaShow" data-live-color="batteria.etaColor">
+            &#9203; <span data-live="batteria.eta"><?php echo $p['batteria']['eta']; ?></span><span
+              data-live-html="batteria.etaClock"><?php echo $p['batteria']['etaClock']; ?></span>
+          </div>
+
+          <!-- Cella piu' calda, non l'elettronica: e' quella su cui lavorano i
+               limiti del BMS. Sotto 0 gradi la carica si ferma da sola. -->
+          <div style="margin-top:4px; font-size:0.7rem; font-weight:700; color:<?php echo $p['batteria']['tempColor']; ?>; <?php echo showStyle($p['batteria']['tempShow']); ?>"
+            data-live-show="batteria.tempShow" data-live-color="batteria.tempColor">
+            &#127777; <span data-live="batteria.temp"><?php echo $p['batteria']['temp']; ?></span><span
+              data-live="batteria.tempNote"><?php echo $p['batteria']['tempNote']; ?></span>
+          </div>
+
+          <div class="minmax-row">
+            <div class="minmax-item"><span class="minmax-label">Potenza</span><span class="minmax-val"
+                data-live="batteria.power"><?php echo $p['batteria']['power']; ?></span></div>
+            <div class="minmax-item"><span class="minmax-label">Residuo</span><span class="minmax-val"
+                data-live="batteria.residuo"><?php echo $p['batteria']['residuo']; ?></span></div>
+            <div class="minmax-item"><span class="minmax-label">Range 24h</span><span class="minmax-val"
+                data-live="batteria.range"><?php echo $p['batteria']['range']; ?></span></div>
+          </div>
+        </a>
+      </div>
+    <?php endif; ?>
+
+    <?php if ($emAvailable): ?>
+      <!-- 9b. Prelievo dalla rete: 0 quando il fotovoltaico copre tutto il
            consumo, altrimenti la parte importata dello scambio rete. -->
       <div class="card border-draw <?php echo $p['prelievo']['drawing'] ? 'drawing' : ''; ?>" data-card="prelievo">
         <a href="grafico.php?var=prelievo">
@@ -1022,56 +1099,53 @@ function showStyle($cond): string
       <?php endif; ?>
     <?php endif; ?>
 
-    <?php if (!empty($p['battAvailable'])): ?>
-      <!-- 11. Batteria Marstek Venus E. Il consumo casa qui sopra e' gia' al
-           netto di questa: quando la batteria carica, quei watt non sono
-           consumo della casa ma accumulo. -->
-      <div class="card border-batt <?php echo $p['batteria']['discharging'] ? 'discharging' : ''; ?>"
-        data-card="batteria">
-        <a href="grafico.php?var=battSoc">
-          <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-batt" viewBox="0 0 24 24"
-            fill="currentColor">
-            <path d="M4 7h13a2 2 0 0 1 2 2v6a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V9a2 2 0 0 1 2-2zm0 2v6h13V9H4z" />
-            <path d="M20 10h2v4h-2v-4z" />
-            <path d="M11 8.5 7.5 13H10l-1 3.5L12.5 12H10l1-3.5z" />
-          </svg>
-          <div class="card-label">Batteria</div>
-          <div class="card-value"><span data-live="batteria.val"><?php echo $p['batteria']['val']; ?></span><span
-              class="card-unit">%</span></div>
+    <?php if ($emAvailable && !empty($p['quadro']['show'])): ?>
+      <!-- 12. Quadro principale: la fotografia elettrica dietro alle due card
+           di potenza. Tensione e frequenza sono di linea (un solo contatore,
+           due TA sulla stessa monofase: le due tensioni misurate sono la
+           stessa), le correnti no -- una e' quella dell'inverter, l'altra
+           quella che attraversa il contatore.
+           Le correnti arrivano SENZA segno: il verso sta solo nel segno di
+           gridPower, per questo accanto agli ampere della rete c'e' la parola
+           che lo dice. -->
+      <div class="card border-quadro" data-card="quadro"
+        style="display:flex; flex-direction:column; align-items:center;">
+        <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-quadro" viewBox="0 0 24 24"
+          fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="3" width="18" height="18" rx="2" />
+          <line x1="3" y1="9" x2="21" y2="9" />
+          <line x1="9" y1="9" x2="9" y2="21" />
+          <line x1="6" y1="6" x2="6" y2="6" />
+        </svg>
+        <div class="card-label">Quadro Principale</div>
+        <div style="font-size:0.6rem; color:var(--text-muted); margin-bottom:2px;">letture dei due TA del contatore</div>
 
-          <div class="batt-bar">
-            <div class="batt-fill" data-live-width="batteria.fill" data-live-bg="batteria.fillColor"
-              style="width:<?php echo $p['batteria']['fill']; ?>; background:<?php echo $p['batteria']['fillColor']; ?>;">
-            </div>
-          </div>
+        <div class="diag-group">Linea</div>
+        <div class="diag-rows">
+            <span class="k">Tensione</span><span class="v" data-live="quadro.vLine"><?php echo $p['quadro']['vLine']; ?></span>
+            <span class="k">Frequenza</span><span class="v" data-live="quadro.hz"><?php echo $p['quadro']['hz']; ?></span>
+        </div>
 
-          <div class="flow-state" style="color:<?php echo $p['batteria']['flowColor']; ?>;"
-            data-live-html="batteria.flow" data-live-color="batteria.flowColor">
-            <?php echo $p['batteria']['flow']; ?>
-          </div>
+        <div class="diag-group">Scambio rete</div>
+        <div class="diag-rows">
+            <span class="k">Corrente</span><span class="v"><span data-live="quadro.iGrid"><?php echo $p['quadro']['iGrid']; ?></span> <span class="dir" data-live="quadro.dirGrid"><?php echo $p['quadro']['dirGrid']; ?></span></span>
+            <span class="k">Potenza attiva</span><span class="v" data-live="quadro.wGrid"><?php echo $p['quadro']['wGrid']; ?></span>
+            <span class="k">Fattore di potenza</span><span class="v" data-live="quadro.pfGrid"><?php echo $p['quadro']['pfGrid']; ?></span>
+            <span class="k">Tensione</span><span class="v" data-live="quadro.vGrid"><?php echo $p['quadro']['vGrid']; ?></span>
+        </div>
 
-          <!-- Cella piu' calda, non l'elettronica: e' quella su cui lavorano i
-               limiti del BMS. Sotto 0 gradi la carica si ferma da sola. -->
-          <div style="margin-top:4px; font-size:0.7rem; font-weight:700; color:<?php echo $p['batteria']['tempColor']; ?>; <?php echo showStyle($p['batteria']['tempShow']); ?>"
-            data-live-show="batteria.tempShow" data-live-color="batteria.tempColor">
-            &#127777; <span data-live="batteria.temp"><?php echo $p['batteria']['temp']; ?></span><span
-              data-live="batteria.tempNote"><?php echo $p['batteria']['tempNote']; ?></span>
-          </div>
-
-          <div class="minmax-row">
-            <div class="minmax-item"><span class="minmax-label">Potenza</span><span class="minmax-val"
-                data-live="batteria.power"><?php echo $p['batteria']['power']; ?></span></div>
-            <div class="minmax-item"><span class="minmax-label">Residuo</span><span class="minmax-val"
-                data-live="batteria.residuo"><?php echo $p['batteria']['residuo']; ?></span></div>
-            <div class="minmax-item"><span class="minmax-label">Range 24h</span><span class="minmax-val"
-                data-live="batteria.range"><?php echo $p['batteria']['range']; ?></span></div>
-          </div>
-        </a>
+        <div class="diag-group">Fotovoltaico</div>
+        <div class="diag-rows">
+            <span class="k">Corrente</span><span class="v" data-live="quadro.iPv"><?php echo $p['quadro']['iPv']; ?></span>
+            <span class="k">Potenza attiva</span><span class="v" data-live="quadro.wPv"><?php echo $p['quadro']['wPv']; ?></span>
+            <span class="k">Fattore di potenza</span><span class="v" data-live="quadro.pfPv"><?php echo $p['quadro']['pfPv']; ?></span>
+            <span class="k">Tensione</span><span class="v" data-live="quadro.vPv"><?php echo $p['quadro']['vPv']; ?></span>
+        </div>
       </div>
     <?php endif; ?>
 
     <?php if (!empty($p['battAvailable']) && !empty($p['battDiag']['show'])): ?>
-      <!-- 12. Tutto quello che il pacco dice di se'. La corrente AC e' ricavata
+      <!-- 13. Tutto quello che il pacco dice di se'. La corrente AC e' ricavata
            da |W| / V: il registro che la mappa chiama ac_current, su questo
            firmware, restituisce la potenza. -->
       <!-- Questa card NON e' avvolta in un <a> come le altre: ogni valore

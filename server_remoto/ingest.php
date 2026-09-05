@@ -74,6 +74,9 @@ $fields = [
   'battTempMin', 'battTempInt', 'battTempMos1', 'battTempMos2',
   'battVolt', 'battCurr', 'battCellVMax', 'battCellVMin',
   'battAcV', 'battAcHz', 'battAcW',
+  // Shelly Pro EM-50 clamp detail: voltage, current and power factor per
+  // clamp plus the mains frequency. Live row only -- see EM_DETAIL_FIELDS.
+  'emPvV', 'emPvA', 'emPvPf', 'emGridV', 'emGridA', 'emGridPf', 'emHz',
 ];
 $reading = [];
 foreach ($fields as $f) {
@@ -90,7 +93,12 @@ try {
   $result = meteo_store_reading($link, $reading);
 } catch (Throwable $e) {
   error_log('ingest failed: ' . $e->getMessage());
-  ingest_fail(500, 'store failed');
+  // The message goes back to the caller as well as to the log: the only
+  // clients that get here are holding the shared secret, and without it a
+  // storage failure is invisible from outside (display_errors is off on this
+  // vhost and its PHP log is not readable from the web). mqtt_ingest.py logs
+  // the response body, so a broken store says why in the bridge's journal.
+  ingest_fail(500, 'store failed: ' . $e->getMessage());
 }
 
 echo json_encode([

@@ -55,6 +55,26 @@ $ICONS = ['', '🔔', '⚠️', '🚨', '🔥', '❄️', '🌡️', '💧', '�
 // sensor. Must match STALE_ANY in alarm_watcher.py.
 define('STALE_ANY_SOURCE', '__any__');
 
+// ── Allarmi predefiniti ─────────────────────────────────────────────────────
+// Regole "chiavi in mano": la condizione è cablata nel watcher, qui si possono
+// solo accendere e spegnere. Servono per i casi che non si esprimono con una
+// soglia su una sorgente di alarms.php (qui: la batteria non vede più la rete,
+// che si legge dalla tabella `batteria` e non dalla riga meteo).
+// Le chiavi devono coincidere con PRESET_ALARMS in alarm_watcher.py.
+$PRESETS = [
+  'battery_no_ac' => [
+    'label'           => 'Batteria — Rete AC assente',
+    'hint'            => "Scatta quando la batteria e' raggiungibile ma la tensione di rete "
+                       . "letta dall'inverter e' sotto 100 V (blackout o distacco). "
+                       . "Se la batteria stessa non risponde l'allarme non scatta: quel caso "
+                       . "e' un guasto del ponte Modbus, non un'assenza di rete.",
+    'icon'            => '⚡',
+    'message'         => 'Batteria: rete AC assente.',
+    'restore_icon'    => '✅',
+    'restore_message' => 'Batteria: rete AC ripristinata.',
+  ],
+];
+
 // Day-of-week presets exposed in the UI (bit 0=Mon … bit 6=Sun, matches Python).
 const DAYS_ALL    = 127;
 const DAYS_MONFRI = 31;   // 0b0011111
@@ -118,6 +138,14 @@ function ensure_schema() {
     FOREIGN KEY (rule_id) REFERENCES rules(id) ON DELETE CASCADE
   )");
 
+  // Allarmi predefiniti: solo un interruttore per chiave. Tabella separata dalle
+  // regole perché il salvataggio delle regole riscrive `rules` da zero e
+  // cancellerebbe i preset a ogni salvataggio.
+  $db->exec("CREATE TABLE IF NOT EXISTS presets (
+    key     TEXT PRIMARY KEY,
+    enabled INTEGER NOT NULL DEFAULT 0
+  )");
+
   // Add days_mask to a pre-existing conditions table (deployed before this column).
   $cCols = [];
   $res = $db->query('PRAGMA table_info(conditions)');
@@ -160,6 +188,17 @@ function load_bots($db) {
     while ($b = $res->fetchArray(SQLITE3_ASSOC)) $bots[(int)$b['id']] = $b;
   } catch (Throwable $e) { /* table may not exist yet */ }
   return $bots;
+}
+
+// Enabled state of the predefined alarms as [key => bool]. Keys never seen
+// before default to off.
+function load_preset_state($db) {
+  $out = [];
+  try {
+    $res = $db->query('SELECT key, enabled FROM presets');
+    while ($p = $res->fetchArray(SQLITE3_ASSOC)) $out[$p['key']] = ((int)$p['enabled'] === 1);
+  } catch (Throwable $e) { /* table may not exist yet */ }
+  return $out;
 }
 
 // ── Telegram credentials (shared with zbot.py) ──────────────────────────────
@@ -214,7 +253,9 @@ function send_telegram_test($text) {
  * each check, so the reset takes effect on its next cycle.
  */
 function reset_rule_state($rule_id) {
-  $key = (string)(int)$rule_id;
+  // Rule ids are integers; predefined alarms use the "preset:<key>" state key
+  // the watcher writes for them, so both are accepted as-is.
+  $key = is_numeric($rule_id) ? (string)(int)$rule_id : (string)$rule_id;
   if (!file_exists(ALARM_STATE_FILE)) {
     return [true, "Nessuno stato memorizzato: la regola #{$key} può già scattare."];
   }
@@ -257,7 +298,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
   if ($action === 'reset_rule') {
     $rid = $_POST['reset_id'] ?? '';
-    if (!is_numeric($rid)) {
+    $is_preset = strpos((string)$rid, 'preset:') === 0
+              && isset($PRESETS[substr((string)$rid, 7)]);
+    if (!is_numeric($rid) && !$is_preset) {
       $message = 'Regola non valida.';
       $messageType = 'err';
     } else {
@@ -272,6 +315,32 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     list($ok, $info) = send_telegram_test($text);
     $message = $info;
     $messageType = $ok ? 'ok' : 'err';
+
+  } elseif ($action === 'save_presets') {
+    // Predefined alarms: nothing to validate beyond "known key, on or off".
+    $posted = $_POST['preset'] ?? [];
+    try {
+      $db = ensure_schema();
+      $db->exec('BEGIN');
+      $ins = $db->prepare('INSERT OR REPLACE INTO presets (key, enabled) VALUES (:k, :e)');
+      $on = 0;
+      foreach (array_keys($PRESETS) as $key) {
+        $enabled = !empty($posted[$key]) ? 1 : 0;
+        $on += $enabled;
+        $ins->reset();
+        $ins->clear();
+        $ins->bindValue(':k', $key,     SQLITE3_TEXT);
+        $ins->bindValue(':e', $enabled, SQLITE3_INTEGER);
+        $ins->execute();
+      }
+      $db->exec('COMMIT');
+      $message = "Allarmi predefiniti salvati ({$on} attivi).";
+      $messageType = 'ok';
+    } catch (Throwable $e) {
+      $message = 'Errore scrittura alarms.db: ' . $e->getMessage()
+               . '. Verifica i permessi (deve essere scrivibile da www-data).';
+      $messageType = 'err';
+    }
 
   } elseif ($action === 'save_rules') {
     $rows = $_POST['rule'] ?? [];
@@ -416,9 +485,11 @@ function rule_is_active($state, $rule_id) {
 // ── Load current rules with their conditions ───────────────────────────────
 $rules = [];
 $BOTS = [];
+$PRESET_ON = [];
 try {
   $db = ensure_schema();
   $BOTS = load_bots($db);
+  $PRESET_ON = load_preset_state($db);
   $byId = [];
   $rRes = $db->query('SELECT id, enabled, message, icon, restore_icon, restore_message, bot_id FROM rules ORDER BY id');
   while ($r = $rRes->fetchArray(SQLITE3_ASSOC)) {
@@ -991,6 +1062,24 @@ $tpl_cond_schedule  = schedule_cond_html('__I__', '__J__');
       margin-bottom: .9rem;
     }
 
+    /* Predefined alarms — toggle only */
+    .preset-row {
+      display: flex;
+      align-items: flex-start;
+      gap: .6rem;
+      border: 1px solid #e2e8f0;
+      border-radius: .5rem;
+      padding: .6rem .75rem;
+      margin-bottom: .5rem;
+      cursor: pointer;
+    }
+    .preset-row.active { background: #dcfce7; border-color: #86efac; }
+    .preset-row input[type="checkbox"] { margin-top: .15rem; }
+    .preset-icon { font-size: 1rem; line-height: 1.2; }
+    .preset-body { display: flex; flex-direction: column; gap: .15rem; }
+    .preset-label { font-size: .9rem; font-weight: 600; }
+    .preset-hint { font-size: .78rem; color: #64748b; line-height: 1.4; }
+
     .test-row { display: flex; gap: .5rem; align-items: center; }
     .test-row input[type="text"] { flex: 1; }
   </style>
@@ -1017,6 +1106,37 @@ $tpl_cond_schedule  = schedule_cond_html('__I__', '__J__');
   <?php if ($message): ?>
     <div class="msg <?= htmlspecialchars($messageType) ?>"><?= htmlspecialchars($message) ?></div>
   <?php endif; ?>
+
+  <form method="post" class="panel">
+    <input type="hidden" name="action" value="save_presets">
+    <h2>Allarmi predefiniti</h2>
+    <?php $preset_state = load_alarm_state(); ?>
+    <?php foreach ($PRESETS as $key => $pr): ?>
+      <?php $active = rule_is_active($preset_state, 'preset:' . $key); ?>
+      <label class="preset-row<?= $active ? ' active' : '' ?>">
+        <input type="checkbox" name="preset[<?= htmlspecialchars($key) ?>]" value="1"
+          <?= !empty($PRESET_ON[$key]) ? 'checked' : '' ?>>
+        <span class="preset-icon"><?= htmlspecialchars($pr['icon']) ?></span>
+        <span class="preset-body">
+          <span class="preset-label"><?= htmlspecialchars($pr['label']) ?></span>
+          <span class="preset-hint"><?= htmlspecialchars($pr['hint']) ?></span>
+        </span>
+        <?php if ($active): ?>
+          <button type="submit" form="reset-form" name="reset_id" value="preset:<?= htmlspecialchars($key) ?>"
+            class="btn-reset" title="Azzera lo scatto: l'allarme torna a essere verificato">&#8635;</button>
+        <?php endif; ?>
+      </label>
+    <?php endforeach; ?>
+    <div class="actions">
+      <button type="submit">Salva predefiniti</button>
+    </div>
+    <p class="help">
+      Questi allarmi hanno la condizione gia' cablata in <code>alarm_watcher.py</code>:
+      si possono solo attivare o disattivare, non modificare. Usano il bot predefinito
+      di <code>zbot.py</code> e si comportano come le regole normali (anti-flapping di
+      2 letture, messaggio di rientro quando la condizione si risolve).
+    </p>
+  </form>
 
   <form method="post">
     <input type="hidden" name="action" value="save_rules">

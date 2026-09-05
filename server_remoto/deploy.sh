@@ -38,6 +38,7 @@ PHP_FILES=(
   live.php
   instant_lib.php
   instant_store.php
+  trend_store.php
   store_lib.php
   ingest.php
   ingest_secret.php

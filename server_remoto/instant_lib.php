@@ -14,6 +14,7 @@ declare(strict_types=1);
  */
 
 require_once __DIR__ . '/instant_store.php';
+require_once __DIR__ . '/trend_store.php';
 
 /** PV production under this many watts is noise, not production. */
 // define() rather than const: grafico.php declares the same constant, and the
@@ -46,9 +47,45 @@ defined('BATTERY_DIAG_FIELDS') || define('BATTERY_DIAG_FIELDS', [
   'battAcV', 'battAcHz', 'battAcW',
 ]);
 
+/**
+ * Shelly Pro EM-50 detail: what the two clamps report besides active power.
+ *
+ * Every message already carries voltage, current and power factor per clamp
+ * plus the mains frequency -- they were stored on the Raspberry and thrown
+ * away on the way here. They feed the "Quadro principale" card and nothing
+ * else, so they live in the live row only, like the battery diagnostics did
+ * before they became plottable.
+ *
+ * The two voltages are the same line measured twice (one meter, two CTs on a
+ * single-phase supply): they differ by sampling noise, not by circuit. The
+ * currents are genuinely different -- one is what the inverter pushes, the
+ * other what crosses the meter -- but both are UNSIGNED: direction lives only
+ * in the sign of gridPower.
+ */
+defined('EM_DETAIL_FIELDS') || define('EM_DETAIL_FIELDS', [
+  'emPvV', 'emPvA', 'emPvPf',
+  'emGridV', 'emGridA', 'emGridPf',
+  'emHz',
+]);
+
 /** Usable capacity of the pack, kWh — only to turn SoC into a "residuo".
  * 5.12 kWh is what the Venus E 3.0 reports as its rated capacity. */
 defined('BATT_CAPACITY_KWH') || define('BATT_CAPACITY_KWH', 5.12);
+
+/** Where the autonomy estimate stops counting: the SoC the pack is expected to
+ * stop discharging at, not 0. The Venus reserves the bottom of the pack, and a
+ * "quanto manca" measured to an empty it never reaches would always be wrong
+ * by that reserve. */
+defined('BATT_RESERVE_SOC') || define('BATT_RESERVE_SOC', 12.0);
+
+/** Where the charge estimate stops counting. The Venus has no reachable
+ * charge-ceiling register on the v3 map, so it fills to 100 and this is simply
+ * full. */
+defined('BATT_FULL_SOC') || define('BATT_FULL_SOC', 100.0);
+
+/** How far back the autonomy estimate looks. Long enough that a kettle does
+ * not set the slope, short enough to follow the evening as it changes. */
+defined('BATT_ETA_WINDOW') || define('BATT_ETA_WINDOW', 1800);
 
 /** ---------- FORMATTING HELPERS ---------- */
 
@@ -170,6 +207,141 @@ function getForecastTiming(array $forecast, float $presTrend3h): string
   return '';
 }
 
+/**
+ * How long the pack takes to reach $target, at the rate it has actually been
+ * moving. Answers both directions: $target below the current SoC is the
+ * autonomy question (how long until the reserve), above it the charge question
+ * (how long until full).
+ *
+ * $rows are the last BATT_ETA_WINDOW seconds of history, oldest first, each
+ * ['data' => unix ts, 'soc' => %, 'power' => signed W or null].
+ *
+ * The primary estimate is a least-squares fit of SoC against time: it measures
+ * the pack actually filling or emptying, which already contains the conversion
+ * losses and the real usable capacity, so it needs neither. The mean power is
+ * the fallback, for the case the fit cannot answer -- too few rows, or a SoC
+ * that has not moved a whole reported step yet, which is common at low power
+ * because the battery reports SoC in tenths and half an hour at 150 W barely
+ * shifts it.
+ *
+ * The sample thresholds are low because the fallback source, `dati_meteo`,
+ * holds ONE ROW PER TEN MINUTES: half an hour of it is three or four rows and
+ * no more, so a fit that insisted on more would never run when the RAM trend
+ * window is empty. The span check is what keeps the fit honest instead --
+ * three points inside a couple of minutes say nothing, three across twenty
+ * minutes do. Fed from trend_store.php the same fit gets a sample every
+ * twenty seconds or so and is simply better conditioned.
+ *
+ * Both estimates are LINEAR, which is the honest reading of the last half hour
+ * and nothing more. It holds well while discharging; on charge it runs
+ * optimistic near the top, where the Venus tapers into constant voltage and
+ * the last few percent take longer than the fit expects.
+ *
+ * Returns ['hours' => float, 'watts' => float, 'slope' => float,
+ * 'basis' => 'soc'|'power'] or null when neither method has anything honest to
+ * say. `watts` and `slope` are the same rate in the two units the card shows
+ * it in -- power, and SoC per hour, both as positive numbers whichever way the
+ * pack is going -- so it can show the figures behind the estimate rather than
+ * only its result. Each branch measures one of the two and converts to the
+ * other across the pack capacity: on the SoC branch the slope is the
+ * measurement and the watts are derived, on the power branch it is the other
+ * way round. Neither is the instantaneous reading, which is what the pack
+ * happens to be doing this second.
+ */
+function battSocEtaHours(array $rows, ?float $soc, float $target): ?array
+{
+  if ($soc === null) {
+    return null;
+  }
+  // Which way the pack has to move to get there, as +1 or -1. A pack already
+  // at its target has no estimate to give.
+  $dir = ($target > $soc) ? 1.0 : (($target < $soc) ? -1.0 : 0.0);
+  if ($dir === 0.0) {
+    return null;
+  }
+  $toGo = abs($target - $soc);              // % still to cover
+
+  // --- least squares on SoC(t), t in hours from the first sample ---
+  $n = 0;
+  $sx = $sy = $sxx = $sxy = 0.0;
+  $t0 = null;
+  $tLast = null;
+  $pSum = 0.0;
+  $pN = 0;
+  foreach ($rows as $r) {
+    if ($r['soc'] !== null) {
+      $t0 = $t0 ?? (float) $r['data'];
+      $tLast = (float) $r['data'];
+      $x = ((float) $r['data'] - $t0) / 3600.0;
+      $y = (float) $r['soc'];
+      $n++;
+      $sx += $x;
+      $sy += $y;
+      $sxx += $x * $x;
+      $sxy += $x * $y;
+    }
+    if ($r['power'] !== null) {
+      $pSum += (float) $r['power'];
+      $pN++;
+    }
+  }
+
+  $span = ($t0 !== null && $tLast !== null) ? ($tLast - $t0) : 0.0;
+  if ($n >= 3 && $span >= 600) {
+    $den = ($n * $sxx) - ($sx * $sx);
+    if ($den > 0) {
+      // %/h, signed: negative while emptying, positive while filling.
+      $slope = (($n * $sxy) - ($sx * $sy)) / $den;
+      $toward = $slope * $dir;              // progress toward the target
+      // Anything shallower than this is noise on a 0.1 % reading, not a trend:
+      // it would divide out to a "duration" of days.
+      if ($toward >= 0.5) {
+        return [
+          'hours' => $toGo / $toward,
+          'watts' => $toward / 100.0 * BATT_CAPACITY_KWH * 1000.0,
+          'slope' => $toward,
+          'basis' => 'soc',
+        ];
+      }
+      // Only a pack visibly moving the WRONG way is refused outright. The band
+      // between the two thresholds -- moving too slowly to fit, or flat
+      // because SoC has not ticked a whole tenth yet -- falls through to the
+      // power fallback, which is the case that branch was written for.
+      if ($toward <= -0.5) {
+        return null;
+      }
+    }
+  }
+
+  // --- fallback: mean power over the same window ---
+  if ($pN >= 2) {
+    $meanW = $pSum / $pN;                    // signed the house way: > 0 charging
+    $towardW = $meanW * $dir;                // power spent going where we asked
+    if ($towardW > BATT_IDLE_W) {
+      $kwh = $toGo / 100.0 * BATT_CAPACITY_KWH;
+      return [
+        'hours' => $kwh / ($towardW / 1000.0),
+        'watts' => $towardW,
+        'slope' => ($towardW / 1000.0) / BATT_CAPACITY_KWH * 100.0,
+        'basis' => 'power',
+      ];
+    }
+  }
+
+  return null;
+}
+
+/** A duration in hours as the card says it: "3h 20m" above the hour, plain
+ * minutes below it. */
+function fmtDuration(float $hours): string
+{
+  $mins = (int) round($hours * 60);
+  if ($mins < 60) {
+    return max(1, $mins) . ' min';
+  }
+  return intdiv($mins, 60) . 'h ' . str_pad((string) ($mins % 60), 2, '0', STR_PAD_LEFT) . 'm';
+}
+
 function getTempClass($val)
 {
   return ($val < 1 && $val > -99) ? 'freezing' : '';
@@ -271,6 +443,27 @@ function meteo_build_payload(mysqli $link): array
   // existing is not enough: they are NULL until meteo.py forwards the first
   // pvPower/gridPower, and empty cards look broken.
   $emAvailable = ($safePv0 !== null || $safeGrid0 !== null);
+
+  // Clamp detail (V / A / pf / Hz) for the "Quadro principale" card. Its own
+  // query and its own try/catch, exactly like the battery diagnostics: these
+  // columns are newer than pvPower/gridPower and must not be able to take the
+  // two meter cards down with them on a database that predates them.
+  $emDetail = [];
+  if ($emAvailable) {
+    try {
+      $cols = implode(',', array_map(static fn($c) => "`$c`", EM_DETAIL_FIELDS));
+      $resEd = $link->query("SELECT $cols FROM `dati_instant` WHERE `id` = 1");
+      if ($resEd instanceof mysqli_result && $rowEd = $resEd->fetch_assoc()) {
+        foreach ($rowEd as $k => $v) {
+          if (is_numeric($v)) {
+            $emDetail[$k] = (float) $v;
+          }
+        }
+      }
+    } catch (Throwable $e) {
+      // Columns not created yet: the card stays hidden.
+    }
+  }
 
   /** ---------- 2c. MARSTEK VENUS E (HOME BATTERY) ----------
    * battPower is signed the house way: > 0 charging, < 0 discharging.
@@ -673,6 +866,93 @@ function meteo_build_payload(mysqli $link): array
     $battColor = 'var(--text-muted)';
   }
 
+  /* Autonomy while discharging, time-to-full while charging: how long the
+   * pack takes to get where it is going and at what time it arrives, at the
+   * rate of the last half hour rather than the rate of this instant -- the
+   * instantaneous power swings with every appliance and every passing cloud,
+   * and would make the figure jump around uselessly.
+   *
+   * Discharging it counts down to BATT_RESERVE_SOC, not to zero, because that
+   * is where the pack actually stops; charging it counts up to BATT_FULL_SOC.
+   * Nothing is shown unless the window says something: a battery that just
+   * changed direction gets no number rather than a wrong one.
+   */
+  $battEtaText = '';
+  $battEtaClock = '';
+  $battEtaShow = false;
+  $battEtaColor = 'var(--accent-orange)';
+  if (($battDischarging || $battCharging) && $safeBattSoc0 !== null) {
+    /* Samples come from the RAM window first: it holds every reading of the
+     * last half hour, where `dati_meteo` holds three or four of them. The DB
+     * is the fallback for the case the buffer has nothing to say yet -- after
+     * a reboot, or on a host with no usable /dev/shm -- and gives the coarser
+     * answer it always did rather than none.
+     */
+    $rowsEta = [];
+    foreach (trend_window(BATT_ETA_WINDOW) as $t) {
+      if (!isset($t['battSoc'])) {
+        continue;
+      }
+      $rowsEta[] = [
+        'data' => (int) $t['t'],
+        'soc' => (float) $t['battSoc'],
+        'power' => isset($t['battPower']) ? (float) $t['battPower'] : null,
+      ];
+    }
+
+    if (count($rowsEta) < 3) {
+      $rowsEta = [];
+      try {
+        $sinceEta = $now - BATT_ETA_WINDOW;
+        $resEta = $link->query(
+          "SELECT `data`, battSoc + 0 AS soc, battPower + 0 AS power
+           FROM dati_meteo
+           WHERE `data` >= {$sinceEta} AND battSoc IS NOT NULL
+           ORDER BY `data` ASC"
+        );
+        if ($resEta instanceof mysqli_result) {
+          while ($rowEta = $resEta->fetch_assoc()) {
+            $rowsEta[] = [
+              'data' => (int) $rowEta['data'],
+              'soc' => is_numeric($rowEta['soc']) ? (float) $rowEta['soc'] : null,
+              'power' => is_numeric($rowEta['power']) ? (float) $rowEta['power'] : null,
+            ];
+          }
+        }
+      } catch (Throwable $e) {
+        // No battery history either: the card simply omits the estimate.
+      }
+    }
+
+    $target = $battCharging ? BATT_FULL_SOC : BATT_RESERVE_SOC;
+    $eta = battSocEtaHours($rowsEta, $safeBattSoc0, $target);
+    if ($eta !== null) {
+      $battEtaShow = true;
+      // Green filling, orange emptying: the same colour the flow state uses,
+      // so the two lines of the card never disagree about which way it is going.
+      $battEtaColor = $battCharging ? 'var(--accent-green)' : 'var(--accent-orange)';
+      // The rate the estimate rests on, in both its units: a duration is only
+      // as good as the rate under it, and this is that rate.
+      $battEtaClock = ' &#183; ' . fmtW($eta['watts'])
+        . ' &#183; ' . number_format($eta['slope'], 1) . ' %/h';
+      if ($eta['hours'] > 24) {
+        // Past a day the linear extrapolation is fiction: the house will have
+        // charged and discharged again long before then.
+        $battEtaText = 'oltre 24 h';
+      } else {
+        $battEtaText = fmtDuration($eta['hours']);
+        $battEtaClock .= ' &#183; ' . ($battCharging ? 'pieno alle ' : 'fino alle ')
+          . date('H:i', $now + (int) ($eta['hours'] * 3600));
+      }
+      // Which of the two methods answered: a duration read off the SoC curve
+      // and one read off the mean power are not the same claim, and the card
+      // should not present them as if they were.
+      if ($eta['basis'] === 'power') {
+        $battEtaText .= ' (stima da potenza)';
+      }
+    }
+  }
+
   /* Cell temperature, coloured by what it means for the pack rather than by
    * how warm it sounds. Below 0 °C the BMS refuses to CHARGE (discharge is
    * fine down to -20), which is normal on a winter night and worth flagging
@@ -736,6 +1016,24 @@ function meteo_build_payload(mysqli $link): array
     $selfShare = (int) round(min(100, max(0, ($safeCasa0 - $prelievo0) / $safeCasa0 * 100)));
   }
   $selfLabel = $battAvailable ? '% da FV e batteria' : '% da fotovoltaico';
+
+  /* ---------- 7d. QUADRO PRINCIPALE (SHELLY CLAMP DETAIL) ----------
+   * The electrical picture behind the two power cards: line voltage and
+   * frequency once, then current and power factor per clamp. The power factor
+   * has no unit, so this formatter drops the trailing space $fmtNum would add.
+   */
+  $e = static fn(string $k) => $emDetail[$k] ?? null;
+  $e_fmt = static fn($v, int $dec, string $unit)
+    => ($v === null) ? '--'
+      : number_format((float) $v, $dec) . ($unit === '' ? '' : ' ' . $unit);
+
+  /* The clamps report |current|: only the sign of gridPower says which way it
+   * is flowing, so the direction is spelled out next to the ampere figure. */
+  $gridDir = '';
+  if ($safeGrid0 !== null) {
+    $gridDir = ($safeGrid0 > 0) ? 'prelievo'
+      : (($safeGrid0 < 0) ? 'immissione' : 'in pareggio');
+  }
 
   /** ---------- 8. RENDER-READY PAYLOAD ---------- */
   return [
@@ -861,6 +1159,25 @@ function meteo_build_payload(mysqli $link): array
       'peak' => fmtW($em_max_casa_batt ?? $em_max_casa),
     ],
 
+    /* Quadro principale: what the two Shelly clamps measure besides power.
+     * Same treatment as battDiag -- plain strings with their units, read and
+     * not charted. The currents are unsigned, so the grid one carries the
+     * direction as a word taken from the sign of gridPower. */
+    'quadro' => [
+      'show' => ($emDetail !== []),
+      'vLine'    => $e_fmt($e('emGridV') ?? $e('emPvV'), 1, 'V'),
+      'hz'       => $e_fmt($e('emHz'), 2, 'Hz'),
+      'vGrid'    => $e_fmt($e('emGridV'), 1, 'V'),
+      'iGrid'    => $e_fmt($e('emGridA'), 2, 'A'),
+      'pfGrid'   => $e_fmt($e('emGridPf'), 2, ''),
+      'wGrid'    => fmtW($safeGrid0),
+      'dirGrid'  => $gridDir,
+      'vPv'      => $e_fmt($e('emPvV'), 1, 'V'),
+      'iPv'      => $e_fmt($e('emPvA'), 2, 'A'),
+      'pfPv'     => $e_fmt($e('emPvPf'), 2, ''),
+      'wPv'      => fmtW($safePv0),
+    ],
+
     /* Everything the pack reports about itself. Rendered as plain strings
      * with their units: nothing here is charted or compared, it is read. */
     'battDiag' => [
@@ -905,6 +1222,12 @@ function meteo_build_payload(mysqli $link): array
         : number_format($safeBattSoc0 / 100 * BATT_CAPACITY_KWH, 2) . ' kWh'),
       'range' => ($batt_min_soc === null || $batt_max_soc === null) ? '--'
         : round($batt_min_soc) . '% - ' . round($batt_max_soc) . '%',
+      // Autonomy: shown only while discharging, and only when the last half
+      // hour is enough to say something. See BATT_RESERVE_SOC for the floor.
+      'etaShow' => $battEtaShow,
+      'eta' => $battEtaText,
+      'etaClock' => $battEtaClock,
+      'etaColor' => $battEtaColor,
       // Cella piu' calda: e' quella su cui lavorano i limiti del BMS, mentre
       // `temperature` sulla batteria e' l'elettronica e corre 6 gradi sopra.
       'temp' => ($safeBattTemp0 === null ? '--' : number_format($safeBattTemp0, 1) . ' °C'),

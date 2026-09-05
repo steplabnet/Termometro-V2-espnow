@@ -47,6 +47,32 @@ meters at once: PV 1871 W, export 877 W, battery charging 770 W, real load
 The local dashboards (`rapsberry meteo/index.php`, `batteria.php`) still show
 the gross figure; only the remote one is net. See `BATTERY_VENUS.md`.
 
+### Quadro principale (clamp detail)
+
+Every message already carried more than `act_power`, and the extra fields were
+stored on the Pi and dropped on the way to the remote server. They are now
+forwarded too, under `emPvV` / `emPvA` / `emPvPf`, `emGridV` / `emGridA` /
+`emGridPf` and `emHz` (`EM_DETAIL_FIELDS` in `instant_lib.php`), and rendered
+by the **Quadro Principale** card next to Diagnostica Batteria.
+
+Live row only: `dati_instant` gets the columns, `dati_meteo` does not, so there
+is no history behind these numbers and no chart to link them to. Three things
+worth knowing when reading the card:
+
+- **One voltage, measured twice.** A single Pro EM-50 with two CTs on the same
+  single-phase supply: `emPvV` and `emGridV` differ by sampling noise, not by
+  circuit. The "Linea" row shows the grid clamp's reading, which refreshes
+  fastest; the per-channel figures are kept below for comparison.
+- **The currents are unsigned.** An exporting 5 A and an importing 5 A look
+  identical, so the direction shown beside the grid ampere figure comes from
+  the sign of `gridPower`, not from the current.
+- **The PV channel is slow.** em1:1 barely notifies over MQTT (see below), so
+  its voltage/current refresh at `SHELLY_HTTP_INTERVAL` via the HTTP fallback
+  poll, not every two seconds like the grid channel.
+
+`aprt_power` and `calibration` are still dropped — apparent power is derivable
+from `act_power` and `pf` if it is ever wanted.
+
 ### PV deadband
 
 Production below **10 W** is not production — it is clamp leakage and inverter

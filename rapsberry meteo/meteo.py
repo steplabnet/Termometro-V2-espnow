@@ -12,9 +12,9 @@ import board
 import busio
 from RPi import GPIO
 
-# -------- ADS1115 --------
-import adafruit_ads1x15.ads1115 as ADS
-from adafruit_ads1x15.analog_in import AnalogIn
+# -------- ADS1115 (temporaneamente disattivato) --------
+# import adafruit_ads1x15.ads1115 as ADS
+# from adafruit_ads1x15.analog_in import AnalogIn
 
 # -------- Tinkerforge --------
 from tinkerforge.ip_connection import IPConnection
@@ -29,14 +29,14 @@ GPIO.setup(15, GPIO.OUT)
 GPIO.output(15, GPIO.LOW)
 fanMode = 0  # ventola spenta
 
-# -------- ADS1115 / I2C --------
-i2c = busio.I2C(board.SCL, board.SDA)
-ads = ADS.ADS1115(i2c)
-chan = AnalogIn(ads, 0, 1)  # differential
-
-ADCgains = [1, 2, 4, 8, 16]
-ads.gain = 1
-adcGainIdx = 0
+# -------- ADS1115 / I2C (temporaneamente disattivato) --------
+# i2c = busio.I2C(board.SCL, board.SDA)
+# ads = ADS.ADS1115(i2c)
+# chan = AnalogIn(ads, 0, 1)  # differential
+#
+# ADCgains = [1, 2, 4, 8, 16]
+# ads.gain = 1
+# adcGainIdx = 0
 
 # -------- Tinkerforge --------
 HOST = "localhost"
@@ -75,7 +75,7 @@ PUBLISH_DEADBAND = {
     "humi": 1, "hombra": 1, "hMobile": 1,
     "wind": 0.1, "gust": 0.1, "rain": 0.1,
     "pres": 1, "tempCpu": 0.5,
-    "power": 20,
+    # "power": 20,   # ADS1115 temporaneamente disattivato
     "pvPower": 10, "gridPower": 10, "casaPower": 10,
     "battPower": 10, "battSoc": 0.5, "battTemp": 0.5,
     # The diagnostic set moves constantly and must not drive publishes on its
@@ -85,10 +85,17 @@ PUBLISH_DEADBAND = {
     "battVolt": 0.1, "battCurr": 0.5, "battAcV": 2, "battAcHz": 0.1,
     "battAcW": 20,
     "battCellVMax": 0.01, "battCellVMin": 0.01,
+    # Shelly clamp detail: same rule. Mains voltage drifts a volt at a time all
+    # day and the currents follow every appliance, so the bands are wide enough
+    # that these ride along with a publish rather than causing one.
+    "emPvV": 2, "emGridV": 2, "emPvA": 0.2, "emGridA": 0.2,
+    "emPvPf": 0.05, "emGridPf": 0.05, "emHz": 0.05,
 }
 
 # Diagnostics that ride along in the payload but must never trigger a publish
-# on their own: the raw ADC figures change on every single read.
+# on their own. The raw ADC figures used to be here; they are gone while the
+# ADS1115 is disconnected, but the names stay listed so restoring the sensor
+# needs no change here.
 # battTs rides along for the same reason: it moves on every single read, and
 # it is only there so the server can tell a fresh battery reading from a stale
 # one -- it must never be the reason a message goes out.
@@ -99,8 +106,9 @@ PUBLISH_IGNORE = {"timestamp", "mean_voltage", "adc_voltage", "adc_raw",
 log_int = 1000  # seconds
 tb = 0
 
-tensioni = [0.0] * 20
-powerPrev = 0
+# ADS1115 temporaneamente disattivato
+# tensioni = [0.0] * 20
+# powerPrev = 0
 fanHistory = np.array([48] * 10, dtype=float)  # moving avg of CPU temp
 
 
@@ -316,12 +324,12 @@ def db_store_payload(payload):
             INSERT INTO meteo (
                 timestamp, tMobile, hMobile, fan, tempCpu, temp, humi,
                 wind, gust, rain, wdir, tombra, hombra,
-                chip, pres, power, mean_voltage, adc_voltage, adc_raw,
+                chip, pres,
                 station_id, data_valid
             ) VALUES (
                 :timestamp, :tMobile, :hMobile, :fan, :tempCpu, :temp, :humi,
                 :wind, :gust, :rain, :wdir, :tombra, :hombra,
-                :chip, :pres, :power, :mean_voltage, :adc_voltage, :adc_raw,
+                :chip, :pres,
                 :station_id, :data_valid
             )
         """, payload)
@@ -621,42 +629,43 @@ def log_write(message):
     print("Log error: unable to write log file")
 
 
-def autogain_read():
-    """Return (voltage, raw) with gain adjustment"""
-    global adcGainIdx
+# ADS1115 temporaneamente disattivato: lettura ADC e autogain sospese.
+# def autogain_read():
+#     """Return (voltage, raw) with gain adjustment"""
+#     global adcGainIdx
 
-    max_v = 0.0
-    max_raw = 0
+#     max_v = 0.0
+#     max_raw = 0
 
-    for _ in range(6):
-        max_v = 0.0
-        max_raw = 0
+#     for _ in range(6):
+#         max_v = 0.0
+#         max_raw = 0
 
-        for _ in range(100):
-            try:
-                v = abs(chan.voltage)
-                r = abs(chan.value)
-            except Exception as e:
-                print("ADS1115 read error:", e)
-                return 0.0, 0
+#         for _ in range(100):
+#             try:
+#                 v = abs(chan.voltage)
+#                 r = abs(chan.value)
+#             except Exception as e:
+#                 print("ADS1115 read error:", e)
+#                 return 0.0, 0
 
-            if v > max_v:
-                max_v = v
-            if r > max_raw:
-                max_raw = r
+#             if v > max_v:
+#                 max_v = v
+#             if r > max_raw:
+#                 max_raw = r
 
-        if max_raw > 32000 and ads.gain > 1:
-            adcGainIdx = max(0, adcGainIdx - 1)
-            ads.gain = ADCgains[adcGainIdx]
-            print("gain:", ads.gain)
-        elif max_raw < 16000 and ads.gain < 16:
-            adcGainIdx = min(4, adcGainIdx + 1)
-            ads.gain = ADCgains[adcGainIdx]
-            print("gain:", ads.gain)
-        else:
-            return max_v, max_raw
+#         if max_raw > 32000 and ads.gain > 1:
+#             adcGainIdx = max(0, adcGainIdx - 1)
+#             ads.gain = ADCgains[adcGainIdx]
+#             print("gain:", ads.gain)
+#         elif max_raw < 16000 and ads.gain < 16:
+#             adcGainIdx = min(4, adcGainIdx + 1)
+#             ads.gain = ADCgains[adcGainIdx]
+#             print("gain:", ads.gain)
+#         else:
+#             return max_v, max_raw
 
-    return max_v, max_raw
+#     return max_v, max_raw
 
 
 def _on_mqtt_connect(client, userdata, flags, reason_code, properties):
@@ -830,7 +839,7 @@ def read_weather(ow, roles):
 
 
 def main():
-    global tb, tensioni, powerPrev
+    global tb
 
     # connect once
     ipcon = IPConnection()
@@ -859,16 +868,8 @@ def main():
     last_payload = None
 
     while True:
-        # The ADC is the fastest signal here, and autogain_read() already takes
-        # a fraction of a second, so it sets the pace of the whole loop.
-        voltage, raw_value = autogain_read()
-
-        left_shift(tensioni, voltage)
-        mean_v = volt_average(tensioni)
-
-        power = max(230 * (mean_v - 0.0102) * 30 / 1.08, 0)
-        powerPrev = power
-
+        # ADS1115 temporaneamente disattivato: senza la lettura ADC il ritmo
+        # del ciclo lo detta il solo sleep(1) in fondo.
         now = time()
 
         if now - tb > log_int:
@@ -907,15 +908,23 @@ def main():
             "hombra": weather["hombra"],
             "chip": temperature,
             "pres": round(pressure),
-            "power": int(power),
-            "mean_voltage": round(mean_v, 6),
-            "adc_voltage": round(voltage, 6),
-            "adc_raw": int(raw_value),
+            # ADS1115 temporaneamente disattivato: power / mean_voltage /
+            # adc_voltage / adc_raw non vengono piu' calcolati ne' inviati.
             "station_id": weather["station_id"],
             "data_valid": weather["data_valid"],
             "pvPower": energy.get("pv_power"),
             "gridPower": energy.get("grid_power"),
             "casaPower": energy.get("casa_power"),
+            # What the clamps measure besides power. Absent (not None) is not
+            # possible here -- a missing clamp simply yields None, which
+            # ingest.php skips, leaving the stored value alone.
+            "emPvV": energy.get("pv_voltage"),
+            "emPvA": energy.get("pv_current"),
+            "emPvPf": energy.get("pv_pf"),
+            "emGridV": energy.get("grid_voltage"),
+            "emGridA": energy.get("grid_current"),
+            "emGridPf": energy.get("grid_pf"),
+            "emHz": energy.get("freq"),
             # Absent (not null) when the battery is silent, so ingest.php
             # leaves the stored value alone rather than blanking it. Both keys
             # appear together or not at all.
@@ -934,7 +943,7 @@ def main():
             mqtt_publish_payload(mqtt_client, payload)
             print(f"[{payload['timestamp']}] published "
                   f"temp={payload['temp']} tombra={payload['tombra']} "
-                  f"power={payload['power']} pv={payload['pvPower']}")
+                  f"pv={payload['pvPower']}")
             last_publish = now
             last_payload = payload
 

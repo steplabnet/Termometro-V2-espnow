@@ -9,6 +9,7 @@ declare(strict_types=1);
  * The cadences here are what keeps a fast MQTT feed cheap:
  *   dati_instant   -> every reading (the dashboard's live row)
  *   /dev/shm snapshot -> every reading (what live.php pushes to browsers)
+ *   /dev/shm trend window -> every reading, last 30 min only, never to disk
  *   dati_meteo     -> one history row per 10 minutes, as it has always been
  *   ARPA portata   -> fetched at most every 10 minutes, cached in RAM
  *   minmax_24h.json -> only when a history row was written
@@ -16,6 +17,7 @@ declare(strict_types=1);
  */
 
 require_once __DIR__ . '/instant_lib.php'; // payload builder + /dev/shm snapshot
+require_once __DIR__ . '/trend_store.php'; // RAM-only 30 min window for trends
 
 /** dati_meteo keeps one row per this many seconds. */
 const METEO_HISTORY_INTERVAL = 600;
@@ -208,6 +210,17 @@ function meteo_store_reading(mysqli $link, array $r): array
   }
   $gridPower = isset($r['gridPower']) && is_numeric($r['gridPower']) ? (float) $r['gridPower'] : null;
 
+  // What the two clamps measure besides power: voltage, current and power
+  // factor each, plus the mains frequency. Live row only -- see
+  // EM_DETAIL_FIELDS in instant_lib.php. A field the station does not send
+  // simply stays out, so the stored value is left alone rather than blanked.
+  $emDetail = [];
+  foreach (EM_DETAIL_FIELDS as $f) {
+    if (isset($r[$f]) && is_numeric($r[$f])) {
+      $emDetail[$f] = (float) $r[$f];
+    }
+  }
+
   // Marstek Venus E. battPower is signed the house way (+ = charging) and is
   // subtracted from the house load downstream, so a value with no companion
   // battTs is refused: an undated power figure is exactly the one that would
@@ -235,6 +248,24 @@ function meteo_store_reading(mysqli $link, array $r): array
     $battSoc = null;
     $battTemp = null;
   }
+
+  /* Into the RAM trend window, before anything is written anywhere else.
+   *
+   * The battery fields go in already guarded: an undated battPower is refused
+   * above, and a trend must not be fitted through the figures a dead bridge
+   * left behind. The rest of the reading goes in as it arrived -- trend_push()
+   * keeps the numeric fields and ignores everything else.
+   *
+   * Failure here is deliberately silent and costs nothing: no tmpfs means no
+   * trend buffer, and every reader falls back to `dati_meteo`.
+   */
+  trend_push(array_merge($r, [
+    'pvPower' => $pvPower,
+    'gridPower' => $gridPower,
+    'battPower' => $battPower,
+    'battSoc' => $battSoc,
+    'battTemp' => $battTemp,
+  ]), $now);
 
   $get = static fn(string $k) => (isset($r[$k]) && $r[$k] !== '') ? $r[$k] : null;
 
@@ -268,6 +299,10 @@ function meteo_store_reading(mysqli $link, array $r): array
     foreach (BATTERY_DIAG_FIELDS as $c) {
       ensure_column($link, 'dati_instant', $c, 'FLOAT NULL');
       ensure_column($link, 'dati_meteo', $c, 'FLOAT NULL');
+    }
+    // Live row only: the quadro card reads them, nothing charts them.
+    foreach (EM_DETAIL_FIELDS as $c) {
+      ensure_column($link, 'dati_instant', $c, 'FLOAT NULL');
     }
 
     // Validation to prevent bad sensor readings (-50)
@@ -328,6 +363,9 @@ function meteo_store_reading(mysqli $link, array $r): array
   if ($gridPower !== null) {
     $instant['gridPower'] = $gridPower;
   }
+  foreach ($emDetail as $f => $v) {
+    $instant[$f] = $v;
+  }
   // battTs goes with them: the three are written together or not at all, so
   // the stored age always belongs to the stored figures.
   if ($battPower !== null || $battSoc !== null || $battTemp !== null || $battLive) {
@@ -365,7 +403,7 @@ function meteo_store_reading(mysqli $link, array $r): array
       // write is retried once. A second failure is a real error and is left to
       // the caller.
       foreach (array_merge(['pvPower', 'gridPower', 'battPower', 'battSoc', 'battTemp'],
-                          BATTERY_DIAG_FIELDS) as $c) {
+                          BATTERY_DIAG_FIELDS, EM_DETAIL_FIELDS) as $c) {
         ensure_column($link, 'dati_instant', $c, 'FLOAT NULL');
       }
       ensure_column($link, 'dati_instant', 'battTs', 'INT NULL');

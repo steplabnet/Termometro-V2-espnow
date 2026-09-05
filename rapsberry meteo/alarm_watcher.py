@@ -75,6 +75,37 @@ ENERGY_METRICS = {
 ENERGY_STALE_S = 600
 ENERGY_KEYS = frozenset(ENERGY_METRICS)
 
+# Marstek Venus E figures, copied from batteria.php so the dashboard and the
+# /batteria report can never disagree: rated pack capacity (used to turn SoC
+# into a residual kWh) and the deadband under which the pack counts as idle.
+BATTERY_CAPACITY_KWH = 5.12
+BATTERY_IDLE_W = 15
+# The bridge publishes every few seconds and the batteria table is written once
+# a minute, so a row older than this means the bridge or the battery is down —
+# reported as "no data" rather than as a frozen last reading.
+BATTERY_STALE_S = 600
+
+# Grid voltage below this means the inverter has no AC line (blackout, breaker
+# open, plug pulled). The Venus reads ~230 V when connected and drops to 0 —
+# the threshold only has to sit clear of both.
+BATTERY_AC_MIN_V = 100.0
+
+# ── Allarmi predefiniti ─────────────────────────────────────────────────────
+# Turn-key alarms whose condition is wired here instead of being assembled in
+# alarms.php: the page can only switch them on and off (table `presets`).
+# They exist for the checks that no combination of alarms.php sources can
+# express — "rete AC assente" reads the `batteria` table, not the meteo row.
+# Keys must match $PRESETS in alarms.php.
+PRESET_ALARMS = {
+    "battery_no_ac": {
+        "label":           "Batteria — Rete AC assente",
+        "icon":            "⚡",
+        "message":         "Batteria: rete AC assente.",
+        "restore_icon":    "✅",
+        "restore_message": "Batteria: rete AC ripristinata.",
+    },
+}
+
 # Office readings older than this are treated as missing so a board dropout
 # can't keep firing alarms on a frozen last value.
 UFFICIO_STALE_S = 1200
@@ -138,6 +169,7 @@ def set_bot_commands():
         {"command": "status",   "description": "Report: temperature, energia o tutto"},
         {"command": "temperature", "description": "Tutte le temperature e umidità"},
         {"command": "energia",  "description": "Produzione e consumi elettrici"},
+        {"command": "batteria", "description": "Stato e salute della batteria"},
         {"command": "forecast", "description": "Previsione 6am (cielo sereno)"},
         {"command": "alarms",   "description": "Soglie configurate e allarmi attivi"},
         {"command": "reboot",   "description": "Riavvia il Raspberry"},
@@ -183,7 +215,7 @@ def answer_callback_query(callback_id, text=None):
 
 
 # ── Persistence helpers ─────────────────────────────────────────────────────
-def load_rules():
+def _load_user_rules():
     """Return a list of rule dicts (each with a 'conditions' list) from alarms.db."""
     if not os.path.exists(ALARMS_DB_PATH):
         return []
@@ -226,6 +258,48 @@ def load_rules():
     except Exception as e:
         log(f"[rules] load error: {e}")
         return []
+
+
+def load_preset_rules():
+    """Enabled predefined alarms, as synthetic rules the normal engine can run.
+
+    Their id is the string "preset:<key>" — unique against the integer rule ids,
+    and the same key alarms.php uses for the "riarma" button on that row."""
+    if not os.path.exists(ALARMS_DB_PATH):
+        return []
+    rules = []
+    try:
+        uri = f"file:{ALARMS_DB_PATH}?mode=ro"
+        con = sqlite3.connect(uri, uri=True, timeout=2)
+        try:
+            enabled = [r[0] for r in con.execute(
+                "SELECT key FROM presets WHERE enabled = 1")]
+        except sqlite3.OperationalError:
+            enabled = []  # presets table not created yet
+        con.close()
+    except Exception as e:
+        log(f"[presets] load error: {e}")
+        return []
+    for key in enabled:
+        meta = PRESET_ALARMS.get(key)
+        if not meta:
+            continue  # a preset removed from the code but still stored
+        rules.append({
+            "id": f"preset:{key}",
+            "enabled": 1,
+            "message": meta["message"],
+            "icon": meta["icon"],
+            "restore_icon": meta["restore_icon"],
+            "restore_message": meta["restore_message"],
+            "bot_id": None,
+            "conditions": [{"kind": "preset", "source": key}],
+        })
+    return rules
+
+
+def load_rules():
+    """User rules from alarms.php plus the enabled predefined alarms."""
+    return _load_user_rules() + load_preset_rules()
 
 
 def load_bots():
@@ -864,7 +938,7 @@ def format_status():
     if not row:
         return "Nessun dato disponibile."
 
-    parts = [format_temperatures(row), format_energy(row)]
+    parts = [format_temperatures(row), format_energy(row), format_battery()]
     sid = row.get("station_id")
     if sid is not None:
         parts.append(f"<i>Stazione {sid}</i>")
@@ -1042,16 +1116,161 @@ def format_energy(row=None):
     return "\n".join(lines)
 
 
+# ── Battery report ──────────────────────────────────────────────────────────
+def fetch_battery():
+    """Latest `batteria` row as a dict, or None when the table is absent, empty
+    or its newest row is older than BATTERY_STALE_S."""
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=2)
+        con.row_factory = sqlite3.Row
+        row = con.execute("SELECT * FROM batteria ORDER BY id DESC LIMIT 1").fetchone()
+        con.close()
+    except Exception as e:
+        log(f"[db] battery: {e}")
+        return None
+    if not row:
+        return None
+    row = dict(row)
+    try:
+        age = (datetime.utcnow()
+               - datetime.strptime(row.get("timestamp"), "%Y-%m-%dT%H:%M:%SZ")).total_seconds()
+    except (TypeError, ValueError):
+        return None
+    return row if age <= BATTERY_STALE_S else None
+
+
+def battery_today_kwh():
+    """(charged, discharged) kWh since local midnight.
+
+    Integrated from the stored power samples because the Venus' lifetime
+    counters are not reliably published: trapezoid over consecutive rows, gaps
+    longer than 5 min skipped rather than bridged so a receiver that was down
+    cannot invent energy. Mirrors integrate_kwh() in batteria.php."""
+    local_midnight = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    since = (local_midnight + (datetime.utcnow() - datetime.now())).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        con = sqlite3.connect(DB_PATH, timeout=2)
+        rows = con.execute(
+            "SELECT timestamp, battery_power FROM batteria WHERE timestamp >= ? ORDER BY id ASC",
+            (since,)).fetchall()
+        con.close()
+    except Exception as e:
+        log(f"[report] battery daily: {e}")
+        return (None, None)
+
+    charge = discharge = 0.0
+    prev_t = prev_p = None
+    for ts, power in rows:
+        try:
+            t = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")
+            p = float(power)
+        except (TypeError, ValueError):
+            prev_t = prev_p = None
+            continue
+        if prev_t is not None:
+            dt_s = (t - prev_t).total_seconds()
+            if 0 < dt_s <= 300:
+                wh = (p + prev_p) / 2.0 * dt_s / 3600.0
+                if wh > 0:
+                    charge += wh
+                else:
+                    discharge -= wh
+        prev_t, prev_p = t, p
+    return (charge / 1000.0, discharge / 1000.0)
+
+
+def battery_state_label(power):
+    """Same three states the dashboard badge shows, from the pack power."""
+    if power is None:
+        return "nessun dato"
+    if power > BATTERY_IDLE_W:
+        return "in carica"
+    if power < -BATTERY_IDLE_W:
+        return "in scarica"
+    return "in attesa"
+
+
+def format_battery(row=None):
+    """Marstek Venus E: charge state first, then the pack detail (temperatures
+    and cell balance) that says whether it is healthy.
+
+    Same block shape as the other reports: the value on the headline, the
+    context in italics underneath."""
+    row = row if row is not None else fetch_battery()
+    if not row:
+        return ("🔋 Batteria\nNessun dato dalla Marstek Venus E "
+                "(battery_bridge.py fermo o batteria non raggiungibile).")
+
+    def num(key):
+        v = row.get(key)
+        try:
+            f = float(v)
+            return f if f == f else None   # reject NaN
+        except (TypeError, ValueError):
+            return None
+
+    def unit(value, decimals, suffix):
+        return f"{value:.{decimals}f}{suffix}" if value is not None else "--"
+
+    soc   = num("soc")
+    power = num("battery_power")
+    lines = report_header("🔋 Batteria", row.get("timestamp"))
+
+    residual = BATTERY_CAPACITY_KWH * soc / 100 if soc is not None else None
+    lines.append(f"🔋 <b>Carica</b>   {unit(soc, 0, '%')}"
+                 f"   ·   {unit(residual, 2, ' kWh')} di {BATTERY_CAPACITY_KWH:.2f} kWh")
+    soc_rng = fmt_range(*window_extremes("batteria", "soc"), decimals=0, unit="%")
+    if soc_rng:
+        lines.append(f"      <i>24h  {soc_rng}</i>")
+
+    lines.append(f"⚡ <b>Potenza pacco</b>   {fmt_w(abs(power) if power is not None else None)}"
+                 f"   ·   {battery_state_label(power)}")
+    charged, discharged = battery_today_kwh()
+    if charged is not None:
+        lines.append(f"      <i>oggi  ↑ {charged:.2f} kWh caricati"
+                     f"   ·   ↓ {discharged:.2f} kWh erogati</i>")
+
+    ac = num("ac_power")
+    lines.append(f"🔌 <b>Uscita AC</b>   {fmt_w(abs(ac) if ac is not None else None)}")
+    lines.append(f"      <i>{unit(num('ac_voltage'), 1, ' V')}"
+                 f"   ·   {unit(num('ac_frequency'), 2, ' Hz')}</i>")
+
+    lines.append(f"🔧 <b>Pacco</b>   {unit(num('battery_voltage'), 2, ' V')}"
+                 f"   ·   {unit(num('battery_current'), 1, ' A')}")
+    v_max, v_min = num("cell_voltage_max"), num("cell_voltage_min")
+    v_spread = (v_max - v_min) * 1000 if (v_max is not None and v_min is not None) else None
+    lines.append(f"      <i>celle {unit(v_min, 3, ' V')}–{unit(v_max, 3, ' V')}"
+                 f"   ·   Δ {unit(v_spread, 0, ' mV')}</i>")
+
+    t_max, t_min = num("cell_temp_max"), num("cell_temp_min")
+    t_spread = t_max - t_min if (t_max is not None and t_min is not None) else None
+    lines.append(f"🌡️ <b>Celle</b>   {unit(t_min, 1, '°C')}–{unit(t_max, 1, '°C')}"
+                 f"   ·   Δ {unit(t_spread, 1, '°C')}")
+    lines.append(f"      <i>interna {unit(num('temperature'), 1, '°C')}"
+                 f"   ·   MOS {unit(num('temp_mos1'), 1, '°C')}"
+                 f" / {unit(num('temp_mos2'), 1, '°C')}</i>")
+
+    # The device's own strings, when the bridge publishes them: they say more
+    # than the power sign alone (e.g. a work mode that explains an idle pack).
+    device = "   ·   ".join(str(row[k]) for k in ("state", "mode") if row.get(k))
+    if device:
+        lines.append("")
+        lines.append(f"<i>{device}</i>")
+    return "\n".join(lines)
+
+
 # Report chooser shown by a bare /status. The callback_data values are also
 # accepted as text arguments (/status temp, /status energia, /status tutto).
 STATUS_REPORTS = {
     "temp":   ("🌡️ Temperature", format_temperatures),
     "energy": ("⚡ Energia",      format_energy),
+    "battery": ("🔋 Batteria",    format_battery),
     "all":    ("📋 Tutto",        lambda: format_status()),
 }
 STATUS_ALIASES = {
     "temp": "temp", "temperature": "temp", "temperatura": "temp", "t": "temp",
     "energy": "energy", "energia": "energy", "e": "energy",
+    "battery": "battery", "batteria": "battery", "b": "battery",
     "all": "all", "tutto": "all", "completo": "all",
 }
 
@@ -1153,9 +1372,10 @@ def format_alarms_summary():
 HELP_TEXT = (
     "Stazione Meteo bot\n"
     "Comandi:\n"
-    "/status — scegli il report (temperature / energia / tutto)\n"
+    "/status — scegli il report (temperature / energia / batteria / tutto)\n"
     "/temperature — tutte le temperature e umidità\n"
     "/energia — produzione e consumi elettrici\n"
+    "/batteria — carica, potenza e salute della batteria\n"
     "/forecast — previsione 6am (cielo sereno)\n"
     "/alarms — soglie configurate e allarmi attivi\n"
     "/reboot — riavvia il Raspberry\n"
@@ -1205,12 +1425,15 @@ def handle_command(text):
             return status_menu()
         key = STATUS_ALIASES.get(arg)
         if not key:
-            return "Report sconosciuto. Usa /status temp, /status energia o /status tutto."
+            return ("Report sconosciuto. Usa /status temp, /status energia, "
+                    "/status batteria o /status tutto.")
         return format_status_report(key)
     if cmd == "/temperature":
         return format_status_report("temp")
     if cmd == "/energia":
         return format_status_report("energy")
+    if cmd == "/batteria":
+        return format_status_report("battery")
     if cmd == "/forecast":
         return format_forecast()
     if cmd == "/alarms":
