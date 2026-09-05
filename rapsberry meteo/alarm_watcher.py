@@ -722,6 +722,40 @@ def evaluate_stale_cond(cond, row):
     return False
 
 
+def evaluate_preset_battery_no_ac():
+    """True when the battery is answering but reports no mains voltage.
+
+    None (undecided) when the battery itself is unreachable or the reading is
+    stale: a dead Modbus bridge is a different failure and must not be reported
+    as a blackout. None also keeps an already-fired alarm latched instead of
+    silently rearming while the battery is out of touch."""
+    row = fetch_battery()
+    if row is None:
+        return None
+    v = row.get("ac_voltage")
+    try:
+        v = float(v)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(v):
+        return None
+    return v < BATTERY_AC_MIN_V
+
+
+def evaluate_preset_cond(cond):
+    """Dispatch a preset condition to its hardwired evaluator."""
+    key = cond.get("source")
+    if key == "battery_no_ac":
+        return evaluate_preset_battery_no_ac()
+    return None  # unknown preset: never fires
+
+
+def rule_needs_reading(rule):
+    """False for rules made only of preset conditions — those read their own
+    source and must still be evaluated when the meteo row is missing."""
+    return any(c["kind"] != "preset" for c in rule.get("conditions", []))
+
+
 def is_scheduled_rule(rule):
     return any(c["kind"] == "schedule" for c in rule.get("conditions", []))
 
@@ -748,6 +782,10 @@ def rule_describe(rule):
                 parts.append(f"{label} non trasmette (>{int(mins)} min)")
             else:
                 parts.append(f"{label} non trasmette")
+        elif c["kind"] == "preset":
+            key = c.get("source")
+            meta = PRESET_ALARMS.get(key)
+            parts.append(meta["label"] if meta else "preset " + str(key))
         elif c["kind"] == "time_window":
             days = format_days_mask(c.get("days_mask"))
             tail = "" if days == "ogni giorno" else f" ({days})"
@@ -807,6 +845,12 @@ def _eval_non_schedule_conditions(rule, row, now_t, today_bit):
                 return False
         elif kind == "stale":
             res = evaluate_stale_cond(c, row)
+            if res is None:
+                return None
+            if not res:
+                return False
+        elif kind == "preset":
+            res = evaluate_preset_cond(c)
             if res is None:
                 return None
             if not res:
@@ -897,7 +941,7 @@ def check_alarms():
         # next rising edge. `verified is None` (missing source) keeps the
         # current state so a sensor dropout doesn't silently rearm.
         entry = state.get(rid) if isinstance(state.get(rid), dict) else {}
-        if row is None:
+        if row is None and rule_needs_reading(rule):
             continue
         verified = _eval_non_schedule_conditions(rule, row, now_t, today_bit)
 

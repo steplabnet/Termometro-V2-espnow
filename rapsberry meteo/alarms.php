@@ -64,10 +64,10 @@ define('STALE_ANY_SOURCE', '__any__');
 $PRESETS = [
   'battery_no_ac' => [
     'label'           => 'Batteria — Rete AC assente',
-    'hint'            => "Scatta quando la batteria e' raggiungibile ma la tensione di rete "
-                       . "letta dall'inverter e' sotto 100 V (blackout o distacco). "
+    'hint'            => "Scatta quando la batteria è raggiungibile ma la tensione di rete "
+                       . "letta dall'inverter è sotto 100 V (blackout o distacco). "
                        . "Se la batteria stessa non risponde l'allarme non scatta: quel caso "
-                       . "e' un guasto del ponte Modbus, non un'assenza di rete.",
+                       . "è un guasto del ponte Modbus, non un'assenza di rete.",
     'icon'            => '⚡',
     'message'         => 'Batteria: rete AC assente.',
     'restore_icon'    => '✅',
@@ -1071,6 +1071,12 @@ $tpl_cond_schedule  = schedule_cond_html('__I__', '__J__');
       border-radius: .5rem;
       padding: .6rem .75rem;
       margin-bottom: .5rem;
+    }
+    .preset-toggle {
+      display: flex;
+      align-items: flex-start;
+      gap: .6rem;
+      flex: 1;
       cursor: pointer;
     }
     .preset-row.active { background: #dcfce7; border-color: #86efac; }
@@ -1113,25 +1119,29 @@ $tpl_cond_schedule  = schedule_cond_html('__I__', '__J__');
     <?php $preset_state = load_alarm_state(); ?>
     <?php foreach ($PRESETS as $key => $pr): ?>
       <?php $active = rule_is_active($preset_state, 'preset:' . $key); ?>
-      <label class="preset-row<?= $active ? ' active' : '' ?>">
-        <input type="checkbox" name="preset[<?= htmlspecialchars($key) ?>]" value="1"
-          <?= !empty($PRESET_ON[$key]) ? 'checked' : '' ?>>
-        <span class="preset-icon"><?= htmlspecialchars($pr['icon']) ?></span>
-        <span class="preset-body">
-          <span class="preset-label"><?= htmlspecialchars($pr['label']) ?></span>
-          <span class="preset-hint"><?= htmlspecialchars($pr['hint']) ?></span>
-        </span>
+      <div class="preset-row<?= $active ? ' active' : '' ?>">
+        <label class="preset-toggle">
+          <input type="checkbox" name="preset[<?= htmlspecialchars($key) ?>]" value="1"
+            <?= !empty($PRESET_ON[$key]) ? 'checked' : '' ?>>
+          <span class="preset-icon"><?= htmlspecialchars($pr['icon']) ?></span>
+          <span class="preset-body">
+            <span class="preset-label"><?= htmlspecialchars($pr['label']) ?></span>
+            <span class="preset-hint"><?= htmlspecialchars($pr['hint']) ?></span>
+          </span>
+        </label>
         <?php if ($active): ?>
+          <!-- Same as the rule cards: submits #reset-form, clearing only the
+               latched state so the alarm can fire again. -->
           <button type="submit" form="reset-form" name="reset_id" value="preset:<?= htmlspecialchars($key) ?>"
             class="btn-reset" title="Azzera lo scatto: l'allarme torna a essere verificato">&#8635;</button>
         <?php endif; ?>
-      </label>
+      </div>
     <?php endforeach; ?>
     <div class="actions">
       <button type="submit">Salva predefiniti</button>
     </div>
     <p class="help">
-      Questi allarmi hanno la condizione gia' cablata in <code>alarm_watcher.py</code>:
+      Questi allarmi hanno la condizione già cablata in <code>alarm_watcher.py</code>:
       si possono solo attivare o disattivare, non modificare. Usano il bot predefinito
       di <code>zbot.py</code> e si comportano come le regole normali (anti-flapping di
       2 letture, messaggio di rientro quando la condizione si risolve).
@@ -1284,6 +1294,15 @@ $tpl_cond_schedule  = schedule_cond_html('__I__', '__J__');
     container.addEventListener('click', function (e) {
       if (e.target.closest('.btn-remove-rule, .btn-remove, .btn-add-cond, .btn-preset')) markDirty();
     });
+
+    // The predefined alarms live in their own form with their own save button:
+    // toggling one and leaving without saving must warn just the same.
+    const presetInput = document.querySelector('input[name="action"][value="save_presets"]');
+    const presetForm = presetInput ? presetInput.form : null;
+    if (presetForm) {
+      presetForm.addEventListener('change', markDirty);
+      presetForm.addEventListener('submit', function () { dirty = false; });
+    }
 
     // Saving clears the dirty state so the submit itself isn't blocked.
     rulesForm.addEventListener('submit', function () { dirty = false; });
