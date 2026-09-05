@@ -40,6 +40,7 @@ TARGETS=(
   "cronotermostato.php|/var/www/html|"
   "index.php|/var/www/html|"
   "batteria.php|/var/www/html|"
+  "carichi.php|/var/www/html|"
   "battery_bridge.py|/var/www/html|meteo-battery.service"
   "check_energy.py|/var/www/html|"
 )

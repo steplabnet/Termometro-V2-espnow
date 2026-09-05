@@ -342,6 +342,24 @@ function fmtDuration(float $hours): string
   return intdiv($mins, 60) . 'h ' . str_pad((string) ($mins % 60), 2, '0', STR_PAD_LEFT) . 'm';
 }
 
+/* Prossima occorrenza di un'ora del giorno a partire da $now: quella di oggi se
+ * deve ancora arrivare, altrimenti quella di domani.
+ *
+ * Le soglie della batteria sono ancorate alla notte in corso e non al
+ * calendario: chi guarda la dashboard alle 2 ha davanti la mattina fra sei ore,
+ * non quella del giorno dopo, e con 'tomorrow 08:00' venti ore di autonomia
+ * finirebbero colorate come un'emergenza.
+ */
+function nextClock(string $hhmm, int $now): int
+{
+  $today = strtotime("today $hhmm", $now);
+  if ($today !== false && $today > $now) {
+    return $today;
+  }
+  $tomorrow = strtotime("tomorrow $hhmm", $now);
+  return $tomorrow === false ? $now : $tomorrow;
+}
+
 function getTempClass($val)
 {
   return ($val < 1 && $val > -99) ? 'freezing' : '';
@@ -364,6 +382,182 @@ function meteo_db(): ?mysqli
  * Runs every query the dashboard needs and returns a render-ready tree.
  * Everything the browser has to patch on refresh is already a string in here.
  */
+/** Quanto a lungo il sole deve stare sopra il consumo prima di crederci (s). */
+defined('PV_COVER_SUSTAIN') || define('PV_COVER_SUSTAIN', 600);
+/** Buco nei dati oltre il quale una copertura in corso non e' piu' continua (s). */
+defined('PV_COVER_GAP') || define('PV_COVER_GAP', 1800);
+/** Ritardo del sole sulla riserva oltre il quale il pallino diventa rosso (s). */
+defined('ANA_LATE_RED') || define('ANA_LATE_RED', 7200);
+/** Finestra su cui la card Statistiche conta, in giorni. */
+defined('STATS_DAYS') || define('STATS_DAYS', 30);
+
+/* Le tre icone di stato della card "Inizio carica". Stanno qui e non nel
+ * template perche' e' il payload a sceglierle: la pagina le riceve gia' pronte
+ * e le sostituisce in diretta, senza doverne conoscere le regole. currentColor
+ * lascia il colore al contenitore, cosi' icona e tinta cambiano insieme. */
+defined('ANA_ICON_OK') || define('ANA_ICON_OK',
+  '<svg class="state-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"'
+  . ' stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/>'
+  . '<path d="m8.5 12.5 2.5 2.5 4.5-5"/></svg>');
+defined('ANA_ICON_WARN') || define('ANA_ICON_WARN',
+  '<svg class="state-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"'
+  . ' stroke-linecap="round" stroke-linejoin="round">'
+  . '<path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
+  . '<path d="M12 9v4"/><path d="M12 17h.01"/></svg>');
+defined('ANA_ICON_ALARM') || define('ANA_ICON_ALARM',
+  '<svg class="state-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"'
+  . ' stroke-linecap="round" stroke-linejoin="round">'
+  . '<path d="M8.6 2h6.8L22 8.6v6.8L15.4 22H8.6L2 15.4V8.6z"/>'
+  . '<path d="M12 7v6"/><path d="M12 17h.01"/></svg>');
+
+/* Primo momento, nella finestra [$from, $to), in cui il fotovoltaico arriva a
+ * $threshold watt e ci resta per PV_COVER_SUSTAIN secondi.
+ *
+ * La soglia e' la potenza che la batteria sta erogando adesso: quando il sole
+ * la raggiunge, quei watt li produce il tetto e il pacco puo' smettere di
+ * scaricarsi. Si guarda la produzione contro il prelievo vero del pacco e non
+ * contro il consumo di casa perche' e' il pacco che deve fermarsi, ed e' l'unica
+ * grandezza che si misura in questo istante invece di ricostruirla da somme e
+ * differenze.
+ *
+ * La condizione deve reggere per qualche minuto: una nuvola che si apre non e'
+ * l'inizio della carica.
+ *
+ * Torna anche `drop`: se DOPO il sorpasso, e PRIMA del massimo di produzione
+ * della giornata, il sole e' ricaduto sotto la soglia. Il limite del picco non
+ * e' un dettaglio -- dopo il picco la produzione cala sempre, e' il tramonto, e
+ * senza quel paletto ogni sera risulterebbe "con un calo". Prima del picco
+ * invece il sole dovrebbe salire: se scende sono nuvole, e l'ora del sorpasso
+ * regge molto meno.
+ */
+function pvCoverCrossing(mysqli $link, int $from, int $to, float $threshold): ?array
+{
+  try {
+    $res = $link->query(
+      "SELECT `data`, pvPower + 0 AS pv
+       FROM dati_meteo
+       WHERE `data` >= {$from} AND `data` < {$to} AND pvPower IS NOT NULL
+       ORDER BY `data` ASC"
+    );
+  } catch (Throwable $e) {
+    return null;
+  }
+  if (!($res instanceof mysqli_result)) {
+    return null;
+  }
+
+  $rows = [];
+  while ($row = $res->fetch_assoc()) {
+    if (is_numeric($row['pv'])) {
+      $rows[] = [(int) $row['data'], (float) $row['pv']];
+    }
+  }
+  if ($rows === []) {
+    return null;
+  }
+
+  // Primo sorpasso che tiene.
+  $runStart = null;
+  $runPv = null;
+  $prevTs = null;
+  $crossIdx = null;
+
+  foreach ($rows as $i => [$ts, $pv]) {
+    // Un buco lungo nei dati spezza la continuita': non si puo' dire che il
+    // sole abbia tenuto la soglia per dieci minuti se per dieci minuti non si
+    // e' guardato.
+    if ($prevTs !== null && $ts - $prevTs > PV_COVER_GAP) {
+      $runStart = null;
+    }
+    $prevTs = $ts;
+
+    if ($pv > PV_ZERO_THRESHOLD && $pv >= $threshold) {
+      if ($runStart === null) {
+        $runStart = $ts;
+        $runPv = $pv;
+        $crossIdx = $i;
+      }
+      if ($ts - $runStart >= PV_COVER_SUSTAIN) {
+        break;
+      }
+    } else {
+      $runStart = null;   // nuvola, o soglia salita: si ricomincia
+      $crossIdx = null;
+    }
+  }
+  if ($crossIdx === null || $runStart === null || $prevTs - $runStart < PV_COVER_SUSTAIN) {
+    return null;
+  }
+
+  // Indice del massimo di produzione: oltre quello si sta calando verso sera.
+  $peakIdx = 0;
+  foreach ($rows as $i => [, $pv]) {
+    if ($pv > $rows[$peakIdx][1]) {
+      $peakIdx = $i;
+    }
+  }
+
+  $drop = false;
+  for ($i = $crossIdx + 1; $i <= $peakIdx; $i++) {
+    if ($rows[$i][1] < $threshold) {
+      $drop = true;
+      break;
+    }
+  }
+
+  return ['ts' => $runStart, 'pv' => $runPv, 'drop' => $drop];
+}
+
+/* Quante volte, negli ultimi $days giorni, il pacco e' sceso fino alla riserva
+ * e si e' fermato li'.
+ *
+ * Si conta un giorno per volta -- un giorno il cui SoC minimo ha toccato
+ * BATT_RESERVE_SOC vale un evento -- invece di contare i singoli campioni sotto
+ * soglia, che sarebbero decine per ogni singolo svuotamento. Contare per giorni
+ * ha senso perche' per arrivare due volte alla riserva nello stesso giorno il
+ * pacco dovrebbe anche ricaricarsi del tutto in mezzo, cosa che non succede.
+ *
+ * Il conto lo fa il database: tornare 4000 righe di SoC a ogni aggiornamento
+ * della dashboard per contarle in PHP sarebbe lo stesso numero pagato molto piu'
+ * caro.
+ */
+function battReserveHits(mysqli $link, int $now, int $days): array
+{
+  $since = $now - $days * 86400;
+  $reserve = BATT_RESERVE_SOC;
+  $out = ['hits' => null, 'last' => null, 'observed' => null];
+
+  try {
+    $res = $link->query(
+      "SELECT COUNT(*) AS hits, MAX(d) AS last_day, MIN(d) AS first_day
+         FROM (SELECT DATE(FROM_UNIXTIME(`data`)) AS d, MIN(battSoc + 0) AS soc_min
+                 FROM dati_meteo
+                WHERE `data` >= {$since} AND battSoc IS NOT NULL
+                GROUP BY d
+               HAVING soc_min <= {$reserve}) AS giorni"
+    );
+    if ($res instanceof mysqli_result && ($row = $res->fetch_assoc())) {
+      $out['hits'] = (int) $row['hits'];
+      $out['last'] = $row['last_day'];
+    }
+
+    // Giorni davvero osservati: senza, "3 volte" non si sa se sia su un mese o
+    // su una settimana di dati.
+    $res2 = $link->query(
+      "SELECT COUNT(DISTINCT DATE(FROM_UNIXTIME(`data`))) AS n
+         FROM dati_meteo
+        WHERE `data` >= {$since} AND battSoc IS NOT NULL"
+    );
+    if ($res2 instanceof mysqli_result && ($row2 = $res2->fetch_assoc())) {
+      $out['observed'] = (int) $row2['n'];
+    }
+  } catch (Throwable $e) {
+    // Colonna assente o query rifiutata: la card mostra "--" e non si inventa
+    // un conteggio.
+  }
+  return $out;
+}
+
 function meteo_build_payload(mysqli $link): array
 {
   $now = time();
@@ -866,6 +1060,50 @@ function meteo_build_payload(mysqli $link): array
     $battColor = 'var(--text-muted)';
   }
 
+  /* Inizio carica: l'ora in cui il sole si prende il carico e la batteria
+   * smette di scaricarsi per cominciare a riempirsi.
+   *
+   * E' una misura, non una previsione meteo: si legge sul fotovoltaico di OGGI,
+   * il dato piu' fresco che questa dashboard abbia. Prima che il sorpasso di
+   * oggi sia avvenuto pero' non c'e' niente da leggere -- ed e' proprio la
+   * situazione in cui la card si vede, cioe' di notte a batteria in scarica --
+   * quindi in quel caso si ricade sull'ultima mattina osservata davvero, quella
+   * di ieri. Meglio l'ora dell'ultima alba vera che nessuna ora.
+   */
+  $anaCrossTs = null;   // istante del sorpasso, usato anche dalla stima batteria
+  $anaVal = '--';
+  $anaPv = '--';        // quanto produceva il sole in quel momento
+  $anaDrop = false;     // dopo il sorpasso il sole e' ricaduto sotto la soglia
+
+  // Soglia da raggiungere: i watt che il pacco sta erogando adesso. Si muove
+  // con la casa -- accendi il forno e l'ora si sposta in avanti, perche' al
+  // sole serve piu' tempo per arrivare a coprire un prelievo piu' grosso.
+  $anaThreshold = ($battDischarging && $safeBattPower0 !== null)
+    ? abs($safeBattPower0) : null;
+
+  if ($battAvailable && $emAvailable && $anaThreshold !== null) {
+    $tStart = strtotime('today 00:00', $now);
+    $cross = ($tStart === false)
+      ? null : pvCoverCrossing($link, $tStart, $now, $anaThreshold);
+
+    if ($cross === null) {
+      $yStart = strtotime('yesterday 00:00', $now);
+      $yEnd = strtotime('today 00:00', $now);
+      $cross = ($yStart === false || $yEnd === false)
+        ? null : pvCoverCrossing($link, $yStart, $yEnd, $anaThreshold);
+    }
+
+    if ($cross !== null) {
+      $anaCrossTs = (int) $cross['ts'];
+      $anaVal = date('H:i', $anaCrossTs);
+      // La potenza del sorpasso dice quanto sole ci vuole, in casa, perche' la
+      // batteria smetta di lavorare: e' la soglia da tenere d'occhio nei giorni
+      // coperti, quando l'ora da sola non basta a capire se ce la fara'.
+      $anaPv = fmtW($cross['pv']);
+      $anaDrop = (bool) $cross['drop'];
+    }
+  }
+
   /* Autonomy while discharging, time-to-full while charging: how long the
    * pack takes to get where it is going and at what time it arrives, at the
    * rate of the last half hour rather than the rate of this instant -- the
@@ -881,6 +1119,15 @@ function meteo_build_payload(mysqli $link): array
   $battEtaClock = '';
   $battEtaShow = false;
   $battEtaColor = 'var(--accent-orange)';
+  // Colore della barra imposto dalla stima invece che dal SoC: vale solo in
+  // scarica, quando la carica finisce entro stanotte o entro domattina presto.
+  // Resta null quando la stima non dice niente di urgente e la barra torna a
+  // colorarsi in base alla percentuale.
+  $battFillUrgency = null;
+  // Istanti su cui il pallino della card "Inizio carica" da' il suo giudizio:
+  // quando il pacco tocca la riserva e quando il sole se lo riprende.
+  $battEtaEnd = null;
+  $battSunTakeover = null;
   if (($battDischarging || $battCharging) && $safeBattSoc0 !== null) {
     /* Samples come from the RAM window first: it holds every reading of the
      * last half hour, where `dati_meteo` holds three or four of them. The DB
@@ -931,18 +1178,65 @@ function meteo_build_payload(mysqli $link): array
       // Green filling, orange emptying: the same colour the flow state uses,
       // so the two lines of the card never disagree about which way it is going.
       $battEtaColor = $battCharging ? 'var(--accent-green)' : 'var(--accent-orange)';
-      // The rate the estimate rests on, in both its units: a duration is only
-      // as good as the rate under it, and this is that rate.
-      $battEtaClock = ' &#183; ' . fmtW($eta['watts'])
-        . ' &#183; ' . number_format($eta['slope'], 1) . ' %/h';
-      if ($eta['hours'] > 24) {
-        // Past a day the linear extrapolation is fiction: the house will have
-        // charged and discharged again long before then.
-        $battEtaText = 'oltre 24 h';
+      $etaEnd = $now + (int) ($eta['hours'] * 3600);
+
+      // Prossima volta che il sole si riprende il carico, all'ora che la card
+      // "Inizio carica" ha misurato. nextClock la porta avanti alla giornata
+      // giusta: guardando la dashboard di notte il sorpasso e' quello di fra
+      // poche ore, non quello del giorno dopo.
+      $sunTakeover = ($anaCrossTs === null)
+        ? null : nextClock(date('H:i', $anaCrossTs), $now);
+
+      // Il pacco arriva al sorpasso: alla riserva non ci arriva mai, perche' da
+      // quell'ora il carico se lo prende il fotovoltaico e la scarica si ferma.
+      // Durata e ora di fine descriverebbero qualcosa che non succedera', quindi
+      // resta il solo ritmo in %/h, che e' l'unica cosa davvero misurata.
+      $etaRescuedBySun = !$battCharging && $sunTakeover !== null && $etaEnd >= $sunTakeover;
+
+      $battEtaEnd = $etaEnd;
+      $battSunTakeover = $sunTakeover;
+
+      // Oltre la mattina dopo la retta non descrive più niente: il sole avrà
+      // rimesso dentro corrente molto prima. Da lì in poi cadono l'ora di fine
+      // e i watt, che prometterebbero una precisione che la stima non ha.
+      $etaBeyondMorning = !$battCharging && $etaEnd > nextClock('09:00', $now);
+
+      // Colore della barra, letto sulla stessa scadenza che la riga racconta:
+      //   verde  = ce la fa fino al sorpasso del sole, non si svuota;
+      //   rosso  = la riserva arriva entro oggi;
+      //   giallo = ci arriva durante la notte, prima che il sole la salvi.
+      // Senza il dato di ieri (giornata coperta, storico assente) il sorpasso
+      // non esiste: resta il solo rosso per "finisce oggi" e per il resto la
+      // barra torna a colorarsi in base alla percentuale.
+      if (!$battCharging) {
+        if ($etaRescuedBySun) {
+          $battFillUrgency = 'var(--accent-green)';
+        } elseif ($etaEnd <= nextClock('00:00', $now)) {
+          $battFillUrgency = 'var(--accent-red)';
+        } elseif ($sunTakeover !== null) {
+          $battFillUrgency = 'var(--accent-yellow)';
+        }
+      }
+
+      if ($etaRescuedBySun) {
+        $battEtaText = number_format($eta['slope'], 1) . ' %/h';
+        $battEtaClock = '';
       } else {
-        $battEtaText = fmtDuration($eta['hours']);
-        $battEtaClock .= ' &#183; ' . ($battCharging ? 'pieno alle ' : 'fino alle ')
-          . date('H:i', $now + (int) ($eta['hours'] * 3600));
+        // The rate the estimate rests on, in both its units: a duration is only
+        // as good as the rate under it, and this is that rate.
+        $battEtaClock = $etaBeyondMorning ? '' : ' &#183; ' . fmtW($eta['watts']);
+        $battEtaClock .= ' &#183; ' . number_format($eta['slope'], 1) . ' %/h';
+        if ($eta['hours'] > 24) {
+          // Past a day the linear extrapolation is fiction: the house will have
+          // charged and discharged again long before then.
+          $battEtaText = 'oltre 24 h';
+        } else {
+          $battEtaText = fmtDuration($eta['hours']);
+          if (!$etaBeyondMorning) {
+            $battEtaClock .= ' &#183; ' . ($battCharging ? 'pieno alle ' : 'fino alle ')
+              . date('H:i', $etaEnd);
+          }
+        }
       }
       // Which of the two methods answered: a duration read off the SoC curve
       // and one read off the mean power are not the same claim, and the card
@@ -950,6 +1244,53 @@ function meteo_build_payload(mysqli $link): array
       if ($eta['basis'] === 'power') {
         $battEtaText .= ' (stima da potenza)';
       }
+    }
+  }
+
+  /* Icona sotto l'ora di "Inizio carica": dice se quell'ora arriva in tempo
+   * rispetto a quando il pacco tocca la riserva.
+   *
+   *   spunta         = il sole arriva prima che la batteria si svuoti, e da li'
+   *                    in poi non e' piu' ricaduto sotto la soglia;
+   *   triangolo      = l'ora ci starebbe, ma quel giorno dopo il sorpasso il
+   *                    sole e' ricaduto (nuvole: l'ora regge poco); oppure
+   *                    arriva in ritardo, ma per meno di due ore;
+   *   ottagono       = arriva con piu' di due ore di ritardo: quel buco lo paga
+   *                    la rete.
+   *
+   * Senza una delle due scadenze non si giudica: niente icona, che vuol dire
+   * "non lo so" invece di una spunta ottimista.
+   */
+  $anaIcon = '';
+  $anaIconColor = 'var(--text-muted)';
+  if ($battSunTakeover !== null && $battEtaEnd !== null) {
+    if ($battSunTakeover > $battEtaEnd + ANA_LATE_RED) {
+      $anaIcon = ANA_ICON_ALARM;
+      $anaIconColor = 'var(--accent-red)';
+    } elseif ($battSunTakeover > $battEtaEnd || $anaDrop) {
+      $anaIcon = ANA_ICON_WARN;
+      $anaIconColor = 'var(--accent-yellow)';
+    } else {
+      $anaIcon = ANA_ICON_OK;
+      $anaIconColor = 'var(--accent-green)';
+    }
+  }
+
+  /* Statistiche: per ora una sola voce, quante volte il pacco e' finito sulla
+   * riserva. La card e' pensata per crescere, quindi il calcolo sta qui e non
+   * dentro il blocco della batteria.
+   */
+  $statsHits = '--';
+  $statsLast = '--';
+  $statsWindow = STATS_DAYS . ' giorni';
+  if ($battAvailable) {
+    $st = battReserveHits($link, $now, STATS_DAYS);
+    if ($st['hits'] !== null) {
+      $statsHits = (string) $st['hits'];
+      $statsLast = ($st['last'] === null) ? 'mai' : date('d/m', (int) strtotime((string) $st['last']));
+    }
+    if ($st['observed'] !== null) {
+      $statsWindow = $st['observed'] . ' giorni osservati';
     }
   }
 
@@ -1180,6 +1521,14 @@ function meteo_build_payload(mysqli $link): array
 
     /* Everything the pack reports about itself. Rendered as plain strings
      * with their units: nothing here is charted or compared, it is read. */
+    // Statistiche sul pacco: quante volte e' arrivato alla riserva e quando.
+    'stats' => [
+      'show' => $battAvailable,
+      'hits' => $statsHits,
+      'last' => $statsLast,
+      'window' => $statsWindow,
+    ],
+
     'battDiag' => [
       'show' => ($battDiag !== []),
       'tCellMax'  => $fmtNum($safeBattTemp0, 1, '°C'),
@@ -1203,14 +1552,27 @@ function meteo_build_payload(mysqli $link): array
       'iAc'       => $fmtNum($acCurrent, 1, 'A'),
     ],
 
+    // Inizio carica: l'ora in cui il sole si prende il carico e la batteria
+    // smette di scaricarsi. Solo l'ora, ed e' l'unico numero su cui si decide.
+    // Si vede solo mentre il pacco scarica: fermo o in carica non serve.
+    'inizioCarica' => [
+      'show' => ($battAvailable && $emAvailable && $battDischarging),
+      'val' => $anaVal,
+      'pv' => $anaPv,
+      'icon' => $anaIcon,
+      'iconColor' => $anaIconColor,
+    ],
+
     'batteria' => [
       'val' => ($safeBattSoc0 === null ? '--' : (string) round($safeBattSoc0)),
       // Width of the fill bar, as a CSS length the poller can drop straight in.
       'fill' => ($safeBattSoc0 === null ? '0%'
         : max(0, min(100, round($safeBattSoc0))) . '%'),
+      // L'urgenza della stima batte la percentuale: un pacco al 60% che si
+      // svuota entro stanotte non è una situazione verde.
       'fillColor' => ($safeBattSoc0 === null ? 'var(--text-muted)'
-        : ($safeBattSoc0 <= 15 ? 'var(--accent-red)'
-          : ($safeBattSoc0 <= 35 ? 'var(--accent-orange)' : 'var(--accent-green)'))),
+        : ($battFillUrgency ?? ($safeBattSoc0 <= 15 ? 'var(--accent-red)'
+          : ($safeBattSoc0 <= 35 ? 'var(--accent-orange)' : 'var(--accent-green)')))),
       'charging' => $battCharging,
       'discharging' => $battDischarging,
       'flow' => $battFlow,

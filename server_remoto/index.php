@@ -61,6 +61,7 @@ function showStyle($cond): string
       --accent-blue: #3b82f6;
       --accent-orange: #f59e0b;
       --accent-red: #ef4444;
+      --accent-yellow: #eab308;
       --accent-teal: #14b8a6;
       --accent-ice: #0ea5e9;
       --accent-purple: #8b5cf6;
@@ -376,6 +377,36 @@ function showStyle($cond): string
     }
 
     .icon-house {
+      color: var(--accent-purple);
+    }
+
+    /* Statistiche: viola come le altre letture derivate. */
+    .border-stats {
+      border-top-color: var(--accent-purple);
+    }
+
+    .icon-stats {
+      color: var(--accent-purple);
+    }
+
+    .state-row {
+      display: flex;
+      justify-content: center;
+      padding: 6px 0 2px;
+    }
+
+    .state-icon {
+      width: 26px;
+      height: 26px;
+    }
+
+    /* Inizio carica: viola come le altre letture "derivate", per non farla
+       sembrare la misura diretta di uno strumento. */
+    .border-inizio {
+      border-top-color: var(--accent-purple);
+    }
+
+    .icon-inizio {
       color: var(--accent-purple);
     }
 
@@ -1018,6 +1049,42 @@ function showStyle($cond): string
       </div>
     <?php endif; ?>
 
+    <?php if (!empty($p['battAvailable']) && $emAvailable): ?>
+      <!-- 9c. Inizio carica: l'ora in cui il sole si prende il carico di casa e
+           la batteria smette di scaricarsi. E' l'ora misurata sul fotovoltaico
+           di oggi (o dell'ultima mattina osservata, se oggi il sorpasso non c'e'
+           ancora stato), non una previsione. Si vede solo mentre la batteria
+           scarica: a pacco fermo o in carica non serve a decidere niente. -->
+      <div class="card border-inizio" data-card="inizioCarica"
+        style="<?php echo showStyle($p['inizioCarica']['show']); ?>"
+        data-live-show="inizioCarica.show">
+        <a href="grafico.php?var=pvPower">
+          <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-inizio" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 3v2M5.6 7.6 4.2 6.2M18.4 7.6l1.4-1.4M3 14h2M19 14h2" />
+            <path d="M8 14a4 4 0 0 1 8 0" />
+            <path d="M2 18h20M6 21h12" />
+          </svg>
+          <div class="card-label">Inizio carica</div>
+          <div class="card-value"><span data-live="inizioCarica.val"><?php echo $p['inizioCarica']['val']; ?></span></div>
+
+          <!-- Icona di stato: spunta verde se il sole arriva prima che il pacco
+               tocchi la riserva, triangolo giallo se quel giorno dopo il
+               sorpasso e' ricaduto o se arriva in ritardo di meno di due ore,
+               ottagono rosso oltre. Il markup arriva gia' fatto dal payload. -->
+          <div class="state-row" style="color:<?php echo $p['inizioCarica']['iconColor']; ?>;"
+            data-live-html="inizioCarica.icon" data-live-color="inizioCarica.iconColor">
+            <?php echo $p['inizioCarica']['icon']; ?>
+          </div>
+
+          <div class="minmax-row">
+            <div class="minmax-item"><span class="minmax-label">Produzione a quell&rsquo;ora</span><span
+                class="minmax-val" data-live="inizioCarica.pv"><?php echo $p['inizioCarica']['pv']; ?></span></div>
+          </div>
+        </a>
+      </div>
+    <?php endif; ?>
+
     <?php if ($emAvailable): ?>
       <!-- 9b. Prelievo dalla rete: 0 quando il fotovoltaico copre tutto il
            consumo, altrimenti la parte importata dello scambio rete. -->
@@ -1187,6 +1254,36 @@ function showStyle($cond): string
             <span class="k">Pacco</span><span class="v"><a href="grafico.php?var=battCurr" data-live="battDiag.iPack"><?php echo $p['battDiag']['iPack']; ?></a></span>
             <span class="k">Rete AC (da W/V)</span><span class="v"><a href="grafico.php?var=battAcCurr" data-live="battDiag.iAc"><?php echo $p['battDiag']['iAc']; ?></a></span>
         </div>
+      </div>
+    <?php endif; ?>
+
+    <?php if (!empty($p['stats']['show'])): ?>
+      <!-- 13b. Statistiche del pacco. Per ora una voce sola: quante volte la
+           batteria e' scesa fino alla riserva del 12% e si e' fermata li'. Si
+           conta un giorno per volta -- per arrivarci due volte in un giorno il
+           pacco dovrebbe anche ricaricarsi del tutto in mezzo. -->
+      <div class="card border-stats" data-card="stats">
+        <a href="grafico.php?var=battSoc">
+          <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-stats" viewBox="0 0 24 24"
+            fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M3 3v18h18" />
+            <path d="M7 15l4-5 3 3 5-7" />
+          </svg>
+          <div class="card-label">Statistiche</div>
+          <div class="card-value"><span data-live="stats.hits"><?php echo $p['stats']['hits']; ?></span><span
+              class="card-unit"> volte a riserva</span></div>
+
+          <div class="flow-state" style="color:var(--text-muted);">
+            scariche complete fino al <?php echo (int) BATT_RESERVE_SOC; ?>%
+          </div>
+
+          <div class="minmax-row">
+            <div class="minmax-item"><span class="minmax-label">Ultima</span><span class="minmax-val"
+                data-live="stats.last"><?php echo $p['stats']['last']; ?></span></div>
+            <div class="minmax-item"><span class="minmax-label">Periodo</span><span class="minmax-val"
+                data-live="stats.window"><?php echo $p['stats']['window']; ?></span></div>
+          </div>
+        </a>
       </div>
     <?php endif; ?>
 
