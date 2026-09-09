@@ -42,9 +42,17 @@ defined('BATT_MAX_AGE') || define('BATT_MAX_AGE', 300);
  * only this one is included by index.php.
  */
 defined('BATTERY_DIAG_FIELDS') || define('BATTERY_DIAG_FIELDS', [
-  'battTempMin', 'battTempInt', 'battTempMos1', 'battTempMos2',
-  'battVolt', 'battCurr', 'battCellVMax', 'battCellVMin',
-  'battAcV', 'battAcHz', 'battAcW',
+  'battTempMin',
+  'battTempInt',
+  'battTempMos1',
+  'battTempMos2',
+  'battVolt',
+  'battCurr',
+  'battCellVMax',
+  'battCellVMin',
+  'battAcV',
+  'battAcHz',
+  'battAcW',
 ]);
 
 /**
@@ -63,8 +71,12 @@ defined('BATTERY_DIAG_FIELDS') || define('BATTERY_DIAG_FIELDS', [
  * in the sign of gridPower.
  */
 defined('EM_DETAIL_FIELDS') || define('EM_DETAIL_FIELDS', [
-  'emPvV', 'emPvA', 'emPvPf',
-  'emGridV', 'emGridA', 'emGridPf',
+  'emPvV',
+  'emPvA',
+  'emPvPf',
+  'emGridV',
+  'emGridA',
+  'emGridPf',
   'emHz',
 ]);
 
@@ -82,6 +94,18 @@ defined('BATT_RESERVE_SOC') || define('BATT_RESERVE_SOC', 12.0);
  * charge-ceiling register on the v3 map, so it fills to 100 and this is simply
  * full. */
 defined('BATT_FULL_SOC') || define('BATT_FULL_SOC', 100.0);
+
+/** Produzione sotto la quale il fotovoltaico e' considerato spento, in watt.
+ * Sotto questi watt e' notte (o quasi) e la scarica della batteria conta come
+ * copertura totale a prescindere dal contatore: non c'e' altra sorgente che
+ * possa reggere la casa al posto suo. */
+defined('BATT_PV_OFF_W') || define('BATT_PV_OFF_W', 10.0);
+
+/** Soglia sotto la quale una sorgente conta come spenta, in watt. Vale sia per
+ * la rete sia per il fotovoltaico: se nessuna delle due supera questi watt, la
+ * casa la sta tenendo su la batteria da sola. Non e' zero perche' i contatori
+ * non stanno mai esattamente a zero. */
+defined('BATT_COVER_W') || define('BATT_COVER_W', 30.0);
 
 /** How far back the autonomy estimate looks. Long enough that a kettle does
  * not set the slope, short enough to follow the evening as it changes. */
@@ -342,6 +366,15 @@ function fmtDuration(float $hours): string
   return intdiv($mins, 60) . 'h ' . str_pad((string) ($mins % 60), 2, '0', STR_PAD_LEFT) . 'm';
 }
 
+/* Durata in secondi come hh:mm:ss. Le ore non rientrano nelle 24: il totale
+ * di vita del pacco e' fatto per crescere oltre il giorno, e "312:40:05" dice
+ * quello che "0d 12h" nasconderebbe. */
+function fmtHms(int $secs): string
+{
+  $secs = max(0, $secs);
+  return sprintf('%d:%02d:%02d', intdiv($secs, 3600), intdiv($secs % 3600, 60), $secs % 60);
+}
+
 /* Prossima occorrenza di un'ora del giorno a partire da $now: quella di oggi se
  * deve ancora arrivare, altrimenti quella di domani.
  *
@@ -391,24 +424,224 @@ defined('ANA_LATE_RED') || define('ANA_LATE_RED', 7200);
 /** Finestra su cui la card Statistiche conta, in giorni. */
 defined('STATS_DAYS') || define('STATS_DAYS', 30);
 
+/* ---------- PROFILO MEDIO DEL FOTOVOLTAICO ----------
+ * La stima di "pieno alle" e' una retta: prende il ritmo dell'ultima mezz'ora
+ * e lo prolunga. Al mattino regge, dal primo pomeriggio no -- da li' in poi il
+ * sole cala fino a spegnersi, e una retta tirata sul ritmo delle 13 promette
+ * una carica che alle 18 non c'e' piu'. Il profilo medio degli ultimi giorni
+ * dice COME cala, quarto d'ora per quarto d'ora, e serve a correggere quella
+ * promessa.
+ */
+/** Giorni pieni di storico su cui si media la produzione. */
+defined('PV_PROFILE_DAYS') || define('PV_PROFILE_DAYS', 7);
+/** Larghezza di un intervallo del profilo, in secondi. `dati_meteo` tiene una
+ * riga ogni dieci minuti: a un quarto d'ora ogni casella ha uno o due campioni
+ * per giorno, abbastanza per una media e abbastanza fitto per il tramonto. */
+defined('PV_PROFILE_BUCKET') || define('PV_PROFILE_BUCKET', 900);
+/** Ora del giorno da cui la correzione entra in gioco. Prima di mezzogiorno il
+ * sole sta ancora salendo e la retta, semmai, e' pessimista. */
+defined('PV_PROFILE_FROM_HOUR') || define('PV_PROFILE_FROM_HOUR', 12);
+/** Produzione media minima nell'intervallo corrente per potersi calibrare, in
+ * watt. Sotto questa il rapporto fra oggi e la media e' una divisione per
+ * rumore. */
+defined('PV_PROFILE_MIN_W') || define('PV_PROFILE_MIN_W', 100.0);
+/** Tetto al fattore di calibrazione fra oggi e la media. Oltre questo non e'
+ * una giornata piu' bella della media: e' un profilo che non descrive oggi. */
+defined('PV_PROFILE_MAX_K') || define('PV_PROFILE_MAX_K', 3.0);
+/** Scarto oltre il quale le due stime non dicono la stessa cosa (s). Sotto i
+ * venti minuti la correzione non aggiunge niente e la riga resta com'e'. */
+defined('PV_PROFILE_TOLERANCE') || define('PV_PROFILE_TOLERANCE', 1200);
+/** Giorni con almeno un campione richiesti perche' il profilo valga. */
+defined('PV_PROFILE_MIN_DAYS') || define('PV_PROFILE_MIN_DAYS', 3);
+/** Quanto lontano si puo' pescare la riga di ieri per il confronto alla stessa
+ * ora, in secondi. `dati_meteo` ha una riga ogni dieci minuti e ieri non e'
+ * campionato agli stessi secondi di oggi: un quarto d'ora di tolleranza trova
+ * sempre qualcosa senza spostarsi a un'altra fase del sole. */
+defined('PV_YESTERDAY_TOL') || define('PV_YESTERDAY_TOL', 900);
+
 /* Le tre icone di stato della card "Inizio carica". Stanno qui e non nel
  * template perche' e' il payload a sceglierle: la pagina le riceve gia' pronte
  * e le sostituisce in diretta, senza doverne conoscere le regole. currentColor
  * lascia il colore al contenitore, cosi' icona e tinta cambiano insieme. */
-defined('ANA_ICON_OK') || define('ANA_ICON_OK',
+defined('ANA_ICON_OK') || define(
+  'ANA_ICON_OK',
   '<svg class="state-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"'
   . ' stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/>'
-  . '<path d="m8.5 12.5 2.5 2.5 4.5-5"/></svg>');
-defined('ANA_ICON_WARN') || define('ANA_ICON_WARN',
+  . '<path d="m8.5 12.5 2.5 2.5 4.5-5"/></svg>'
+);
+defined('ANA_ICON_WARN') || define(
+  'ANA_ICON_WARN',
   '<svg class="state-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"'
   . ' stroke-linecap="round" stroke-linejoin="round">'
   . '<path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>'
-  . '<path d="M12 9v4"/><path d="M12 17h.01"/></svg>');
-defined('ANA_ICON_ALARM') || define('ANA_ICON_ALARM',
+  . '<path d="M12 9v4"/><path d="M12 17h.01"/></svg>'
+);
+defined('ANA_ICON_ALARM') || define(
+  'ANA_ICON_ALARM',
   '<svg class="state-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"'
   . ' stroke-linecap="round" stroke-linejoin="round">'
   . '<path d="M8.6 2h6.8L22 8.6v6.8L15.4 22H8.6L2 15.4V8.6z"/>'
-  . '<path d="M12 7v6"/><path d="M12 17h.01"/></svg>');
+  . '<path d="M12 7v6"/><path d="M12 17h.01"/></svg>'
+);
+
+/**
+ * Produzione media del fotovoltaico per ora del giorno, sugli ultimi
+ * PV_PROFILE_DAYS giorni PIENI (oggi escluso: e' in corso, e mediarlo con se
+ * stesso non aggiunge niente).
+ *
+ * Torna [indice di intervallo => watt medi], dove l'indice e' il quarto d'ora
+ * dalla mezzanotte locale: 48 = le 12:00. Gli intervalli senza campioni non ci
+ * sono, e per chi legge valgono zero -- di notte e' esattamente giusto.
+ *
+ * Solo la FORMA conta. I watt assoluti di una settimana fa non sono quelli di
+ * oggi; quello che si riusa e' il modo in cui la produzione cala dal
+ * pomeriggio al tramonto, che dipende dal cielo del giorno molto meno di
+ * quanto dipenda dalla stagione e dall'orientamento del tetto.
+ *
+ * Il risultato sta in cache per la giornata: gli ingressi sono giorni chiusi e
+ * non cambiano piu' fino a domani, mentre il payload si ricostruisce ogni
+ * minuto e senza cache si porterebbe dietro una query da un migliaio di righe
+ * ogni volta. Anche un profilo vuoto viene scritto, altrimenti un impianto
+ * senza storico rifarebbe quella query un minuto dopo l'altro per non trovare
+ * mai niente.
+ */
+function pvDayProfile(mysqli $link, int $now): ?array
+{
+  $day = date('Y-m-d', $now);
+  $cacheFile = (instant_ram_ready() ? INSTANT_RAM_DIR : __DIR__) . '/pv_profile.json';
+
+  clearstatcache(true, $cacheFile);
+  if (is_readable($cacheFile)) {
+    $cached = json_decode((string) @file_get_contents($cacheFile), true);
+    if (is_array($cached) && ($cached['day'] ?? null) === $day
+      && isset($cached['profile']) && is_array($cached['profile'])) {
+      $profile = [];
+      foreach ($cached['profile'] as $idx => $w) {
+        $profile[(int) $idx] = (float) $w;
+      }
+      return $profile === [] ? null : $profile;
+    }
+  }
+
+  $todayStart = strtotime('today 00:00', $now);
+  if ($todayStart === false) {
+    return null;
+  }
+  $from = $todayStart - (PV_PROFILE_DAYS * 86400);
+
+  $sum = [];      // indice => watt sommati
+  $cnt = [];      // indice => campioni
+  $seenDays = []; // giorni con almeno un campione: uno solo non e' una media
+  try {
+    $res = $link->query(
+      "SELECT `data`, pvPower + 0 AS pv
+       FROM dati_meteo
+       WHERE `data` >= {$from} AND `data` < {$todayStart} AND pvPower IS NOT NULL
+       ORDER BY `data` ASC"
+    );
+    if ($res instanceof mysqli_result) {
+      while ($row = $res->fetch_assoc()) {
+        if (!is_numeric($row['pv'])) {
+          continue;
+        }
+        $ts = (int) $row['data'];
+        // Secondi dalla mezzanotte LOCALE, non dall'epoca: e' l'ora del giorno
+        // che deve allinearsi fra giorni diversi, e con l'ora legale in mezzo
+        // le due cose non coincidono.
+        $secOfDay = ((int) date('G', $ts)) * 3600 + ((int) date('i', $ts)) * 60
+          + (int) date('s', $ts);
+        $idx = intdiv($secOfDay, PV_PROFILE_BUCKET);
+        $sum[$idx] = ($sum[$idx] ?? 0.0) + max(0.0, (float) $row['pv']);
+        $cnt[$idx] = ($cnt[$idx] ?? 0) + 1;
+        $seenDays[date('Y-m-d', $ts)] = true;
+      }
+    }
+  } catch (Throwable $e) {
+    return null;   // niente storico: la correzione semplicemente non si fa
+  }
+
+  $profile = [];
+  if (count($seenDays) >= PV_PROFILE_MIN_DAYS) {
+    foreach ($sum as $idx => $tot) {
+      $profile[$idx] = $tot / $cnt[$idx];
+    }
+    ksort($profile);
+  }
+
+  @instant_write_atomic(
+    $cacheFile,
+    (string) json_encode(['day' => $day, 'built_at' => $now, 'profile' => $profile])
+  );
+
+  return $profile === [] ? null : $profile;
+}
+
+/**
+ * Dove arriva la carica di oggi seguendo il sole invece di una retta.
+ *
+ * $chargeW sono i watt con cui il pacco sta caricando adesso, gli stessi su
+ * cui la stima lineare si basa. Il profilo dice quanto vale, in media, questo
+ * momento della giornata e quanto varranno quelli dopo: il rapporto fra i due
+ * calibra oggi sulla media -- sereno k > 1, coperto k < 1 -- e da li' in poi la
+ * potenza di carica segue la stessa discesa che il sole ha in media, fino a
+ * spegnersi la sera.
+ *
+ * L'integrazione si ferma a mezzanotte, e in pratica molto prima: una carica
+ * fotovoltaica non puo' finire il giorno dopo, e una stima che dicesse "pieno
+ * alle 02:40" starebbe promettendo un sole che di notte non c'e'.
+ *
+ * Torna ['full' => ts|null, 'soc' => %, 'endTs' => ts, 'k' => float]:
+ *   full  = quando il pacco tocca $target, oppure null se oggi non ci arriva;
+ *   soc   = il SoC a fine giornata, cioe' la carica massima raggiungibile;
+ *   endTs = l'ultimo istante in cui il sole carica ancora qualcosa.
+ * null quando la calibrazione non e' possibile -- sole gia' basso o assente in
+ * questo momento: meglio nessuna correzione che una divisione per rumore.
+ */
+function battChargeSunEta(array $profile, int $now, float $soc, float $target, float $chargeW): ?array
+{
+  if ($chargeW <= 0 || $soc >= $target) {
+    return null;
+  }
+  $secOfDay = ((int) date('G', $now)) * 3600 + ((int) date('i', $now)) * 60 + (int) date('s', $now);
+  $dayStart = $now - $secOfDay;
+  $nowIdx = intdiv($secOfDay, PV_PROFILE_BUCKET);
+
+  $avgNow = $profile[$nowIdx] ?? 0.0;
+  if ($avgNow < PV_PROFILE_MIN_W) {
+    return null;
+  }
+  $k = min($chargeW / $avgNow, PV_PROFILE_MAX_K);
+
+  $lastIdx = intdiv(86400, PV_PROFILE_BUCKET) - 1;
+  $endTs = $now;
+  for ($i = $nowIdx; $i <= $lastIdx; $i++) {
+    $bucketStart = $dayStart + ($i * PV_PROFILE_BUCKET);
+    $slotFrom = ($i === $nowIdx) ? $now : $bucketStart;
+    $slotTo = $bucketStart + PV_PROFILE_BUCKET;
+    $dt = $slotTo - $slotFrom;
+    if ($dt <= 0) {
+      continue;
+    }
+    $watts = $k * ($profile[$i] ?? 0.0);
+    if ($watts < BATT_IDLE_W) {
+      continue;   // sotto questa soglia il pacco non carica: e' sera
+    }
+    $endTs = $slotTo;
+    $dSoc = ($watts * ($dt / 3600.0)) / 1000.0 / BATT_CAPACITY_KWH * 100.0;
+    if ($soc + $dSoc >= $target) {
+      $frac = ($target - $soc) / $dSoc;
+      return [
+        'full' => (int) round($slotFrom + ($frac * $dt)),
+        'soc' => $target,
+        'endTs' => $slotTo,
+        'k' => $k,
+      ];
+    }
+    $soc += $dSoc;
+  }
+
+  return ['full' => null, 'soc' => $soc, 'endTs' => $endTs, 'k' => $k];
+}
 
 /* Primo momento, nella finestra [$from, $to), in cui il fotovoltaico arriva a
  * $threshold watt e ci resta per PV_COVER_SUSTAIN secondi.
@@ -690,7 +923,9 @@ function meteo_build_payload(mysqli $link): array
         // with them on a database that predates them.
         try {
           $cols = implode(',', array_map(
-            static fn($c) => "`$c`", BATTERY_DIAG_FIELDS));
+            static fn($c) => "`$c`",
+            BATTERY_DIAG_FIELDS
+          ));
           $resD = $link->query("SELECT $cols FROM `dati_instant` WHERE `id` = 1");
           if ($resD instanceof mysqli_result && $rowD = $resD->fetch_assoc()) {
             foreach ($rowD as $k => $v) {
@@ -973,7 +1208,6 @@ function meteo_build_payload(mysqli $link): array
   // Fraction of the clear-sky reference we are actually producing right now.
   // Need a meaningful reference (>20 W) or we can't tell (deep night / no data).
   $sunFrac = ($hourPeak > 20 && $pvNow >= 0) ? min(1.0, $pvNow / $hourPeak) : null;
-  $sunPct = ($sunFrac !== null) ? (int) round($sunFrac * 100) : null;
 
   $skyNow = null; // ['text' => ..., 'color' => ...]
   if ($sunFrac !== null) {
@@ -1026,6 +1260,44 @@ function meteo_build_payload(mysqli $link): array
   }
   $pvPeak = ($em_max_pv !== null) ? fmtW($em_max_pv) : ($mm_max_power . ' W');
   $pvLink = $pvMetered ? 'grafico.php?var=pvPower' : 'grafico.php?var=power';
+
+  /* La produzione di ieri alla stessa ora. Dice, in un numero solo, se oggi il
+   * tetto sta andando meglio o peggio -- confronto che l'irraggiamento in
+   * percentuale non faceva: quello misurava il cielo contro il massimo della
+   * settimana, non contro la giornata precedente, ed era la stessa cosa che la
+   * riga "Sereno / Nuvoloso" qui sopra dice gia' a parole.
+   *
+   * Si legge la stessa colonna che la card sta mostrando adesso -- il contatore
+   * quando c'e', la stima ADC altrimenti -- perche' due sorgenti diverse non si
+   * confrontano fra loro. La riga piu' vicina alle 24 ore esatte entro
+   * PV_YESTERDAY_TOL, e nessuna se ieri a quest'ora non si e' registrato niente
+   * (impianto nuovo, o un buco nei dati).
+   */
+  $pvYesterday = null;
+  $pvCol = $pvMetered ? 'pvPower' : 'power';
+  $pvRef = $now - 86400;
+  $pvYFrom = $pvRef - PV_YESTERDAY_TOL;
+  $pvYTo = $pvRef + PV_YESTERDAY_TOL;
+  try {
+    $resY = $link->query(
+      "SELECT `{$pvCol}` + 0 AS pv
+       FROM dati_meteo
+       WHERE `data` BETWEEN {$pvYFrom} AND {$pvYTo} AND `{$pvCol}` IS NOT NULL
+       ORDER BY ABS(`data` - {$pvRef}) ASC
+       LIMIT 1"
+    );
+    if ($resY instanceof mysqli_result) {
+      $rowY = $resY->fetch_assoc();
+      if ($rowY !== null && is_numeric($rowY['pv'])) {
+        $pvYesterday = max(0.0, (float) $rowY['pv']);
+        if ($pvYesterday < PV_ZERO_THRESHOLD) {
+          $pvYesterday = 0.0;   // stessa soglia del valore di oggi
+        }
+      }
+    }
+  } catch (Throwable $e) {
+    // Colonna assente o storico vuoto: la voce mostra '--'.
+  }
 
   /** ---------- 7. GRID DIRECTION ---------- */
   $exporting = ($safeGrid0 !== null && $safeGrid0 < 0);
@@ -1128,6 +1400,12 @@ function meteo_build_payload(mysqli $link): array
   // quando il pacco tocca la riserva e quando il sole se lo riprende.
   $battEtaEnd = null;
   $battSunTakeover = null;
+  // Correzione della stima di carica col profilo medio del sole: l'ora di pieno
+  // rifatta seguendo la discesa del pomeriggio, e -- quando quella discesa non
+  // basta ad arrivare al 100% -- il massimo che oggi si puo' raggiungere.
+  $sunFullTs = null;
+  $sunMaxSoc = null;
+  $sunMaxTs = null;
   if (($battDischarging || $battCharging) && $safeBattSoc0 !== null) {
     /* Samples come from the RAM window first: it holds every reading of the
      * last half hour, where `dati_meteo` holds three or four of them. The DB
@@ -1201,6 +1479,36 @@ function meteo_build_payload(mysqli $link): array
       // e i watt, che prometterebbero una precisione che la stima non ha.
       $etaBeyondMorning = !$battCharging && $etaEnd > nextClock('09:00', $now);
 
+      /* In carica, dal primo pomeriggio, la retta va confrontata col sole che
+       * c'e' davvero. Il ritmo dell'ultima mezz'ora e' quello di ADESSO: se
+       * sono le 14 e il pacco prende 2 kW, prolungarlo dice "pieno alle 17"
+       * ignorando che alle 17 il tetto fara' un quinto di quei watt. Il
+       * profilo medio degli ultimi PV_PROFILE_DAYS giorni rifa' il conto
+       * seguendo quella discesa.
+       *
+       * Se le due stime cadono a meno di PV_PROFILE_TOLERANCE l'una dall'altra
+       * sono d'accordo e la riga resta com'e'. Altrimenti vince il profilo:
+       * o l'ora corretta, o -- quando il sole finisce prima del 100% -- la
+       * carica massima che la giornata permette.
+       *
+       * Da qui viene anche il paletto della mezzanotte: una carica solare non
+       * puo' finire domani, e senza questo controllo una giornata coperta
+       * produce senza fatica un "pieno alle 03:20".
+       */
+      if ($battCharging && (int) date('G', $now) >= PV_PROFILE_FROM_HOUR) {
+        $pvProfile = pvDayProfile($link, $now);
+        $sun = ($pvProfile === null) ? null
+          : battChargeSunEta($pvProfile, $now, $safeBattSoc0, $target, $eta['watts']);
+        if ($sun !== null) {
+          if ($sun['full'] === null) {
+            $sunMaxSoc = $sun['soc'];
+            $sunMaxTs = (int) $sun['endTs'];
+          } elseif (abs((int) $sun['full'] - $etaEnd) > PV_PROFILE_TOLERANCE) {
+            $sunFullTs = (int) $sun['full'];
+          }
+        }
+      }
+
       // Colore della barra, letto sulla stessa scadenza che la riga racconta:
       //   verde  = ce la fa fino al sorpasso del sole, non si svuota;
       //   rosso  = la riserva arriva entro oggi;
@@ -1237,6 +1545,35 @@ function meteo_build_payload(mysqli $link): array
               . date('H:i', $etaEnd);
           }
         }
+      }
+
+      /* La correzione col sole riscrive la riga, invece di aggiungersi in
+       * coda: due orari di pieno diversi sulla stessa card non si commentano a
+       * vicenda, si contraddicono. Restano i watt e i %/h, che sono misurati e
+       * valgono comunque, e resta detto da dove viene la correzione.
+       */
+      if ($sunMaxSoc !== null) {
+        // Oggi il 100% non arriva: quello che conta non e' piu' "quando", e'
+        // "fin dove". Giallo perche' e' una carica che finisce a meta'.
+        $battEtaText = 'max ' . round($sunMaxSoc) . '%';
+        $battEtaClock = ' &#183; ' . fmtW($eta['watts'])
+          . ' &#183; ' . number_format($eta['slope'], 1) . ' %/h'
+          . ' &#183; sole fino alle ' . date('H:i', $sunMaxTs)
+          . ' (media ' . PV_PROFILE_DAYS . ' gg)';
+        $battEtaColor = 'var(--accent-yellow)';
+        $battEtaEnd = $sunMaxTs;
+      } elseif ($sunFullTs !== null) {
+        $battEtaText = fmtDuration(max(0, $sunFullTs - $now) / 3600.0);
+        $battEtaClock = ' &#183; ' . fmtW($eta['watts'])
+          . ' &#183; ' . number_format($eta['slope'], 1) . ' %/h'
+          . ' &#183; pieno alle ' . date('H:i', $sunFullTs)
+          . ' (media ' . PV_PROFILE_DAYS . ' gg)';
+        $battEtaEnd = $sunFullTs;
+      } elseif ($battCharging && $etaEnd >= nextClock('00:00', $now)) {
+        // Senza profilo utilizzabile resta almeno il paletto: il sole non
+        // carica di notte, quindi l'ora di pieno di domani non si stampa.
+        $battEtaClock = str_replace(' &#183; pieno alle ' . date('H:i', $etaEnd), '', $battEtaClock);
+        $battEtaClock .= ' &#183; non entro oggi';
       }
       // Which of the two methods answered: a duration read off the SoC curve
       // and one read off the mean power are not the same claim, and the card
@@ -1276,6 +1613,57 @@ function meteo_build_payload(mysqli $link): array
     }
   }
 
+  /* Da dove arriva, in questo istante, la corrente che casa sta usando. Le tre
+   * sorgenti non si misurano una per una: si ricavano dai segni.
+   *
+   *   rete       = quota importata dello scambio (gridPower > 0);
+   *   batteria   = quanto il pacco sta erogando (battPower < 0);
+   *   fotovoltaico = quello che resta del consumo, cioe' la parte di produzione
+   *                  che non e' finita ne' in rete ne' nel pacco.
+   *
+   * Il fotovoltaico per differenza e non come pvPower: quando l'impianto
+   * esporta o carica la batteria, pvPower e' piu' grande del contributo che i
+   * pannelli danno DAVVERO alle prese di casa, e le tre barre non tornerebbero.
+   */
+  $mix = [
+    'show' => false,
+    'pv' => '0%',
+    'batt' => '0%',
+    'grid' => '0%',
+    'pvW' => '--',
+    'battW' => '--',
+    'gridW' => '--'
+  ];
+  $mixGridW = null;
+  $mixPvW = null;
+  if ($safeCasa0 !== null && $safeCasa0 > 0 && $safeGrid0 !== null) {
+    $fromGrid = min(max(0.0, $safeGrid0), $safeCasa0);
+    $fromBatt = ($safeBattPower0 !== null) ? max(0.0, -$safeBattPower0) : 0.0;
+    $fromBatt = min($fromBatt, max(0.0, $safeCasa0 - $fromGrid));
+    $fromPv = max(0.0, $safeCasa0 - $fromGrid - $fromBatt);
+    // I due contributi in watt servono anche al contatore di scarica, che su
+    // questi decide se la batteria stava reggendo la casa da sola.
+    $mixGridW = $fromGrid;
+    $mixPvW = $fromPv;
+    $sum = $fromPv + $fromBatt + $fromGrid;
+    if ($sum > 0) {
+      // La rete prende il resto invece del suo arrotondamento: cosi' le tre
+      // larghezze fanno esattamente 100% e la barra non lascia un filo vuoto.
+      $pctPv = (int) round($fromPv / $sum * 100);
+      $pctBatt = (int) round($fromBatt / $sum * 100);
+      $pctGrid = max(0, 100 - $pctPv - $pctBatt);
+      $mix = [
+        'show' => true,
+        'pv' => $pctPv . '%',
+        'batt' => $pctBatt . '%',
+        'grid' => $pctGrid . '%',
+        'pvW' => fmtW($fromPv),
+        'battW' => fmtW($fromBatt),
+        'gridW' => fmtW($fromGrid),
+      ];
+    }
+  }
+
   /* Statistiche: per ora una sola voce, quante volte il pacco e' finito sulla
    * riserva. La card e' pensata per crescere, quindi il calcolo sta qui e non
    * dentro il blocco della batteria.
@@ -1283,6 +1671,63 @@ function meteo_build_payload(mysqli $link): array
   $statsHits = '--';
   $statsLast = '--';
   $statsWindow = STATS_DAYS . ' giorni';
+
+  /* Quanto la batteria ha davvero retto la casa. Il contatore avanza qui
+   * perche' qui si sa se il pacco sta scaricando, e questa funzione gira a
+   * ogni upload del Pi (~60 s): l'intervallo fra due passaggi e' l'unita' di
+   * misura. Il giorno in corso sta in /dev/shm, ieri e il totale su disco --
+   * vedi batt_runtime_accumulate().
+   *
+   * Copertura totale in due casi.
+   *
+   * Il primo e' il fotovoltaico spento (produzione sotto BATT_PV_OFF_W): di
+   * notte non c'e' nient'altro in campo, la batteria sta reggendo la casa e
+   * quelle ore contano intere, anche se il contatore intanto tira qualche
+   * watt -- quella e' la parte di carico che il pacco non riesce a seguire,
+   * non una seconda sorgente.
+   *
+   * Il secondo e' di giorno: nessuna delle due sorgenti supera BATT_COVER_W,
+   * quindi ne' la rete ne' i pannelli stanno dando qualcosa alle prese.
+   *
+   * Senza le letture non si puo' dire, e quel tempo finisce fra i parziali:
+   * meglio sottostimare le ore "da sola" che regalarle. */
+  $battNightPv = ($safePv0 !== null && $safePv0 < BATT_PV_OFF_W);
+  $battFullCover = ($battDischarging && (
+    // Impianto fermo: la giornata e' finita e quello che tiene su la casa e'
+    // il pacco, punto. Quel poco che eventualmente entra dalla rete e' la
+    // coda che la batteria non ce la fa a seguire, non un'altra sorgente.
+    $battNightPv
+    || ($mixGridW !== null && $mixPvW !== null
+      && $mixGridW <= BATT_COVER_W && $mixPvW <= BATT_COVER_W)
+  ));
+  $rt = batt_runtime_accumulate(
+    $battAvailable && $battDischarging,
+    $battAvailable && $battFullCover,
+    $battAvailable && $battCharging,
+    $now
+  );
+
+  $statsToday = fmtHms((int) $rt['day_secs']);
+  $statsTotal = fmtHms((int) $rt['total_secs'] + (int) $rt['day_secs']);
+  $statsTodayFull = fmtHms((int) $rt['day_full']);
+  $statsTodayPart = fmtHms((int) $rt['day_secs'] - (int) $rt['day_full']);
+  /* "Ieri" e' il ciclo precedente, non il giorno di calendario: la giornata
+   * qui va da quando il pacco inizia a caricare la mattina a quando ricomincia
+   * la mattina dopo (vedi batt_runtime_accumulate). Vale solo se quel ciclo e'
+   * ancora vicino a questo -- con il sito fermo a lungo `prev_*` resta su
+   * qualcosa di molto piu' vecchio, e chiamarlo "ieri" sarebbe una bugia. */
+  $prevGap = ((int) $rt['prev_start'] > 0)
+    ? (int) $rt['cycle_start'] - (int) $rt['prev_start'] : null;
+  $hasPrev = ($prevGap !== null && $prevGap > 0 && $prevGap <= BATT_PREV_MAX);
+  $statsYestFull = $hasPrev ? fmtHms((int) $rt['prev_full']) : '--';
+  $statsYestPart = $hasPrev
+    ? fmtHms((int) $rt['prev_secs'] - (int) $rt['prev_full']) : '--';
+  $statsTotFull = fmtHms((int) $rt['total_full'] + (int) $rt['day_full']);
+  $statsTotPart = fmtHms(
+    ((int) $rt['total_secs'] + (int) $rt['day_secs'])
+    - ((int) $rt['total_full'] + (int) $rt['day_full'])
+  );
+
   if ($battAvailable) {
     $st = battReserveHits($link, $now, STATS_DAYS);
     if ($st['hits'] !== null) {
@@ -1347,6 +1792,32 @@ function meteo_build_payload(mysqli $link): array
     ? $safeCasa0 + ($battDraw ?? 0.0)
     : null;
 
+  /* Le due quote della card "Casa + Batteria": quanto di quel totale va alle
+   * prese e quanto finisce nel pacco. Qui non c'e' niente da ricavare dai
+   * segni -- sono i due addendi della somma appena fatta -- ma le larghezze si
+   * preparano lo stesso nel payload, cosi' la pagina non fa conti. */
+  $cbMix = [
+    'show' => false,
+    'casa' => '0%',
+    'batt' => '0%',
+    'casaW' => '--',
+    'battW' => '--'
+  ];
+  if (
+    $safeCasaBatt0 !== null && $safeCasaBatt0 > 0 && $battDraw !== null
+    && $battDraw > BATT_IDLE_W
+  ) {
+    $pctCasa = (int) round(max(0.0, $safeCasa0) / $safeCasaBatt0 * 100);
+    $cbMix = [
+      'show' => true,
+      'casa' => $pctCasa . '%',
+      // La batteria prende il resto: due larghezze che fanno esattamente 100%.
+      'batt' => max(0, 100 - $pctCasa) . '%',
+      'casaW' => fmtW(max(0.0, $safeCasa0)),
+      'battW' => fmtW($battDraw),
+    ];
+  }
+
   // How much of the load is NOT bought from the grid -- covered by the panels
   // directly or by the battery giving back. Computed from the import rather
   // than from pvPower, because with a battery in the middle the PV figure on
@@ -1366,7 +1837,7 @@ function meteo_build_payload(mysqli $link): array
   $e = static fn(string $k) => $emDetail[$k] ?? null;
   $e_fmt = static fn($v, int $dec, string $unit)
     => ($v === null) ? '--'
-      : number_format((float) $v, $dec) . ($unit === '' ? '' : ' ' . $unit);
+    : number_format((float) $v, $dec) . ($unit === '' ? '' : ' ' . $unit);
 
   /* The clamps report |current|: only the sign of gridPower says which way it
    * is flowing, so the direction is spelled out next to the ampere figure. */
@@ -1427,7 +1898,7 @@ function meteo_build_payload(mysqli $link): array
       'skyText' => ($skyNow !== null) ? $skyNow['text'] : '',
       'skyColor' => ($skyNow !== null) ? $skyNow['color'] : 'var(--text-muted)',
       'peak' => (string) $pvPeak,
-      'sunPct' => ($sunPct !== null ? $sunPct . '%' : '--'),
+      'yesterday' => ($pvYesterday === null ? '--' : fmtW($pvYesterday)),
       'link' => $pvLink,
     ],
 
@@ -1478,6 +1949,9 @@ function meteo_build_payload(mysqli $link): array
       'shareShow' => ($selfShare !== null),
       'share' => ($selfShare !== null) ? $selfShare . $selfLabel : '',
       'peak' => fmtW($em_max_casa),
+      // Le tre sorgenti del consumo, gia' in percentuale (larghezze pronte per
+      // la barra) e in watt (la legenda sotto).
+      'mix' => $mix,
     ],
 
     /* Casa + batteria. Deliberately its own card rather than a second figure
@@ -1497,6 +1971,9 @@ function meteo_build_payload(mysqli $link): array
           : 'solo casa'),
       'breakdownColor' => ($battDraw !== null && $battDraw > BATT_IDLE_W)
         ? 'var(--accent-green)' : 'var(--text-muted)',
+      // Le due quote della somma, gia' in percentuale (la barra) e in watt
+      // (la legenda sotto).
+      'mix' => $cbMix,
       'peak' => fmtW($em_max_casa_batt ?? $em_max_casa),
     ],
 
@@ -1506,17 +1983,17 @@ function meteo_build_payload(mysqli $link): array
      * direction as a word taken from the sign of gridPower. */
     'quadro' => [
       'show' => ($emDetail !== []),
-      'vLine'    => $e_fmt($e('emGridV') ?? $e('emPvV'), 1, 'V'),
-      'hz'       => $e_fmt($e('emHz'), 2, 'Hz'),
-      'vGrid'    => $e_fmt($e('emGridV'), 1, 'V'),
-      'iGrid'    => $e_fmt($e('emGridA'), 2, 'A'),
-      'pfGrid'   => $e_fmt($e('emGridPf'), 2, ''),
-      'wGrid'    => fmtW($safeGrid0),
-      'dirGrid'  => $gridDir,
-      'vPv'      => $e_fmt($e('emPvV'), 1, 'V'),
-      'iPv'      => $e_fmt($e('emPvA'), 2, 'A'),
-      'pfPv'     => $e_fmt($e('emPvPf'), 2, ''),
-      'wPv'      => fmtW($safePv0),
+      'vLine' => $e_fmt($e('emGridV') ?? $e('emPvV'), 1, 'V'),
+      'hz' => $e_fmt($e('emHz'), 2, 'Hz'),
+      'vGrid' => $e_fmt($e('emGridV'), 1, 'V'),
+      'iGrid' => $e_fmt($e('emGridA'), 2, 'A'),
+      'pfGrid' => $e_fmt($e('emGridPf'), 2, ''),
+      'wGrid' => fmtW($safeGrid0),
+      'dirGrid' => $gridDir,
+      'vPv' => $e_fmt($e('emPvV'), 1, 'V'),
+      'iPv' => $e_fmt($e('emPvA'), 2, 'A'),
+      'pfPv' => $e_fmt($e('emPvPf'), 2, ''),
+      'wPv' => fmtW($safePv0),
     ],
 
     /* Everything the pack reports about itself. Rendered as plain strings
@@ -1527,29 +2004,41 @@ function meteo_build_payload(mysqli $link): array
       'hits' => $statsHits,
       'last' => $statsLast,
       'window' => $statsWindow,
+      // Ore di scarica in hh:mm:ss. `today`/`total` sono il tempo di scarica
+      // comunque sia andata; le sei voci sotto lo dividono fra le ore in cui
+      // il pacco ha retto la casa da solo e quelle in cui la rete dava una
+      // mano, per oggi, ieri e sempre.
+      'today' => $statsToday,
+      'total' => $statsTotal,
+      'todayFull' => $statsTodayFull,
+      'todayPart' => $statsTodayPart,
+      'yestFull' => $statsYestFull,
+      'yestPart' => $statsYestPart,
+      'totFull' => $statsTotFull,
+      'totPart' => $statsTotPart,
     ],
 
     'battDiag' => [
       'show' => ($battDiag !== []),
-      'tCellMax'  => $fmtNum($safeBattTemp0, 1, '°C'),
-      'tCellMin'  => $fmtNum($d('battTempMin'), 1, '°C'),
-      'tSpread'   => $fmtNum($cellTempSpread, 1, '°C'),
+      'tCellMax' => $fmtNum($safeBattTemp0, 1, '°C'),
+      'tCellMin' => $fmtNum($d('battTempMin'), 1, '°C'),
+      'tSpread' => $fmtNum($cellTempSpread, 1, '°C'),
       'tSpreadWarn' => ($cellTempSpread !== null && $cellTempSpread > 5),
-      'tInt'      => $fmtNum($d('battTempInt'), 1, '°C'),
-      'tMos1'     => $fmtNum($d('battTempMos1'), 1, '°C'),
-      'tMos2'     => $fmtNum($d('battTempMos2'), 1, '°C'),
-      'vPack'     => $fmtNum($d('battVolt'), 2, 'V'),
-      'vCellMax'  => $fmtNum($d('battCellVMax'), 3, 'V'),
-      'vCellMin'  => $fmtNum($d('battCellVMin'), 3, 'V'),
+      'tInt' => $fmtNum($d('battTempInt'), 1, '°C'),
+      'tMos1' => $fmtNum($d('battTempMos1'), 1, '°C'),
+      'tMos2' => $fmtNum($d('battTempMos2'), 1, '°C'),
+      'vPack' => $fmtNum($d('battVolt'), 2, 'V'),
+      'vCellMax' => $fmtNum($d('battCellVMax'), 3, 'V'),
+      'vCellMin' => $fmtNum($d('battCellVMin'), 3, 'V'),
       // In mV: the digit that matters here is the one three decimals of a
       // volt hide.
-      'vSpread'   => ($cellVoltSpread === null) ? '--'
+      'vSpread' => ($cellVoltSpread === null) ? '--'
         : round($cellVoltSpread) . ' mV',
       'vSpreadWarn' => ($cellVoltSpread !== null && $cellVoltSpread > 50),
-      'vAc'       => $fmtNum($d('battAcV'), 1, 'V'),
-      'hz'        => $fmtNum($d('battAcHz'), 2, 'Hz'),
-      'iPack'     => $fmtNum($d('battCurr'), 1, 'A'),
-      'iAc'       => $fmtNum($acCurrent, 1, 'A'),
+      'vAc' => $fmtNum($d('battAcV'), 1, 'V'),
+      'hz' => $fmtNum($d('battAcHz'), 2, 'Hz'),
+      'iPack' => $fmtNum($d('battCurr'), 1, 'A'),
+      'iAc' => $fmtNum($acCurrent, 1, 'A'),
     ],
 
     // Inizio carica: l'ora in cui il sole si prende il carico e la batteria

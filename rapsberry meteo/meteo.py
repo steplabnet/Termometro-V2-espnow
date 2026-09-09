@@ -594,10 +594,10 @@ def temperature_of_raspberry_pi():
     fanHistory[-1] = thermoTemp
     ctMedia = fanHistory.mean()
 
-    if ctMedia > 53:
+    if ctMedia > 65:
         GPIO.output(15, GPIO.HIGH)
         fanMode = 1
-    elif ctMedia < 49:
+    elif ctMedia < 55:
         GPIO.output(15, GPIO.LOW)
         fanMode = 0
 

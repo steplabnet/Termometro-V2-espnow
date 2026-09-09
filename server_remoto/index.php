@@ -234,6 +234,12 @@ function showStyle($cond): string
       font-weight: 700;
     }
 
+    /* La riga di testa della card Statistiche: stessa struttura delle altre,
+       un filo piu' grande perche' e' il numero che si guarda per primo. */
+    .minmax-lead .minmax-val {
+      font-size: 1.15rem;
+    }
+
     .val-min {
       color: var(--accent-blue);
     }
@@ -529,6 +535,35 @@ function showStyle($cond): string
       height: 100%;
       border-radius: 999px;
       transition: width 0.4s ease, background-color 0.4s ease;
+    }
+
+    /* Barra a tre segmenti del Consumo Casa: verde fotovoltaico, giallo
+       batteria, rosso rete. Stessa altezza e stesso raggio di .batt-bar --
+       sono due letture diverse dello stesso impianto e non devono sembrare due
+       componenti diversi. */
+    .mix-bar {
+      display: flex;
+      width: 100%;
+      height: 8px;
+      margin-top: 10px;
+      border-radius: 999px;
+      background: #e5e7eb;
+      overflow: hidden;
+    }
+
+    .mix-seg {
+      height: 100%;
+      transition: width 0.4s ease;
+    }
+
+    .mix-legend {
+      display: flex;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 6px;
+      font-size: 0.65rem;
+      font-weight: 700;
     }
 
     .flow-state {
@@ -886,8 +921,8 @@ function showStyle($cond): string
             <span class="minmax-val" data-live="pv.peak"><?php echo $p['pv']['peak']; ?></span>
           </div>
           <div class="minmax-item">
-            <span class="minmax-label">Irraggiamento</span>
-            <span class="minmax-val" data-live="pv.sunPct"><?php echo $p['pv']['sunPct']; ?></span>
+            <span class="minmax-label">Ieri stessa ora</span>
+            <span class="minmax-val" data-live="pv.yesterday"><?php echo $p['pv']['yesterday']; ?></span>
           </div>
         </div>
       </a>
@@ -1124,6 +1159,29 @@ function showStyle($cond): string
             data-live-show="casa.shareShow" data-live="casa.share">
             <?php echo $p['casa']['share']; ?>
           </div>
+
+          <!-- Da dove arriva il consumo: una barra sola divisa in tre, perche'
+               le tre quote sono parti dello stesso numero e non tre misure
+               indipendenti. Le larghezze arrivano gia' in percentuale dal
+               payload, quindi il poller le sposta senza sapere nulla del
+               calcolo. -->
+          <?php $mix = $p['casa']['mix'] ?? ['show' => false]; ?>
+          <div class="mix-bar" style="<?php echo showStyle($mix['show']); ?>" data-live-show="casa.mix.show">
+            <div class="mix-seg" title="Fotovoltaico" data-live-width="casa.mix.pv"
+              style="width:<?php echo $mix['pv'] ?? '0%'; ?>; background:var(--accent-green);"></div>
+            <div class="mix-seg" title="Batteria" data-live-width="casa.mix.batt"
+              style="width:<?php echo $mix['batt'] ?? '0%'; ?>; background:var(--accent-yellow);"></div>
+            <div class="mix-seg" title="Rete" data-live-width="casa.mix.grid"
+              style="width:<?php echo $mix['grid'] ?? '0%'; ?>; background:var(--accent-red);"></div>
+          </div>
+          <div class="mix-legend" style="<?php echo showStyle($mix['show']); ?>" data-live-show="casa.mix.show">
+            <span style="color:var(--accent-green);">&#9679; FV <span
+                data-live="casa.mix.pvW"><?php echo $mix['pvW'] ?? '--'; ?></span></span>
+            <span style="color:var(--accent-yellow);">&#9679; Batteria <span
+                data-live="casa.mix.battW"><?php echo $mix['battW'] ?? '--'; ?></span></span>
+            <span style="color:var(--accent-red);">&#9679; Rete <span
+                data-live="casa.mix.gridW"><?php echo $mix['gridW'] ?? '--'; ?></span></span>
+          </div>
           <div class="minmax-row">
             <div class="minmax-item"><span class="minmax-label">Picco 24h</span><span class="minmax-val"
                 data-live="casa.peak"><?php echo $p['casa']['peak']; ?></span></div>
@@ -1156,6 +1214,23 @@ function showStyle($cond): string
             <div class="flow-state" style="color:<?php echo $p['casaBatt']['breakdownColor']; ?>;"
               data-live="casaBatt.breakdown" data-live-color="casaBatt.breakdownColor">
               <?php echo $p['casaBatt']['breakdown']; ?>
+            </div>
+
+            <!-- Le due parti della somma: viola la casa (stesso colore della
+                 card Consumo Casa), teal il pacco. Stessa barra del mix di
+                 sorgenti qui accanto, con due segmenti invece di tre. -->
+            <?php $cbMix = $p['casaBatt']['mix'] ?? ['show' => false]; ?>
+            <div class="mix-bar" style="<?php echo showStyle($cbMix['show']); ?>" data-live-show="casaBatt.mix.show">
+              <div class="mix-seg" title="Casa" data-live-width="casaBatt.mix.casa"
+                style="width:<?php echo $cbMix['casa'] ?? '0%'; ?>; background:var(--accent-purple);"></div>
+              <div class="mix-seg" title="Batteria" data-live-width="casaBatt.mix.batt"
+                style="width:<?php echo $cbMix['batt'] ?? '0%'; ?>; background:var(--accent-teal);"></div>
+            </div>
+            <div class="mix-legend" style="<?php echo showStyle($cbMix['show']); ?>" data-live-show="casaBatt.mix.show">
+              <span style="color:var(--accent-purple);">&#9679; Casa <span
+                  data-live="casaBatt.mix.casaW"><?php echo $cbMix['casaW'] ?? '--'; ?></span></span>
+              <span style="color:var(--accent-teal);">&#9679; Batteria <span
+                  data-live="casaBatt.mix.battW"><?php echo $cbMix['battW'] ?? '--'; ?></span></span>
             </div>
             <div class="minmax-row">
               <div class="minmax-item"><span class="minmax-label">Picco 24h</span><span class="minmax-val"
@@ -1258,10 +1333,11 @@ function showStyle($cond): string
     <?php endif; ?>
 
     <?php if (!empty($p['stats']['show'])): ?>
-      <!-- 13b. Statistiche del pacco. Per ora una voce sola: quante volte la
-           batteria e' scesa fino alla riserva del 12% e si e' fermata li'. Si
-           conta un giorno per volta -- per arrivarci due volte in un giorno il
-           pacco dovrebbe anche ricaricarsi del tutto in mezzo. -->
+      <!-- 13b. Statistiche del pacco: quante volte la batteria e' scesa fino
+           alla riserva del 12% e si e' fermata li' (si conta un giorno per
+           volta -- per arrivarci due volte in un giorno il pacco dovrebbe
+           anche ricaricarsi del tutto in mezzo), e da quanto tempo il pacco
+           ha davvero retto la casa. -->
       <div class="card border-stats" data-card="stats">
         <a href="grafico.php?var=battSoc">
           <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-stats" viewBox="0 0 24 24"
@@ -1270,14 +1346,35 @@ function showStyle($cond): string
             <path d="M7 15l4-5 3 3 5-7" />
           </svg>
           <div class="card-label">Statistiche</div>
-          <div class="card-value"><span data-live="stats.hits"><?php echo $p['stats']['hits']; ?></span><span
-              class="card-unit"> volte a riserva</span></div>
-
-          <div class="flow-state" style="color:var(--text-muted);">
-            scariche complete fino al <?php echo (int) BATT_RESERVE_SOC; ?>%
+          <!-- Le ore di scarica in hh:mm:ss, divise in due colonne: a
+               sinistra il tempo in cui il pacco ha retto la casa DA SOLO
+               (niente prelievo dalla rete), a destra quello in cui la rete
+               dava comunque una mano. Le due colonne sommate fanno il tempo di
+               scarica: e' la stessa ora, letta in due modi, e per questo
+               stanno affiancate invece che su righe diverse.
+               "Oggi" riparte a mezzanotte e vive in RAM; "Ieri" e "Totale"
+               vengono dal file su disco. -->
+          <div class="minmax-row minmax-lead">
+            <div class="minmax-item"><span class="minmax-label">Oggi 100%</span><span class="minmax-val"
+                data-live="stats.todayFull"><?php echo $p['stats']['todayFull'] ?? '--'; ?></span></div>
+            <div class="minmax-item"><span class="minmax-label">Oggi parziale</span><span class="minmax-val"
+                data-live="stats.todayPart"><?php echo $p['stats']['todayPart'] ?? '--'; ?></span></div>
           </div>
-
           <div class="minmax-row">
+            <div class="minmax-item"><span class="minmax-label">Ieri 100%</span><span class="minmax-val"
+                data-live="stats.yestFull"><?php echo $p['stats']['yestFull'] ?? '--'; ?></span></div>
+            <div class="minmax-item"><span class="minmax-label">Ieri parziale</span><span class="minmax-val"
+                data-live="stats.yestPart"><?php echo $p['stats']['yestPart'] ?? '--'; ?></span></div>
+          </div>
+          <div class="minmax-row">
+            <div class="minmax-item"><span class="minmax-label">Totale 100%</span><span class="minmax-val"
+                data-live="stats.totFull"><?php echo $p['stats']['totFull'] ?? '--'; ?></span></div>
+            <div class="minmax-item"><span class="minmax-label">Totale parziale</span><span class="minmax-val"
+                data-live="stats.totPart"><?php echo $p['stats']['totPart'] ?? '--'; ?></span></div>
+          </div>
+          <div class="minmax-row">
+            <div class="minmax-item"><span class="minmax-label">A riserva</span><span class="minmax-val"><span
+                  data-live="stats.hits"><?php echo $p['stats']['hits']; ?></span> volte</span></div>
             <div class="minmax-item"><span class="minmax-label">Ultima</span><span class="minmax-val"
                 data-live="stats.last"><?php echo $p['stats']['last']; ?></span></div>
             <div class="minmax-item"><span class="minmax-label">Periodo</span><span class="minmax-val"
