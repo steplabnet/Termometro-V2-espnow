@@ -76,14 +76,16 @@ MQTT_TOPIC = "casa/batteria/data"
 # dropping the TCP session AND refusing new connections for several seconds,
 # so one bad block costs the whole poll and the two after it. 35000..35002 and
 # 35010..35011 exist, 35003 does not — hence the split. Verified 2026-09-04:
-# all eight blocks below read clean in one session.
+# all eight blocks below read clean in one session. 33004..33011 and 34003
+# were probed one by one on 2026-09-21 before the two blocks were widened to
+# cover them: all implemented, values matching the app and the integrals.
 BLOCKS = [
     (30001, 6),    # battery_power .. ac_power
     (30100, 2),    # battery voltage, current
     (32200, 1),    # AC voltage
     (32204, 1),    # AC frequency
-    (33000, 4),    # lifetime charge / discharge energy
-    (34002, 1),    # soc
+    (33000, 12),   # charge / discharge energy: lifetime, today, this month
+    (34002, 2),    # soc, cycle count
     (35000, 3),    # internal + MOS1 + MOS2 temperatures
     (35010, 2),    # max / min cell temperature
     (35100, 1),    # inverter state
@@ -106,6 +108,16 @@ FIELDS = {
     "battery_current": (30101, "int16", 0.1),
     "charge_total":    (33000, "uint32", 0.01),
     "discharge_total": (33002, "int32", 0.01),
+    # The battery's own daily and monthly totals, reset by it at midnight and
+    # on the 1st. 2026-09-21 14:30: 3.46 / 1.65 kWh today, against 3.37 / 1.7
+    # integrated from the ten-minute power samples on the server.
+    "charge_today":    (33004, "uint32", 0.01),
+    "discharge_today": (33006, "int32", 0.01),
+    "charge_month":    (33008, "uint32", 0.01),
+    "discharge_month": (33010, "int32", 0.01),
+    # Full cycles counted by the BMS: 11 at 51.9 kWh discharged, which is the
+    # ~10 that discharged / 5.12 kWh gives -- a real counter, not a guess.
+    "cycle_count":     (34003, "uint16", 1),
     "soc":             (34002, "uint16", 0.1),
     "temperature":     (35000, "int16", 0.1),
     # Cell temperatures are the ones worth alarming on: `temperature` above is

@@ -130,6 +130,9 @@ validated on hardware — hence `--check` below.
 | 30006 | int16 | 1 | `ac_power` (W) |
 | 30100 / 30101 | uint16 / int16 | 0.01 / 0.1 | `battery_voltage` / `battery_current` |
 | 33000 / 33002 | uint32 / int32 | 0.01 | `charge_total` / `discharge_total` (kWh) |
+| 33004 / 33006 | uint32 / int32 | 0.01 | `charge_today` / `discharge_today` (kWh, reset by the battery at midnight) |
+| 33008 / 33010 | uint32 / int32 | 0.01 | `charge_month` / `discharge_month` (kWh, reset on the 1st) |
+| 34003 | uint16 | 1 | `cycle_count` (BMS full-cycle counter) |
 | 34002 | uint16 | 0.1 | `soc` (%) |
 | 32200 / 32204 | uint16 | 0.1 | `ac_voltage` (V) / `ac_frequency` (Hz) |
 | 35000 | int16 | 0.1 | `temperature` (°C, electronics/MOS area — reads ~39 °C with the pack at 33) |
@@ -348,6 +351,9 @@ puts three keys in its MQTT payload, and `mqtt_ingest.py` -> `ingest.php` ->
 | `battSoc` | `battSoc` | % |
 | `battTemp` | `battTemp` | °C, **hottest cell** — `cell_temp_max`, falling back to the MOS reading |
 | `battTs` | `battTs` (live row only) | unix seconds, when the BATTERY was read |
+| `battChgTot` / `battDisTot` | same, both tables (`DOUBLE`) | kWh, lifetime counters `charge_total` / `discharge_total` (registers 33000 / 33002) — feed the **Energia** card |
+| `battChgDay` / `battDisDay`, `battChgMon` / `battDisMon` | same, both tables | kWh, the battery's own today / this-month totals (33004–33010) |
+| `battCycles` | same, both tables | BMS cycle count (34003) |
 
 `battTemp` is the pack, not the box: `temperature` (register 35000) is the
 electronics/MOS area and runs some 6 °C above the cells (38 °C against 32 °C on
@@ -369,6 +375,17 @@ History rows need none of this: a `dati_meteo` row is already stamped, and a
 NULL `battPower` there means the battery said nothing in that ten-minute
 window. `casa_power()` in `grafico.php` therefore keeps the plain sum when the
 column is NULL, so charts that predate the battery are unaffected.
+
+The daily / monthly totals (33004–33011) and the cycle count (34003) were
+probed one range at a time on 2026-09-21 before the bridge's blocks were
+widened to `33000+12` and `34002+2`: all implemented, and consistent with
+the rest (3.46 kWh charged today against 3.37 integrated; 11 cycles against
+51.9 kWh / 5.12 ≈ 10). Still two block reads, so no extra load either.
+
+The two counters cost the battery nothing extra: the bridge was already
+reading them on every poll, they simply stopped at the Pi until the Energia
+card needed them. They are in `PUBLISH_IGNORE`, so they ride along with the
+next publish (at worst the 60 s heartbeat) and never cause one.
 
 What the house load means changed with it — see `ENERGY_METER.md`.
 

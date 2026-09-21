@@ -239,6 +239,20 @@ outage leaves the last known values on screen rather than showing 0 W.
   by nothing — and moved into `dati_meteo` when the card became clickable,
   because a chart needs a history to draw. Rows logged before that are NULL and
   show as gaps.
+- **Energia** card: today's kWh and the battery's lifetime totals, in three
+  groups. *Oggi* (PV produced, house consumed net of the battery, imported,
+  exported, autoconsumo = share of production not exported, autosufficienza
+  = share of consumption not bought) is integrated by `energyToday()` in
+  `instant_lib.php` over today's `dati_meteo` rows plus the live reading, so
+  it moves between history rows. *Batteria oggi* is the difference between
+  the Venus's own lifetime counters now and at midnight — the pack's
+  measurement — and falls back to integrating `battPower` (labelled *stimata
+  dai campioni*) when the counters are missing or implausible (negative, or
+  more than four full packs in a day). *Totali Venus E*: lifetime charged /
+  discharged kWh, equivalent cycles (discharged / `BATT_CAPACITY_KWH`) and
+  the discharged / charged ratio, which slightly understates efficiency
+  because the energy still in the pack counts as charged but not yet as
+  discharged.
 - **Batteria** card: state of charge with a fill bar, charge/discharge state
   (green charging, orange discharging, ±15 W deadband), cell temperature
   (coloured on the BMS thresholds), current power, residual kWh and the 24 h

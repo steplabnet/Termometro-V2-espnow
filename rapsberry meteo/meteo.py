@@ -99,8 +99,13 @@ PUBLISH_DEADBAND = {
 # battTs rides along for the same reason: it moves on every single read, and
 # it is only there so the server can tell a fresh battery reading from a stale
 # one -- it must never be the reason a message goes out.
+# The battery's lifetime kWh counters belong here too: they tick up by 0.01 kWh
+# every few tens of seconds while the pack works, and the 60 s heartbeat is
+# plenty for a figure that only feeds daily and lifetime totals.
 PUBLISH_IGNORE = {"timestamp", "mean_voltage", "adc_voltage", "adc_raw",
-                  "battTs"}
+                  "battTs", "battChgTot", "battDisTot",
+                  "battChgDay", "battDisDay", "battChgMon", "battDisMon",
+                  "battCycles"}
 
 # -------- Globals --------
 log_int = 1000  # seconds
@@ -261,10 +266,10 @@ def read_latest_energy(max_age=ENERGY_MAX_AGE):
 def read_latest_battery(max_age=BATTERY_MAX_AGE):
     """Latest Venus E snapshot, or {} when it is missing or stale.
 
-    Only the two figures the remote dashboard stores are returned. Everything
-    else the battery reports (voltages, cell temperatures, lifetime counters)
-    stays on the LAN, where batteria.php reads the full row: sending it to the
-    remote server would mean columns nothing over there displays.
+    Returns what the remote dashboard displays: power, SoC and temperature,
+    the diagnostics card's figures, and the two lifetime kWh counters behind
+    its Energia card. `mode` and `state` stay on the LAN, where batteria.php
+    reads the full row.
 
     Staleness matters more here than for the Shelly. A battery bridge that
     died would otherwise leave a fixed battPower in the payload, and the house
@@ -313,6 +318,20 @@ def read_latest_battery(max_age=BATTERY_MAX_AGE):
         "battAcV": row.get("ac_voltage"),
         "battAcHz": row.get("ac_frequency"),
         "battAcW": row.get("ac_power"),
+        # Lifetime counters, kWh (registers 33000 / 33002). The server takes
+        # "caricato / scaricato oggi" from their difference since midnight,
+        # which is the battery's own measurement rather than an integral of
+        # one power sample every ten minutes.
+        "battChgTot": row.get("charge_total"),
+        "battDisTot": row.get("discharge_total"),
+        # The battery's own daily / monthly totals (33004..33011) and its BMS
+        # cycle counter (34003): exact from the first day, no midnight
+        # baseline needed on the server.
+        "battChgDay": row.get("charge_today"),
+        "battDisDay": row.get("discharge_today"),
+        "battChgMon": row.get("charge_month"),
+        "battDisMon": row.get("discharge_month"),
+        "battCycles": row.get("cycle_count"),
         "battTs": int(time()),
     }
 
@@ -594,10 +613,10 @@ def temperature_of_raspberry_pi():
     fanHistory[-1] = thermoTemp
     ctMedia = fanHistory.mean()
 
-    if ctMedia > 53:
+    if ctMedia > 65:
         GPIO.output(15, GPIO.HIGH)
         fanMode = 1
-    elif ctMedia < 49:
+    elif ctMedia < 55:
         GPIO.output(15, GPIO.LOW)
         fanMode = 0
 
