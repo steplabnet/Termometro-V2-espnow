@@ -7,7 +7,6 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <esp_now.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
@@ -50,6 +49,12 @@ static const char *MQTT_TOPIC_OUT = "casa/ufficio/data";
 static const char *MQTT_TOPIC_IN = "casa/ufficio/command";
 const uint32_t MQTT_PUBLISH_INTERVAL = 30000;
 
+// Shelly 1 Mini Gen3 (heater relay), MQTT topic prefix "caldaia".
+// Requires "Generic status update over MQTT" enabled on the Shelly.
+static const char *SHELLY_TOPIC_CMD = "caldaia/command/switch:0";   // "on" / "off" / "status_update"
+static const char *SHELLY_TOPIC_STATUS = "caldaia/status/switch:0"; // JSON, "output": true/false
+static const char *SHELLY_TOPIC_ONLINE = "caldaia/online";          // "true" / "false"
+
 const char *ntpServer = "pool.ntp.org";
 const long gmtOffset_sec = 3600;
 const int daylightOffset_sec = 3600;
@@ -68,13 +73,11 @@ PubSubClient mqtt(mqttWifiClient);
 Adafruit_NeoPixel pixels(1, RGB_PIN, NEO_GRB + NEO_KHZ800);
 Ticker ledBlinker;
 
-uint8_t TARGET[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
-esp_now_peer_info_t peerInfo;
-
 volatile float g_lastTempC = NAN;
 volatile float g_lastHumidity = NAN;
 volatile float g_lastPressure = NAN;
-volatile uint8_t g_lastAction = 0;
+volatile uint8_t g_lastAction = 0; // heater state as reported by the Shelly
+bool g_shellyOnline = false;
 bool g_otaInProgress = false;
 bool g_ledState = false;
 bool g_isBlinking = false;
@@ -208,21 +211,48 @@ static bool cesanaReportAndFetch(float tempC, bool heating, float realSp, bool i
   return false;
 }
 
-static void sendRelayState()
+static void shellySend(const char *cmd)
 {
-  JsonDocument jtx;
-  jtx["heater"] = (g_lastAction == 1) ? "ON" : "OFF";
-  jtx["temp"] = g_lastTempC;
-  jtx["hum"] = g_lastHumidity;
-  jtx["id"] = 12;
-  char buf[128];
-  serializeJson(jtx, buf);
-  esp_err_t err = esp_now_send(TARGET, (uint8_t *)buf, strlen(buf));
-  LOG_PRINTF("[%s] ESP-NOW TX (%s): %s\n", getLogTime().c_str(), esp_err_to_name(err), buf);
+  bool ok = mqtt.connected() && mqtt.publish(SHELLY_TOPIC_CMD, cmd);
+  LOG_PRINTF("[%s] Shelly TX %s: %s\n", getLogTime().c_str(), cmd, ok ? "ok" : "FAILED");
+}
+
+static void shellyHandleStatus(byte *payload, unsigned int length)
+{
+  JsonDocument doc;
+  if (deserializeJson(doc, payload, length) || !doc["output"].is<bool>())
+  {
+    LOG_PRINTLN("Shelly status: bad JSON");
+    return;
+  }
+  g_shellyOnline = true;
+  uint8_t state = doc["output"].as<bool>() ? 1 : 0;
+  if (state != g_lastAction)
+  {
+    g_lastAction = state;
+    g_lastRelayChangeMs = millis();
+    LOG_PRINTF("[%s] Shelly reports heater %s\n", getLogTime().c_str(), state ? "ON" : "OFF");
+  }
+  updateLedDisplay();
 }
 
 static void mqttCallback(char *topic, byte *payload, unsigned int length)
 {
+  if (strcmp(topic, SHELLY_TOPIC_STATUS) == 0)
+  {
+    shellyHandleStatus(payload, length);
+    return;
+  }
+  if (strcmp(topic, SHELLY_TOPIC_ONLINE) == 0)
+  {
+    g_shellyOnline = (length == 4 && memcmp(payload, "true", 4) == 0);
+    LOG_PRINTF("Shelly %s\n", g_shellyOnline ? "online" : "OFFLINE");
+    if (g_shellyOnline)
+      shellySend("status_update");
+    return;
+  }
+
+  // MQTT_TOPIC_IN: thermostat commands
   JsonDocument doc;
   if (deserializeJson(doc, payload, length))
   {
@@ -230,7 +260,8 @@ static void mqttCallback(char *topic, byte *payload, unsigned int length)
     return;
   }
 
-  // Heater (caldaia) ON/OFF — controlled exclusively via MQTT.
+  // Heater (caldaia) ON/OFF — forwarded to the Shelly; g_lastAction is
+  // updated only when the Shelly confirms via its status topic.
   if (!doc["heater"].isNull())
   {
     JsonVariant h = doc["heater"];
@@ -242,11 +273,8 @@ static void mqttCallback(char *topic, byte *payload, unsigned int length)
       String s = h.as<String>();
       on = (s.equalsIgnoreCase("ON") || s == "1" || s.equalsIgnoreCase("true"));
     }
-    g_lastAction = on ? 1 : 0;
-    g_lastRelayChangeMs = millis();
-    updateLedDisplay();
-    sendRelayState(); // push to relay immediately for responsiveness
     LOG_PRINTF("MQTT heater command: %s\n", on ? "ON" : "OFF");
+    shellySend(on ? "on" : "off");
   }
 
   bool changed = false;
@@ -288,6 +316,9 @@ static bool mqttEnsureConnected()
   {
     LOG_PRINTLN("MQTT connected");
     mqtt.subscribe(MQTT_TOPIC_IN);
+    mqtt.subscribe(SHELLY_TOPIC_STATUS);
+    mqtt.subscribe(SHELLY_TOPIC_ONLINE);
+    shellySend("status_update"); // get current relay state right away
     return true;
   }
   LOG_PRINTF("MQTT connect failed, rc=%d\n", mqtt.state());
@@ -305,6 +336,7 @@ static void mqttPublishState()
   doc["pres"] = g_lastPressure;
   doc["setpoint"] = g_fixedSetpoint;
   doc["heater"] = (g_lastAction == 1) ? "ON" : "OFF";
+  doc["heater_online"] = g_shellyOnline;
   doc["preset"] = g_fixedPreset;
   doc["malfunction"] = g_malfunctionState;
   doc["time"] = getLogTime();
@@ -349,7 +381,6 @@ static void otaBegin()
   g_otaInProgress = true;
   esp_task_wdt_delete(NULL);
   esp_task_wdt_deinit();
-  esp_now_deinit();
   mqtt.disconnect();
   ledBlinker.detach();
   pixels.setPixelColor(0, pixels.Color(150, 0, 255));
@@ -378,7 +409,7 @@ static void handleOtaResult()
   server.send(ok ? 200 : 500, "text/plain", ok ? "Update OK, rebooting..." : "Update FAILED, rebooting...");
   LOG_PRINTLN(ok ? "OTA: success, rebooting" : "OTA: failed, rebooting");
   delay(1000);
-  ESP.restart(); // restart in either case: ESP-NOW and WDT were torn down
+  ESP.restart(); // restart in either case: MQTT and WDT were torn down
 }
 
 static void handleOtaUpload()
@@ -454,13 +485,10 @@ void setup()
   {
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
     mqtt.setServer(MQTT_HOST, MQTT_PORT);
-    mqtt.setBufferSize(256);
+    mqtt.setBufferSize(512); // Shelly status payloads can exceed 256 bytes
     mqtt.setCallback(mqttCallback);
   }
 
-  esp_now_init();
-  memcpy(peerInfo.peer_addr, TARGET, 6);
-  esp_now_add_peer(&peerInfo);
   esp_task_wdt_init(&twdt_config);
   esp_task_wdt_add(NULL);
 }
@@ -474,10 +502,9 @@ void loop()
   mqtt.loop();
   uint32_t now = millis();
 
-  // 1. SENSOR READ + RELAY REFRESH
-  //    The heater (caldaia) is controlled exclusively via MQTT commands
-  //    (see mqttCallback). Here we only refresh sensor readings and
-  //    periodically re-send the current heater state to the relay.
+  // 1. SENSOR READ
+  //    The heater (caldaia) is a Shelly switched via MQTT commands
+  //    (see mqttCallback); its state arrives on SHELLY_TOPIC_STATUS.
   static uint32_t lastLogic = 0;
   if (now - lastLogic > LOGIC_INTERVAL)
   {
@@ -493,7 +520,6 @@ void loop()
     }
 
     updateLedDisplay();
-    sendRelayState();
   }
 
   // 2. HTTP SYNC
