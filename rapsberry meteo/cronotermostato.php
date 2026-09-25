@@ -4,6 +4,10 @@
 // absolute path so the location is unambiguous regardless of the CWD. Shared
 // (read-only) with crono_watcher.py, which evaluates the schedule and pushes
 // heater ON/OFF commands to the office board over MQTT.
+// PHP on the Pi defaults to UTC while the system (and crono_watcher.py) runs on
+// local time: keep displayed times (e.g. override expiry) in local time.
+date_default_timezone_set('Europe/Rome');
+
 define('CRONO_DB',    '/var/www/html/crono.db');
 define('CRONO_STATE', '/dev/shm/crono_state.json');
 define('METEO_DB',    '/dev/shm/meteo.db');
@@ -168,6 +172,33 @@ if ($action === 'cancel_override') {
     $messageType = 'ok';
   } catch (Throwable $e) {
     $message = 'Errore: ' . $e->getMessage();
+    $messageType = 'err';
+  }
+
+} elseif ($action === 'save_mode') {
+  // Quick mode switch — touches only mode (+ manual target), not the bands.
+  $mode = $_POST['mode'] ?? 'auto';
+  if (!in_array($mode, ['auto', 'manual', 'off'], true)) $mode = 'auto';
+  $mtgt = trim($_POST['manual_target'] ?? '');
+  try {
+    $db = ensure_schema();
+    $setStmt = $db->prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (:k, :v)');
+    $vals = ['mode' => $mode];
+    if ($mode === 'manual' && is_numeric($mtgt)) $vals['manual_target'] = (string)(float)$mtgt;
+    foreach ($vals as $k => $v) {
+      $setStmt->reset();
+      $setStmt->clear();
+      $setStmt->bindValue(':k', $k, SQLITE3_TEXT);
+      $setStmt->bindValue(':v', $v, SQLITE3_TEXT);
+      $setStmt->execute();
+    }
+    $labels = ['auto' => 'Auto', 'manual' => 'Manuale', 'off' => 'Spento'];
+    $message = 'Modalità impostata: ' . $labels[$mode]
+             . ($mode === 'manual' && isset($vals['manual_target']) ? " ({$vals['manual_target']}°C)" : '')
+             . '. Applicata entro ~30s.';
+    $messageType = 'ok';
+  } catch (Throwable $e) {
+    $message = 'Errore scrittura crono.db: ' . $e->getMessage();
     $messageType = 'err';
   }
 
@@ -456,6 +487,8 @@ $tpl_band = band_card_html('__I__');
     }
     button[type="submit"]:hover, button.primary:hover { background: #7e22ce; }
 
+    .btn-confirm-mode { padding: .4rem .9rem; font-size: .82rem; }
+
     #add-band {
       background: #e2e8f0; color: #1e293b; border: none; border-radius: .45rem;
       padding: .4rem .85rem; font-size: .8rem; font-weight: 600; cursor: pointer; font-family: inherit;
@@ -570,13 +603,16 @@ $tpl_band = band_card_html('__I__');
           <select name="mode" id="mode">
             <option value="auto"   <?= !in_array($settings['mode'], ['off', 'manual'], true) ? 'selected' : '' ?>>Auto (segui programma)</option>
             <option value="manual" <?= $settings['mode'] === 'manual' ? 'selected' : '' ?>>Manuale (temperatura fissa)</option>
-            <option value="off"    <?= $settings['mode'] === 'off' ? 'selected' : '' ?>>Spento (caldaia sempre OFF)</option>
+            <option value="off"    <?= $settings['mode'] === 'off' ? 'selected' : '' ?>>Spento (solo antigelo)</option>
           </select>
         </div>
         <div class="field" id="manual-target-field" <?= $settings['mode'] === 'manual' ? '' : 'hidden' ?>>
           <label for="manual_target">Temperatura manuale (°C)</label>
           <input type="number" step="0.5" name="manual_target" id="manual_target"
             value="<?= htmlspecialchars($settings['manual_target']) ?>">
+        </div>
+        <div class="field">
+          <button type="button" class="primary btn-confirm-mode" id="confirm-mode">Conferma modalità</button>
         </div>
         <div class="field">
           <label for="hysteresis">Isteresi (±°C)</label>
@@ -610,7 +646,8 @@ $tpl_band = band_card_html('__I__');
       <p class="help">
         L'isteresi evita l'oscillazione del relè: la caldaia si accende quando
         <code>temp &lt; target − isteresi</code> e si spegne quando <code>temp &gt; target + isteresi</code>.
-        Il valore <em>antigelo</em> è il target usato negli orari non coperti da alcuna fascia.
+        Il valore <em>antigelo</em> è il target usato negli orari non coperti da alcuna fascia,
+        in modalità <strong>spento</strong> e durante un comando OFF.
         In modalità <strong>manuale</strong> la caldaia regola sempre sulla temperatura impostata,
         ignorando le fasce (un comando Telegram ha comunque la precedenza).
         Il <strong>bot Telegram</strong> (configurato in <a href="bots.php">Bot Telegram</a>) riceve i comandi
@@ -642,10 +679,18 @@ $tpl_band = band_card_html('__I__');
     </div>
   </form>
 
+  <!-- Separate form for the quick mode switch, filled from the settings fields by JS
+       (kept out of the main form so Enter in any field still saves the full schedule). -->
+  <form method="post" id="mode-form" hidden>
+    <input type="hidden" name="action" value="save_mode">
+    <input type="hidden" name="mode">
+    <input type="hidden" name="manual_target">
+  </form>
+
   <!-- ── Learned bands (managed by the watcher) ── -->
   <div class="panel">
     <h2>Fasce apprese
-      <span style="font-weight:400;text-transform:none;letter-spacing:0;color:#94a3b8">— generate dai comandi Telegram</span>
+      <span style="font-weight:400;text-transform:none;letter-spacing:0;color:#94a3b8">— generate dai comandi Telegram e da crono.php</span>
     </h2>
     <?php if (!$learned): ?>
       <div class="empty">Nessuna fascia appresa per ora. Invia comandi al bot e verranno imparati qui.</div>
@@ -744,6 +789,14 @@ $tpl_band = band_card_html('__I__');
     const manualField = document.getElementById('manual-target-field');
     modeSel.addEventListener('change', function () {
       manualField.hidden = modeSel.value !== 'manual';
+    });
+
+    // Confirm the mode alone, without saving the bands.
+    document.getElementById('confirm-mode').addEventListener('click', function () {
+      const f = document.getElementById('mode-form');
+      f.elements['mode'].value = modeSel.value;
+      f.elements['manual_target'].value = document.getElementById('manual_target').value;
+      f.submit();
     });
 
     // ── Live status polling ──

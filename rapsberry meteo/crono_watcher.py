@@ -18,13 +18,21 @@ Three layers, in priority order:
                  after manual ones, so learning adapts the manual baseline.
   3. Default   — the antifreeze target, used outside any band.
 
+"Off" — an OFF command or the global "off" mode — does not cut the heater: it
+holds the antifreeze target, so the office never drops below it.
+
 Telegram: the watcher long-polls ONE configured bot (chosen in the web page,
 stored as settings.bot_id, looked up in alarms.db's bots table). It must be a
 DIFFERENT bot from the one alarm_watcher.py polls, otherwise the two pollers
 steal each other's updates.
 
 Failsafe: if the office reading is missing, stale, or the board reports a
-malfunction, the heater is commanded OFF (an OFF override still works).
+malfunction, the heater is commanded OFF (antifreeze included).
+
+Actuator check: the watcher also listens to the heater's Shelly relay directly
+(caldaia/status/switch:0, caldaia/online). If the heater should be ON but the
+Shelly reports the relay OFF, is offline, or does not answer, a Telegram alert
+is sent on the configured bot (repeated hourly, with a message when it clears).
 """
 
 import json
@@ -51,12 +59,22 @@ MQTT_PORT = 1883
 MQTT_USER = "stzionemeteo"
 MQTT_PASSWORD = "78f25d_78"
 MQTT_TOPIC_CMD = "casa/ufficio/command"
+# Shelly 1 Mini Gen3 driving the heater (the board forwards our commands to it).
+SHELLY_TOPIC_CMD = "caldaia/command/switch:0"      # "status_update" asks for a status
+SHELLY_TOPIC_STATUS = "caldaia/status/switch:0"    # JSON, "output": true/false
+SHELLY_TOPIC_ONLINE = "caldaia/online"             # "true" / "false"
 
 # ── Tuning ──────────────────────────────────────────────────────────────────
 CHECK_INTERVAL = 30        # seconds between schedule evaluations when idle
 REPUBLISH_INTERVAL = 300   # re-send the command at least this often
 STALE_SECONDS = 600        # office reading older than this is treated as missing
 TG_POLL_TIMEOUT = 20       # Telegram long-poll timeout (also caps the idle cycle)
+
+# ── Actuator (Shelly) check ─────────────────────────────────────────────────
+SHELLY_POLL_INTERVAL = 60  # ask the Shelly for its status this often while ON
+SHELLY_STATUS_MAX_AGE = 150  # no status for this long ⇒ "the Shelly isn't answering"
+SHELLY_GRACE = 120         # heater must be wanted ON this long before we alert
+SHELLY_REALERT = 3600      # repeat the alert this often while the problem persists
 
 DEFAULT_HYSTERESIS = 0.3
 DEFAULT_TARGET = 7.0       # antifreeze fallback when no band matches
@@ -123,6 +141,17 @@ def ensure_crono_schema():
             type      TEXT,             -- 'set' | 'off'
             target    REAL,
             permanent INTEGER NOT NULL DEFAULT 0
+        )""")
+        # Commands entered on crono.php, queued for the learning engine. The page
+        # applies the override itself; the watcher only learns from these rows.
+        con.execute("""CREATE TABLE IF NOT EXISTS web_commands (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts        TEXT,             -- local 'YYYY-MM-DD HH:MM:SS' when entered
+            type      TEXT,             -- 'set' | 'off'
+            target    REAL,
+            minutes   INTEGER,
+            permanent INTEGER NOT NULL DEFAULT 0,
+            processed INTEGER NOT NULL DEFAULT 0
         )""")
         # Per-weekday/per-slot EMA model the learned bands are rebuilt from.
         con.execute("""CREATE TABLE IF NOT EXISTS slots (
@@ -326,11 +355,21 @@ def decide(settings, bands, override, row, prev_heater):
         local = exp + (now_local() - now_utc())
         return local.strftime("%H:%M")
 
+    # "Off" (command or mode) never lets the office freeze: it holds the antifreeze
+    # target instead of cutting the heater, unless the reading can't be trusted.
+    def antifreeze(source, what):
+        target = settings["default_target"]
+        if not fresh or temp is None or malfunction:
+            return {"heater": "OFF", "target": target, "temp": temp, "source": source,
+                    "note": f"{what}: dati ufficio assenti/obsoleti, caldaia OFF (failsafe)."}
+        heater = regulate(temp, target, hyst, prev_heater)
+        return {"heater": heater, "target": target, "temp": temp, "source": source,
+                "note": f"{what}: antigelo {target:.1f}°C ±{hyst:.1f} → {heater}."}
+
     # 1. Override (a Telegram command) wins over everything.
     if override:
         if override["type"] == "off":
-            return {"heater": "OFF", "target": None, "temp": temp, "source": "override",
-                    "note": f"Comando OFF attivo (fino alle {expiry_label()})."}
+            return antifreeze("override", f"Comando OFF attivo (fino alle {expiry_label()})")
         # 'set' override: regulate to its target, but still needs a valid reading.
         otarget = override["target"]
         if otarget is not None:
@@ -343,8 +382,7 @@ def decide(settings, bands, override, row, prev_heater):
 
     # 2. Global "off" mode.
     if settings["mode"] == "off":
-        return {"heater": "OFF", "target": None, "temp": temp, "source": "mode_off",
-                "note": "Modalità spento: caldaia forzata OFF."}
+        return antifreeze("mode_off", "Modalità spento")
 
     # 3/4. Failsafe before regulating from the schedule.
     if not fresh or temp is None:
@@ -376,11 +414,43 @@ def decide(settings, bands, override, row, prev_heater):
 
 
 # ── MQTT ────────────────────────────────────────────────────────────────────
+# Last known Shelly state, updated from the MQTT network thread.
+# status_ts is time.time() of the last status message (0 = never heard).
+SHELLY = {"output": None, "status_ts": 0.0, "online": None}
+
+
+def on_connect(client, userdata, flags, rc, props):
+    if rc != 0:
+        log(f"[mqtt] connect failed (rc={rc})")
+        return
+    log(f"[mqtt] connected (rc={rc})")
+    # Subscribe here so a reconnect re-subscribes.
+    client.subscribe([(SHELLY_TOPIC_STATUS, 0), (SHELLY_TOPIC_ONLINE, 0)])
+    client.publish(SHELLY_TOPIC_CMD, "status_update")
+
+
+def on_message(client, userdata, msg):
+    try:
+        text = msg.payload.decode("utf-8", "replace").strip()
+        if msg.topic == SHELLY_TOPIC_STATUS:
+            output = json.loads(text).get("output")
+            if isinstance(output, bool):
+                SHELLY["output"] = output
+                SHELLY["status_ts"] = time.time()
+                SHELLY["online"] = True
+        elif msg.topic == SHELLY_TOPIC_ONLINE:
+            SHELLY["online"] = (text.lower() == "true")
+            if not SHELLY["online"]:
+                log("[shelly] OFFLINE")
+    except Exception as e:
+        log(f"[shelly] bad message on {msg.topic}: {e}")
+
+
 def make_client():
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
     client.username_pw_set(MQTT_USER, MQTT_PASSWORD)
-    client.on_connect = lambda c, u, f, rc, p: log(
-        f"[mqtt] connected (rc={rc})" if rc == 0 else f"[mqtt] connect failed (rc={rc})")
+    client.on_connect = on_connect
+    client.on_message = on_message
     client.on_disconnect = lambda c, u, f, rc, p: log(f"[mqtt] disconnected (rc={rc})")
     return client
 
@@ -515,8 +585,8 @@ def set_override(con, cmd_type, target, minutes):
     con.commit()
 
 
-def log_command(con, cmd_type, target, minutes, permanent):
-    now = now_local()
+def log_command(con, cmd_type, target, minutes, permanent, when=None):
+    now = when or now_local()
     start = minute_of_day(now)
     end = min(24 * 60, start + max(SLOT_MIN, minutes))
     con.execute(
@@ -571,9 +641,9 @@ def _covered_slots(start_min, end_min):
     return range(s0, s1 + 1)
 
 
-def learn_from_command(con, cmd_type, target, minutes, permanent):
+def learn_from_command(con, cmd_type, target, minutes, permanent, when=None):
     """Update the per-slot EMA model for the command's weekday/time span."""
-    now = now_local()
+    now = when or now_local()
     dow = now.weekday()
     start = minute_of_day(now)
     end = min(24 * 60, start + max(SLOT_MIN, minutes))
@@ -606,6 +676,47 @@ def learn_from_command(con, cmd_type, target, minutes, permanent):
             (dow, slot, new_target, new_off, new_weight),
         )
     con.commit()
+
+
+def process_web_commands(con, settings):
+    """Feed commands queued by crono.php into the same learning path as Telegram
+    commands, timed to when they were entered. Returns True if any were found."""
+    try:
+        rows = con.execute(
+            "SELECT id, ts, type, target, minutes, permanent FROM web_commands "
+            "WHERE processed = 0 ORDER BY id"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return False
+    if not rows:
+        return False
+
+    learning = settings.get("learning_on", True)
+    for r in rows:
+        # Mark first so a row that makes learning fail is not retried forever.
+        con.execute("UPDATE web_commands SET processed = 1 WHERE id = ?", (r["id"],))
+        con.commit()
+        if not learning:
+            continue
+        try:
+            when = datetime.strptime(r["ts"], "%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            when = now_local()
+        cmd_type = r["type"] if r["type"] in ("set", "off") else "set"
+        target = to_float(r["target"])
+        minutes = max(1, int(r["minutes"] or 60))
+        permanent = bool(r["permanent"])
+        try:
+            log_command(con, cmd_type, target, minutes, permanent, when)
+            learn_from_command(con, cmd_type, target, minutes, permanent, when)
+            log(f"[web] learned {cmd_type} {target} for {minutes}min"
+                f"{' (permanente)' if permanent else ''} at {when:%a %H:%M}")
+        except Exception as e:
+            log(f"[web] learning error on command {r['id']}: {e}")
+
+    if learning:
+        relearn_bands(con, settings)
+    return True
 
 
 def _slot_to_hhmm(slot):
@@ -788,6 +899,72 @@ def status_text(con, settings):
     return "\n".join(lines)
 
 
+# ── Actuator check ──────────────────────────────────────────────────────────
+def shelly_problem(now):
+    """Why the Shelly is not confirming the heater ON, or None if it is."""
+    if SHELLY["online"] is False:
+        return "lo Shelly della caldaia è OFFLINE"
+    if now - SHELLY["status_ts"] > SHELLY_STATUS_MAX_AGE:
+        return "lo Shelly della caldaia non risponde"
+    if SHELLY["output"] is not True:
+        return "lo Shelly riporta il relè della caldaia SPENTO"
+    return None
+
+
+def send_alert(con, text):
+    """Send text on the configured bot. Returns True if Telegram accepted it."""
+    bot = get_active_bot(con)
+    if not bot:
+        log(f"[alert] no bot configured, not sent: {text}")
+        return False
+    res = tg(bot["token"], "sendMessage", chat_id=bot["chat_id"], text=text)
+    return bool(res and res.get("ok"))
+
+
+def check_actuator(con, client, ctl, decision):
+    """Alert on Telegram when the heater should be ON but the Shelly says
+    otherwise (relay OFF, offline, or silent). Returns the current problem."""
+    now = time.time()
+
+    if decision["heater"] != "ON":
+        ctl["on_since"] = None
+        if ctl.get("alert_active"):
+            log("[alert] heater no longer requested, actuator alert closed")
+            send_alert(con, "ℹ️ Caldaia non più richiesta: allarme Shelly chiuso.")
+            ctl["alert_active"] = False
+        return None
+
+    if ctl.get("on_since") is None:
+        ctl["on_since"] = now
+    # The Shelly only reports on change: poll it so a silent device is noticed.
+    if now - ctl.get("last_status_req", 0.0) >= SHELLY_POLL_INTERVAL:
+        client.publish(SHELLY_TOPIC_CMD, "status_update")
+        ctl["last_status_req"] = now
+
+    if now - ctl["on_since"] < SHELLY_GRACE:
+        return None
+
+    problem = shelly_problem(now)
+    if problem is None:
+        if ctl.get("alert_active"):
+            log("[alert] Shelly now confirms heater ON")
+            send_alert(con, "✅ Lo Shelly ora conferma la caldaia ACCESA.")
+            ctl["alert_active"] = False
+        return None
+
+    if not ctl.get("alert_active") or now - ctl.get("last_alert", 0.0) >= SHELLY_REALERT:
+        temp = decision.get("temp")
+        tgt = decision.get("target")
+        text = (f"⚠️ Cronotermostato: la caldaia dovrebbe essere ACCESA ma {problem}.\n"
+                f"Temp ufficio: {f'{temp:.1f}°C' if temp is not None else 'n/d'}"
+                f" — target: {f'{tgt:.1f}°C' if tgt is not None else '—'}")
+        log(f"[alert] {problem}")
+        if send_alert(con, text):
+            ctl["alert_active"] = True
+            ctl["last_alert"] = now
+    return problem
+
+
 # ── Control cycle ───────────────────────────────────────────────────────────
 def run_control(con, settings, client, ctl, force_publish=False):
     override = get_active_override(con)
@@ -807,6 +984,12 @@ def run_control(con, settings, client, ctl, force_publish=False):
             ctl["prev_heater"] = decision["heater"]
             ctl["prev_target"] = decision["target"]
 
+    try:
+        actuator = check_actuator(con, client, ctl, decision)
+    except Exception as e:
+        log(f"[alert] actuator check error: {e}")
+        actuator = None
+
     save_state({
         "mode": settings["mode"],
         "learning": "on" if settings.get("learning_on", True) else "off",
@@ -816,6 +999,8 @@ def run_control(con, settings, client, ctl, force_publish=False):
         "source": decision["source"],
         "override": override,
         "note": decision["note"],
+        "actuator_problem": actuator,
+        "shelly_output": SHELLY["output"],
         "updated": now_local().strftime("%Y-%m-%d %H:%M:%S"),
     })
 
@@ -832,7 +1017,8 @@ def main():
         log(f"[mqtt] initial connect error: {e}")
     client.loop_start()
 
-    ctl = {"prev_heater": None, "prev_target": None, "last_publish": 0.0}
+    ctl = {"prev_heater": None, "prev_target": None, "last_publish": 0.0,
+           "on_since": None, "last_status_req": 0.0, "alert_active": False, "last_alert": 0.0}
     tg_token = None
     tg_offset = 0
 
@@ -854,7 +1040,10 @@ def main():
 
             # Re-read settings (a command/dialog may have changed things) and decide.
             settings = load_settings(con)
-            run_control(con, settings, client, ctl)
+            # A web command may have set an override or a new learned band:
+            # publish at once instead of waiting for a heater/target change.
+            web = process_web_commands(con, settings)
+            run_control(con, settings, client, ctl, force_publish=web)
             con.close()
         except Exception as e:
             log(f"[loop] error: {e}")

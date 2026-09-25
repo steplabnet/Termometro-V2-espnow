@@ -38,6 +38,7 @@ TARGETS=(
   "alarms.php|/var/www/html|"
   "bots.php|/var/www/html|"
   "cronotermostato.php|/var/www/html|"
+  "crono.php|/var/www/html|"
   "index.php|/var/www/html|"
   "batteria.php|/var/www/html|"
   "carichi.php|/var/www/html|"
