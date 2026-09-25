@@ -21,8 +21,7 @@
 #include <Ticker.h>
 #include <time.h>
 #include <Adafruit_NeoPixel.h>
-#include <ArduinoOTA.h>
-#include <TelnetStream.h>
+#include <Update.h>
 #include <esp_task_wdt.h>
 
 // ======================================================================================
@@ -35,7 +34,7 @@
 
 static const char *WIFI_SSID_DEFAULT = "NETGEAR11";
 static const char *WIFI_PASS_DEFAULT = "breezypiano838";
-static const char *AP_SSID = "termometroUff";
+static const char *AP_SSID = "termometro_ufficio";
 static const char *AP_PASS = "12345678";
 static const char *HOSTNAME = "esp32-thermo";
 
@@ -90,16 +89,9 @@ esp_task_wdt_config_t twdt_config = {
     .idle_core_mask = (1 << 0),
     .trigger_panic = true};
 
-#define LOG_PRINTF(...)               \
-  {                                   \
-    Serial.printf(__VA_ARGS__);       \
-    TelnetStream.printf(__VA_ARGS__); \
-  }
-#define LOG_PRINTLN(...)               \
-  {                                    \
-    Serial.println(__VA_ARGS__);       \
-    TelnetStream.println(__VA_ARGS__); \
-  }
+// Debug output goes to the UART only (Serial = UART0, ARDUINO_USB_CDC_ON_BOOT=0)
+#define LOG_PRINTF(...) Serial.printf(__VA_ARGS__)
+#define LOG_PRINTLN(...) Serial.println(__VA_ARGS__)
 
 bool g_waitingForTimer = false;
 uint32_t g_colorA = 0;
@@ -225,7 +217,8 @@ static void sendRelayState()
   jtx["id"] = 12;
   char buf[128];
   serializeJson(jtx, buf);
-  esp_now_send(TARGET, (uint8_t *)buf, strlen(buf));
+  esp_err_t err = esp_now_send(TARGET, (uint8_t *)buf, strlen(buf));
+  LOG_PRINTF("[%s] ESP-NOW TX (%s): %s\n", getLogTime().c_str(), esp_err_to_name(err), buf);
 }
 
 static void mqttCallback(char *topic, byte *payload, unsigned int length)
@@ -329,18 +322,107 @@ static void mqttPublishState()
   }
 }
 
-void setupOTA()
+// ======================================================================================
+// OTA UPDATE PAGE (served only to clients connected to the soft-AP)
+// ======================================================================================
+
+static const char OTA_PAGE[] PROGMEM = R"html(<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Firmware update</title>
+<style>body{font-family:sans-serif;max-width:420px;margin:30px auto;padding:0 16px}
+input,button{font-size:1em;margin-top:12px;width:100%}</style></head>
+<body><h2>termometro_ufficio - OTA</h2>
+<p>Build: )html" __DATE__ " " __TIME__ R"html(</p>
+<form method="POST" action="/update" enctype="multipart/form-data">
+<input type="file" name="firmware" accept=".bin" required>
+<button type="submit">Upload &amp; flash</button></form>
+<p>Select <code>.pio/build/esp32-c3-devkitm-1/firmware.bin</code>.
+The device reboots when done.</p></body></html>)html";
+
+static bool isApClient()
 {
-  ArduinoOTA.setHostname(HOSTNAME);
-  ArduinoOTA.onStart([]()
-                     {
-    g_otaInProgress = true;
-    esp_task_wdt_delete(NULL);
-    esp_task_wdt_deinit();
-    esp_now_deinit();
-    ledBlinker.detach();
-    pixels.setPixelColor(0, pixels.Color(150, 0, 255)); pixels.show(); });
-  ArduinoOTA.begin();
+  return server.client().localIP() == WiFi.softAPIP();
+}
+
+static void otaBegin()
+{
+  g_otaInProgress = true;
+  esp_task_wdt_delete(NULL);
+  esp_task_wdt_deinit();
+  esp_now_deinit();
+  mqtt.disconnect();
+  ledBlinker.detach();
+  pixels.setPixelColor(0, pixels.Color(150, 0, 255));
+  pixels.show();
+}
+
+static void handleOtaPage()
+{
+  if (!isApClient())
+  {
+    server.send(403, "text/plain", "OTA available only via AP");
+    return;
+  }
+  server.send_P(200, "text/html", OTA_PAGE);
+}
+
+static void handleOtaResult()
+{
+  if (!g_otaInProgress) // upload rejected (not from AP)
+  {
+    server.send(403, "text/plain", "OTA available only via AP");
+    return;
+  }
+  bool ok = !Update.hasError();
+  server.sendHeader("Connection", "close");
+  server.send(ok ? 200 : 500, "text/plain", ok ? "Update OK, rebooting..." : "Update FAILED, rebooting...");
+  LOG_PRINTLN(ok ? "OTA: success, rebooting" : "OTA: failed, rebooting");
+  delay(1000);
+  ESP.restart(); // restart in either case: ESP-NOW and WDT were torn down
+}
+
+static void handleOtaUpload()
+{
+  HTTPUpload &up = server.upload();
+  if (up.status == UPLOAD_FILE_START)
+  {
+    if (!isApClient())
+      return;
+    LOG_PRINTF("OTA: receiving %s\n", up.filename.c_str());
+    otaBegin();
+    if (!Update.begin(UPDATE_SIZE_UNKNOWN))
+      Update.printError(Serial);
+  }
+  else if (!g_otaInProgress)
+  {
+    return;
+  }
+  else if (up.status == UPLOAD_FILE_WRITE)
+  {
+    if (Update.write(up.buf, up.currentSize) != up.currentSize)
+      Update.printError(Serial);
+  }
+  else if (up.status == UPLOAD_FILE_END)
+  {
+    if (Update.end(true))
+      LOG_PRINTF("OTA: %u bytes written\n", up.totalSize);
+    else
+      Update.printError(Serial);
+  }
+  else if (up.status == UPLOAD_FILE_ABORTED)
+  {
+    Update.abort();
+    LOG_PRINTLN("OTA: upload aborted");
+  }
+}
+
+void setupWebServer()
+{
+  server.on("/", HTTP_GET, []()
+            { server.sendHeader("Location", "/update"); server.send(302); });
+  server.on("/update", HTTP_GET, handleOtaPage);
+  server.on("/update", HTTP_POST, handleOtaResult, handleOtaUpload);
+  server.begin();
 }
 
 void setup()
@@ -359,6 +441,9 @@ void setup()
   }
 
   WiFi.mode(WIFI_AP_STA);
+  WiFi.softAP(AP_SSID, AP_PASS);
+  LOG_PRINTF("AP '%s' up, OTA page at http://%s/update\n", AP_SSID, WiFi.softAPIP().toString().c_str());
+  setupWebServer();
   WiFi.begin(WIFI_SSID_DEFAULT, WIFI_PASS_DEFAULT);
 
   unsigned long start = millis();
@@ -368,8 +453,6 @@ void setup()
   if (WiFi.status() == WL_CONNECTED)
   {
     configTime(gmtOffset_sec, daylightOffset_sec, ntpServer);
-    TelnetStream.begin();
-    setupOTA();
     mqtt.setServer(MQTT_HOST, MQTT_PORT);
     mqtt.setBufferSize(256);
     mqtt.setCallback(mqttCallback);
@@ -384,11 +467,10 @@ void setup()
 
 void loop()
 {
-  ArduinoOTA.handle();
+  server.handleClient();
   if (g_otaInProgress)
     return;
   esp_task_wdt_reset();
-  server.handleClient();
   mqtt.loop();
   uint32_t now = millis();
 
