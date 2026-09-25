@@ -97,8 +97,8 @@ function load_bots() {
 }
 
 function load_settings($db) {
-  $defaults = ['mode' => 'auto', 'hysteresis' => '0.3', 'default_target' => '7.0',
-               'bot_id' => '', 'learning' => 'on'];
+  $defaults = ['mode' => 'auto', 'manual_target' => '20', 'hysteresis' => '0.3',
+               'default_target' => '7.0', 'bot_id' => '', 'learning' => 'on'];
   $res = $db->query('SELECT key, value FROM settings');
   while ($r = $res->fetchArray(SQLITE3_ASSOC)) {
     $defaults[$r['key']] = $r['value'];
@@ -172,7 +172,10 @@ if ($action === 'cancel_override') {
   }
 
 } elseif ($action === 'save_schedule') {
-  $mode = ($_POST['mode'] ?? 'auto') === 'off' ? 'off' : 'auto';
+  $mode = $_POST['mode'] ?? 'auto';
+  if (!in_array($mode, ['auto', 'manual', 'off'], true)) $mode = 'auto';
+  $mtgt = trim($_POST['manual_target'] ?? '');
+  $mtgt = is_numeric($mtgt) ? (float)$mtgt : 20.0;
   $hyst = trim($_POST['hysteresis'] ?? '');
   $hyst = is_numeric($hyst) ? max(0.0, (float)$hyst) : 0.3;
   $dflt = trim($_POST['default_target'] ?? '');
@@ -213,7 +216,8 @@ if ($action === 'cancel_override') {
     }
 
     $setStmt = $db->prepare('INSERT OR REPLACE INTO settings (key, value) VALUES (:k, :v)');
-    foreach (['mode' => $mode, 'hysteresis' => (string)$hyst, 'default_target' => (string)$dflt,
+    foreach (['mode' => $mode, 'manual_target' => (string)$mtgt,
+              'hysteresis' => (string)$hyst, 'default_target' => (string)$dflt,
               'learning' => $learning, 'bot_id' => $bot_id] as $k => $v) {
       $setStmt->reset();
       $setStmt->clear();
@@ -240,8 +244,8 @@ $learned = [];         // learned bands (read-only)
 $override = null;
 $commands = [];
 $BOTS = load_bots();
-$settings = ['mode' => 'auto', 'hysteresis' => '0.3', 'default_target' => '7.0',
-             'bot_id' => '', 'learning' => 'on'];
+$settings = ['mode' => 'auto', 'manual_target' => '20', 'hysteresis' => '0.3',
+             'default_target' => '7.0', 'bot_id' => '', 'learning' => 'on'];
 try {
   $db = ensure_schema();
   $settings = load_settings($db);
@@ -564,9 +568,15 @@ $tpl_band = band_card_html('__I__');
         <div class="field">
           <label for="mode">Modalità</label>
           <select name="mode" id="mode">
-            <option value="auto" <?= $settings['mode'] !== 'off' ? 'selected' : '' ?>>Auto (segui programma)</option>
-            <option value="off"  <?= $settings['mode'] === 'off' ? 'selected' : '' ?>>Spento (caldaia sempre OFF)</option>
+            <option value="auto"   <?= !in_array($settings['mode'], ['off', 'manual'], true) ? 'selected' : '' ?>>Auto (segui programma)</option>
+            <option value="manual" <?= $settings['mode'] === 'manual' ? 'selected' : '' ?>>Manuale (temperatura fissa)</option>
+            <option value="off"    <?= $settings['mode'] === 'off' ? 'selected' : '' ?>>Spento (caldaia sempre OFF)</option>
           </select>
+        </div>
+        <div class="field" id="manual-target-field" <?= $settings['mode'] === 'manual' ? '' : 'hidden' ?>>
+          <label for="manual_target">Temperatura manuale (°C)</label>
+          <input type="number" step="0.5" name="manual_target" id="manual_target"
+            value="<?= htmlspecialchars($settings['manual_target']) ?>">
         </div>
         <div class="field">
           <label for="hysteresis">Isteresi (±°C)</label>
@@ -601,6 +611,8 @@ $tpl_band = band_card_html('__I__');
         L'isteresi evita l'oscillazione del relè: la caldaia si accende quando
         <code>temp &lt; target − isteresi</code> e si spegne quando <code>temp &gt; target + isteresi</code>.
         Il valore <em>antigelo</em> è il target usato negli orari non coperti da alcuna fascia.
+        In modalità <strong>manuale</strong> la caldaia regola sempre sulla temperatura impostata,
+        ignorando le fasce (un comando Telegram ha comunque la precedenza).
         Il <strong>bot Telegram</strong> (configurato in <a href="bots.php">Bot Telegram</a>) riceve i comandi
         ON/OFF/temperatura: scegline uno <em>diverso</em> da quello degli allarmi.
         Con l'<strong>apprendimento</strong> attivo i comandi ricorrenti diventano automaticamente fasce «apprese».
@@ -727,6 +739,13 @@ $tpl_band = band_card_html('__I__');
       }
     });
 
+    // Show the manual target field only in manual mode.
+    const modeSel = document.getElementById('mode');
+    const manualField = document.getElementById('manual-target-field');
+    modeSel.addEventListener('change', function () {
+      manualField.hidden = modeSel.value !== 'manual';
+    });
+
     // ── Live status polling ──
     const fmt = (v, d = 1) => (v === null || v === undefined || v === '') ? '—' : Number(v).toFixed(d);
 
@@ -743,7 +762,7 @@ $tpl_band = band_card_html('__I__');
           modeEl.textContent = 'Comando';
           modeEl.className = 'value badge-cmd';
         } else {
-          modeEl.textContent = mode === 'off' ? 'Spento' : 'Auto';
+          modeEl.textContent = mode === 'off' ? 'Spento' : mode === 'manual' ? 'Manuale' : 'Auto';
           modeEl.className = 'value' + (mode === 'off' ? ' badge-mode-off' : '');
         }
 

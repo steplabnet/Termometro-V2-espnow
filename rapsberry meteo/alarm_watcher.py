@@ -24,6 +24,12 @@ import requests
 
 from zbot import BOT_TOKEN, CHAT_ID
 
+# Chats whose commands the bot answers: the private chat from zbot.py plus the
+# group. Kept here, not in zbot.py, because zbot.py is not deployed by
+# deploy_pi.sh. /reboot stays private-chat only (see handle_command).
+GROUP_CHAT_ID = -5102046824
+ALLOWED_CHATS = {CHAT_ID, GROUP_CHAT_ID}
+
 # ── Paths ───────────────────────────────────────────────────────────────────
 HERE = os.path.dirname(os.path.abspath(__file__))
 # Pinned to the same absolute path used by alarms.php so the two processes
@@ -1448,7 +1454,7 @@ def do_reboot():
         return False
 
 
-def handle_command(text):
+def handle_command(text, chat_id=CHAT_ID):
     if not text:
         return None
     parts = text.strip().split()
@@ -1483,6 +1489,9 @@ def handle_command(text):
     if cmd == "/alarms":
         return format_alarms_summary()
     if cmd == "/reboot":
+        # Anyone in the group could send it; only the owner may reboot the Pi.
+        if chat_id != CHAT_ID:
+            return "/reboot è disponibile solo nella chat privata."
         log("[cmd] /reboot requested")
         # Send the confirmation synchronously first: do_reboot() detaches with a
         # delay, so by the time the box goes down the reply is already delivered.
@@ -1540,7 +1549,7 @@ def telegram_poll_once():
         if cb:
             cb_chat = (cb.get("message") or {}).get("chat", {}).get("id")
             answer_callback_query(cb.get("id"))
-            if cb_chat != CHAT_ID:
+            if cb_chat not in ALLOWED_CHATS:
                 log(f"[poll] ignoring callback from chat_id={cb_chat}")
                 continue
             data_str = cb.get("data") or ""
@@ -1558,12 +1567,12 @@ def telegram_poll_once():
             continue
         chat = msg.get("chat", {})
         chat_id = chat.get("id")
-        if chat_id != CHAT_ID:
+        if chat_id not in ALLOWED_CHATS:
             log(f"[poll] ignoring message from chat_id={chat_id}")
             continue
         text = msg.get("text", "")
         try:
-            reply = handle_command(text)
+            reply = handle_command(text, chat_id)
         except Exception as e:
             log(f"[cmd] error: {e}")
             reply = "Errore interno durante l'esecuzione del comando."

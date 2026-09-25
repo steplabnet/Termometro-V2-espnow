@@ -60,6 +60,7 @@ TG_POLL_TIMEOUT = 20       # Telegram long-poll timeout (also caps the idle cycl
 
 DEFAULT_HYSTERESIS = 0.3
 DEFAULT_TARGET = 7.0       # antifreeze fallback when no band matches
+DEFAULT_MANUAL_TARGET = 20.0  # fixed target used in manual mode
 MORNING_HOUR = 6           # "fino a domani" resumes the schedule at this hour
 
 # ── Learning ────────────────────────────────────────────────────────────────
@@ -167,7 +168,11 @@ def load_settings(con):
         settings["default_target"] = float(settings.get("default_target", DEFAULT_TARGET))
     except (TypeError, ValueError):
         settings["default_target"] = DEFAULT_TARGET
-    settings["mode"] = "off" if settings.get("mode") == "off" else "auto"
+    try:
+        settings["manual_target"] = float(settings.get("manual_target", DEFAULT_MANUAL_TARGET))
+    except (TypeError, ValueError):
+        settings["manual_target"] = DEFAULT_MANUAL_TARGET
+    settings["mode"] = settings.get("mode") if settings.get("mode") in ("off", "manual") else "auto"
     settings["learning_on"] = str(settings.get("learning", "on")).lower() not in ("off", "0", "false")
     try:
         settings["bot_id"] = int(settings.get("bot_id")) if settings.get("bot_id") not in (None, "", "0") else None
@@ -308,7 +313,7 @@ def regulate(temp, target, hyst, prev_heater):
 
 
 def decide(settings, bands, override, row, prev_heater):
-    """Priority: override > mode-off > schedule > default. Returns a decision dict."""
+    """Priority: override > mode-off > manual > schedule > default. Returns a decision dict."""
     temp = to_float(row.get("temp")) if row else None
     hyst = settings["hysteresis"]
     fresh = reading_is_fresh(row)
@@ -348,6 +353,13 @@ def decide(settings, bands, override, row, prev_heater):
     if malfunction:
         return {"heater": "OFF", "target": None, "temp": temp, "source": "failsafe",
                 "note": "Sensore scheda in malfunzionamento: caldaia OFF (failsafe)."}
+
+    # 5. Manual mode: fixed target, schedule ignored.
+    if settings["mode"] == "manual":
+        target = settings["manual_target"]
+        heater = regulate(temp, target, hyst, prev_heater)
+        return {"heater": heater, "target": target, "temp": temp, "source": "manual",
+                "note": f"{temp:.1f}°C vs target {target:.1f}°C ±{hyst:.1f} (manuale) → {heater}."}
 
     target, band = active_target(bands, now_local())
     if target is None:
