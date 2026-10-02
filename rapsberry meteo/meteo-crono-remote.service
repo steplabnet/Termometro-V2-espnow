@@ -1,0 +1,23 @@
+# systemd unit for crono_remote.py (Pi <-> remote crono.php bridge).
+#
+#   sudo cp /var/www/html/meteo-crono-remote.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now meteo-crono-remote
+#   journalctl -u meteo-crono-remote -f
+
+[Unit]
+Description=Crono remote bridge (crono.php <-> mqtt1.steplab.net)
+After=network-online.target apache2.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/var/www/html
+ExecStart=/usr/bin/python3 /var/www/html/crono_remote.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

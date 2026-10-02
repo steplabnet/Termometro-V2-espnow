@@ -39,6 +39,9 @@ TARGETS=(
   "bots.php|/var/www/html|"
   "cronotermostato.php|/var/www/html|"
   "crono.php|/var/www/html|"
+  "crono_ui.php|/var/www/html|"
+  "crono_remote.py|/var/www/html|meteo-crono-remote.service"
+  "meteo-crono-remote.service|/var/www/html|"
   "index.php|/var/www/html|"
   "batteria.php|/var/www/html|"
   "carichi.php|/var/www/html|"
@@ -123,7 +126,7 @@ done
 if [ -n "${present:-}" ]; then
   echo
   sh_remote "systemctl --no-pager --property=Id,ActiveState,SubState show$present | grep -v '^$'" || true
-  sh_remote "pgrep -af 'meteo.py|mqtt_receiver.py|alarm_watcher.py|crono_watcher.py|battery_bridge.py'"
+  sh_remote "pgrep -af 'meteo.py|mqtt_receiver.py|alarm_watcher.py|crono_watcher.py|crono_remote.py|battery_bridge.py'"
 fi
 
 echo

@@ -43,6 +43,14 @@ PHP_FILES=(
   ingest.php
   ingest_secret.php
   carica_dati.php
+  crono.php
+  mqtt_lite.php
+  crono_secret.php
+)
+
+# Shared with the Pi: single source in ../rapsberry meteo, copied as-is.
+SHARED_FILES=(
+  crono_ui.php
 )
 
 # Stream one local file to a remote path, then verify it arrived intact.
@@ -59,15 +67,24 @@ echo "==> copying PHP to $TARGET:$DOCROOT"
 for f in "${PHP_FILES[@]}"; do
   [ -f "$HERE/$f" ] || { echo "missing: $f" >&2; exit 1; }
 done
+for f in "${SHARED_FILES[@]}"; do
+  [ -f "$HERE/../rapsberry meteo/$f" ] || { echo "missing: ../rapsberry meteo/$f" >&2; exit 1; }
+done
 for f in "${PHP_FILES[@]}"; do
   printf '    %-20s' "$f"
   push "$HERE/$f" "$DOCROOT/$f"
   echo "ok"
 done
+for f in "${SHARED_FILES[@]}"; do
+  printf '    %-20s' "$f"
+  push "$HERE/../rapsberry meteo/$f" "$DOCROOT/$f"
+  echo "ok"
+done
+PHP_FILES+=("${SHARED_FILES[@]}")
 
 # Match the ownership of the files already in the vhost, and keep the shared
 # secret away from the group the other site files are readable by.
-ssh "$TARGET" "cd '$DOCROOT' && chown steplab:psacln ${PHP_FILES[*]} && chmod 644 ${PHP_FILES[*]} && chmod 640 ingest_secret.php"
+ssh "$TARGET" "cd '$DOCROOT' && chown steplab:psacln ${PHP_FILES[*]} && chmod 644 ${PHP_FILES[*]} && chmod 640 ingest_secret.php crono_secret.php"
 
 echo "==> linting with the vhost's PHP"
 ssh "$TARGET" "cd '$DOCROOT' && for f in ${PHP_FILES[*]}; do /opt/plesk/php/8.3/bin/php -l \$f || exit 1; done"
