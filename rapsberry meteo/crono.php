@@ -347,6 +347,7 @@ $nowHm = date('H:i');
     .pill.on  { background: var(--hot-soft); color: var(--hot); }
     .pill.off { background: var(--cool-soft); color: var(--cool); }
     .pill.cmd { background: var(--accent-soft); color: var(--accent-ink); }
+    .pill.fault { background: var(--hot); color: #fff; }
     .note { margin-top: 12px; font-size: .8rem; color: var(--faint); line-height: 1.4; }
 
     /* Override banner */
@@ -771,9 +772,18 @@ $nowHm = date('H:i');
         tgt.textContent = hasTgt ? fmt(st.target) + '°' : (st.heater === 'OFF' ? 'OFF' : '—');
         tgt.className = 'sp-val' + (hasTgt ? '' : ' off');
 
-        const heater = (st.heater || uff.heater || '').toUpperCase();
-        $('s-heater').textContent = 'Caldaia ' + (heater || '—');
-        $('s-heater').className = 'pill' + (heater === 'ON' ? ' on' : heater === 'OFF' ? ' off' : '');
+        // An unreachable Shelly can't be switching the relay, whatever the watcher wants.
+        const heaterEl = $('s-heater');
+        if (st.shelly_available === false) {
+          heaterEl.textContent = 'Caldaia spenta';
+          heaterEl.className = 'pill fault';
+          heaterEl.title = 'Shelly della caldaia non raggiungibile';
+        } else {
+          const heater = (st.heater || uff.heater || '').toUpperCase();
+          heaterEl.textContent = 'Caldaia ' + (heater || '—');
+          heaterEl.className = 'pill' + (heater === 'ON' ? ' on' : heater === 'OFF' ? ' off' : '');
+          heaterEl.title = '';
+        }
 
         const modeEl = $('s-mode');
         if (st.source === 'override') {

@@ -900,12 +900,20 @@ def status_text(con, settings):
 
 
 # ── Actuator check ──────────────────────────────────────────────────────────
-def shelly_problem(now):
-    """Why the Shelly is not confirming the heater ON, or None if it is."""
+def shelly_unreachable(now):
+    """Why the Shelly can't be reached, or None if it is answering."""
     if SHELLY["online"] is False:
         return "lo Shelly della caldaia è OFFLINE"
     if now - SHELLY["status_ts"] > SHELLY_STATUS_MAX_AGE:
         return "lo Shelly della caldaia non risponde"
+    return None
+
+
+def shelly_problem(now):
+    """Why the Shelly is not confirming the heater ON, or None if it is."""
+    unreachable = shelly_unreachable(now)
+    if unreachable:
+        return unreachable
     if SHELLY["output"] is not True:
         return "lo Shelly riporta il relè della caldaia SPENTO"
     return None
@@ -926,6 +934,12 @@ def check_actuator(con, client, ctl, decision):
     otherwise (relay OFF, offline, or silent). Returns the current problem."""
     now = time.time()
 
+    # The Shelly only reports on change: poll it so a silent device is noticed
+    # (always, so the web page can tell whether it is reachable).
+    if now - ctl.get("last_status_req", 0.0) >= SHELLY_POLL_INTERVAL:
+        client.publish(SHELLY_TOPIC_CMD, "status_update")
+        ctl["last_status_req"] = now
+
     if decision["heater"] != "ON":
         ctl["on_since"] = None
         if ctl.get("alert_active"):
@@ -936,10 +950,6 @@ def check_actuator(con, client, ctl, decision):
 
     if ctl.get("on_since") is None:
         ctl["on_since"] = now
-    # The Shelly only reports on change: poll it so a silent device is noticed.
-    if now - ctl.get("last_status_req", 0.0) >= SHELLY_POLL_INTERVAL:
-        client.publish(SHELLY_TOPIC_CMD, "status_update")
-        ctl["last_status_req"] = now
 
     if now - ctl["on_since"] < SHELLY_GRACE:
         return None
@@ -1001,6 +1011,7 @@ def run_control(con, settings, client, ctl, force_publish=False):
         "note": decision["note"],
         "actuator_problem": actuator,
         "shelly_output": SHELLY["output"],
+        "shelly_available": shelly_unreachable(time.time()) is None,
         "updated": now_local().strftime("%Y-%m-%d %H:%M:%S"),
     })
 
