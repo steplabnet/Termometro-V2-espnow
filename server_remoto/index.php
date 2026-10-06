@@ -1085,26 +1085,25 @@ function showStyle($cond): string
     <?php endif; ?>
 
     <?php if (!empty($p['battAvailable']) && $emAvailable): ?>
-      <!-- 9c. Inizio carica: l'ora in cui il sole si prende il carico di casa e
-           la batteria smette di scaricarsi. E' l'ora misurata sul fotovoltaico
-           di oggi (o dell'ultima mattina osservata, se oggi il sorpasso non c'e'
-           ancora stato), non una previsione. Si vede solo mentre la batteria
-           scarica: a pacco fermo o in carica non serve a decidere niente. -->
+      <!-- 9c. Autonomia / Fine carica: in scarica l'ora in cui il pacco
+           arriverebbe al 20% se il ritmo dell'ultima mezz'ora restasse quello;
+           in carica l'ora del pieno allo stesso modo. Pura retta, senza sole:
+           a pacco fermo la card non si vede. -->
       <div class="card border-inizio" data-card="inizioCarica"
         style="<?php echo showStyle($p['inizioCarica']['show']); ?>"
         data-live-show="inizioCarica.show">
-        <a href="grafico.php?var=pvPower">
+        <a href="grafico.php?var=battSoc">
           <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-inizio" viewBox="0 0 24 24"
             fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 3v2M5.6 7.6 4.2 6.2M18.4 7.6l1.4-1.4M3 14h2M19 14h2" />
             <path d="M8 14a4 4 0 0 1 8 0" />
             <path d="M2 18h20M6 21h12" />
           </svg>
-          <div class="card-label">Inizio carica</div>
-          <div class="card-value"><span data-live="inizioCarica.val"><?php echo $p['inizioCarica']['val']; ?></span></div>
+          <div class="card-label" data-live="inizioCarica.label"><?php echo $p['inizioCarica']['label']; ?></div>
+          <div class="card-value" style="text-align:center;"><span data-live-html="inizioCarica.val"><?php echo $p['inizioCarica']['val']; ?></span></div>
 
-          <!-- Icona di stato: spunta verde se il sole arriva prima che il pacco
-               tocchi la riserva, triangolo giallo se quel giorno dopo il
+          <!-- Icona di stato (solo in scarica): spunta verde se il sole arriva
+               prima che il pacco tocchi la riserva, triangolo giallo se quel giorno dopo il
                sorpasso e' ricaduto o se arriva in ritardo di meno di due ore,
                ottagono rosso oltre. Il markup arriva gia' fatto dal payload. -->
           <div class="state-row" style="color:<?php echo $p['inizioCarica']['iconColor']; ?>;"
@@ -1113,8 +1112,10 @@ function showStyle($cond): string
           </div>
 
           <div class="minmax-row">
-            <div class="minmax-item"><span class="minmax-label">Produzione a quell&rsquo;ora</span><span
-                class="minmax-val" data-live="inizioCarica.pv"><?php echo $p['inizioCarica']['pv']; ?></span></div>
+            <div class="minmax-item"><span class="minmax-label">Tra</span><span
+                class="minmax-val" data-live="inizioCarica.in"><?php echo $p['inizioCarica']['in']; ?></span></div>
+            <div class="minmax-item"><span class="minmax-label">Ritmo</span><span
+                class="minmax-val" data-live-html="inizioCarica.rate"><?php echo $p['inizioCarica']['rate']; ?></span></div>
           </div>
         </a>
       </div>

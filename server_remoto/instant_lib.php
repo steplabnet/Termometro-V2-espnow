@@ -55,6 +55,18 @@ defined('BATTERY_DIAG_FIELDS') || define('BATTERY_DIAG_FIELDS', [
   'battAcW',
 ]);
 
+/** kWh counters the pack keeps itself -- lifetime, today, this month -- and
+ * its BMS cycle count. Live row only, stored as DOUBLE by store_lib.php. */
+defined('BATTERY_ENERGY_FIELDS') || define('BATTERY_ENERGY_FIELDS', [
+  'battChgTot',
+  'battDisTot',
+  'battChgDay',
+  'battDisDay',
+  'battChgMon',
+  'battDisMon',
+  'battCycles',
+]);
+
 /**
  * Shelly Pro EM-50 detail: what the two clamps report besides active power.
  *
@@ -94,6 +106,10 @@ defined('BATT_RESERVE_SOC') || define('BATT_RESERVE_SOC', 12.0);
  * charge-ceiling register on the v3 map, so it fills to 100 and this is simply
  * full. */
 defined('BATT_FULL_SOC') || define('BATT_FULL_SOC', 100.0);
+
+/** Soglia della card "Autonomia": l'ora in cui, al ritmo di scarica attuale,
+ * il pacco scenderebbe a questa percentuale. */
+defined('BATT_AUTONOMY_SOC') || define('BATT_AUTONOMY_SOC', 20.0);
 
 /** Produzione sotto la quale il fotovoltaico e' considerato spento, in watt.
  * Sotto questi watt e' notte (o quasi) e la scarica della batteria conta come
@@ -1406,6 +1422,7 @@ function meteo_build_payload(mysqli $link): array
   $sunFullTs = null;
   $sunMaxSoc = null;
   $sunMaxTs = null;
+  $autoEta = null;
   if (($battDischarging || $battCharging) && $safeBattSoc0 !== null) {
     /* Samples come from the RAM window first: it holds every reading of the
      * last half hour, where `dati_meteo` holds three or four of them. The DB
@@ -1473,6 +1490,12 @@ function meteo_build_payload(mysqli $link): array
 
       $battEtaEnd = $etaEnd;
       $battSunTakeover = $sunTakeover;
+
+      // Card "Autonomia": la pura retta dell'ultima mezz'ora, senza sole ne'
+      // profili. In carica e' la stessa stima verso BATT_FULL_SOC; in scarica
+      // si rifa' il conto fino a BATT_AUTONOMY_SOC invece che fino alla riserva.
+      $autoEta = $battCharging ? $eta
+        : battSocEtaHours($rowsEta, $safeBattSoc0, BATT_AUTONOMY_SOC);
 
       // Oltre la mattina dopo la retta non descrive più niente: il sole avrà
       // rimesso dentro corrente molto prima. Da lì in poi cadono l'ora di fine
@@ -1600,7 +1623,7 @@ function meteo_build_payload(mysqli $link): array
    */
   $anaIcon = '';
   $anaIconColor = 'var(--text-muted)';
-  if ($battSunTakeover !== null && $battEtaEnd !== null) {
+  if ($battDischarging && $battSunTakeover !== null && $battEtaEnd !== null) {
     if ($battSunTakeover > $battEtaEnd + ANA_LATE_RED) {
       $anaIcon = ANA_ICON_ALARM;
       $anaIconColor = 'var(--accent-red)';
@@ -1610,6 +1633,30 @@ function meteo_build_payload(mysqli $link): array
     } else {
       $anaIcon = ANA_ICON_OK;
       $anaIconColor = 'var(--accent-green)';
+    }
+  }
+
+  /* Card "Autonomia" / "Fine carica": l'ora d'arrivo della retta, la durata
+   * e il ritmo su cui poggia. In scarica gia' sotto la soglia non c'e' ora da
+   * dare: lo si dice invece di nascondere la card.
+   */
+  $autoLabel = $battCharging ? 'Fine carica' : 'Autonomia';
+  $autoVal = '--';
+  $autoIn = '--';
+  $autoRate = '--';
+  if ($battDischarging && $safeBattSoc0 !== null && $safeBattSoc0 <= BATT_AUTONOMY_SOC) {
+    $autoVal = 'sotto ' . round(BATT_AUTONOMY_SOC) . '%';
+  } elseif ($autoEta !== null) {
+    $autoRate = fmtW($autoEta['watts']) . ' &#183; ' . number_format($autoEta['slope'], 1) . ' %/h';
+    if ($autoEta['hours'] > 24) {
+      $autoVal = 'oltre 24 h';
+    } else {
+      $autoTs = $now + (int) ($autoEta['hours'] * 3600);
+      $autoVal = date('H:i', $autoTs);
+      if (date('Y-m-d', $autoTs) !== date('Y-m-d', $now)) {
+        $autoVal .= '<span class="card-unit" style="display:block; margin:4px 0 0;">domani</span>';
+      }
+      $autoIn = fmtDuration($autoEta['hours']);
     }
   }
 
@@ -2041,13 +2088,15 @@ function meteo_build_payload(mysqli $link): array
       'iAc' => $fmtNum($acCurrent, 1, 'A'),
     ],
 
-    // Inizio carica: l'ora in cui il sole si prende il carico e la batteria
-    // smette di scaricarsi. Solo l'ora, ed e' l'unico numero su cui si decide.
-    // Si vede solo mentre il pacco scarica: fermo o in carica non serve.
+    // Autonomia in scarica (ora in cui si arriva a BATT_AUTONOMY_SOC), fine
+    // carica in carica (ora del 100%): entrambe al ritmo dell'ultima mezz'ora.
+    // Pacco fermo: non c'e' niente da stimare e la card sparisce.
     'inizioCarica' => [
-      'show' => ($battAvailable && $emAvailable && $battDischarging),
-      'val' => $anaVal,
-      'pv' => $anaPv,
+      'show' => ($battAvailable && $emAvailable && ($battDischarging || $battCharging)),
+      'label' => $autoLabel,
+      'val' => $autoVal,
+      'in' => $autoIn,
+      'rate' => $autoRate,
       'icon' => $anaIcon,
       'iconColor' => $anaIconColor,
     ],
