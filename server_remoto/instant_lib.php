@@ -2227,35 +2227,43 @@ function meteo_build_payload(mysqli $link): array
   $battEff = $battEff[$effDir];
   unset($battEff['last']);
 
-  /* Rendimento in scarica per classe di potenza (trend_store.php): one bar
-   * per 50 W of AC delivered, 0..900 W, scale 0-100 %. The class the pack is in
-   * right now is drawn full, the others faded. HTML built here because the
-   * poller swaps it in whole (data-live-html). */
-  $curve = batt_eff_curve();
-  $curveNow = ($battDischarging && $d('battAcW') !== null)
-    ? (int) floor(abs($d('battAcW')) / BATT_EFF_CURVE_STEP) : -1;
-  $curveBars = '';
-  $curveN = 0;
-  foreach ($curve as $i => $v) {
-    $lo = $i * BATT_EFF_CURVE_STEP;
-    $range = $lo . '-' . ($lo + BATT_EFF_CURVE_STEP) . ' W';
-    if (!is_numeric($v)) {
-      $curveBars .= '<div class="curve-col" title="' . $range . ' · nessuna misura">'
-        . '<span class="curve-val"></span><span class="curve-bar empty"></span></div>';
-      continue;
+  /* The two efficiency-by-power charts (trend_store.php): 18 bars of 50 W
+   * of AC, 0..900 W, scale 0-100 %. HTML built here because the poller swaps
+   * it in whole (data-live-html). The class the pack is in right now is
+   * drawn full, the others faded. */
+  $curveNote = static function (array $bins): string {
+    $n = count(array_filter($bins, 'is_array'));
+    return ($n === 0) ? 'nessuna misura ancora'
+      : $n . ($n === 1 ? ' classe' : ' classi') . ' su ' . count($bins) . ' con misure';
+  };
+  $curveNow = static fn(bool $active, ?float $w) => ($active && $w !== null)
+    ? (int) floor(abs($w) / BATT_EFF_CURVE_STEP) : -1;
+  $emptyCol = static fn(string $range) => '<div class="curve-col" title="' . $range . ' · nessuna misura">'
+    . '<span class="curve-val"></span><span class="curve-bar empty"></span></div>';
+
+  $effChart = static function (array $bins, int $now, string $color, string $unit) use ($curveNote, $emptyCol): array {
+    $html = '';
+    foreach ($bins as $i => $b) {
+      $lo = $i * BATT_EFF_CURVE_STEP;
+      $range = $lo . '-' . ($lo + BATT_EFF_CURVE_STEP) . ' W ' . $unit;
+      if (!is_array($b) || !is_numeric($b['eff'] ?? null)) {
+        $html .= $emptyCol($range);
+        continue;
+      }
+      $v = (float) $b['eff'];
+      $html .= '<div class="curve-col" title="' . $range . ' · ' . number_format($v, 1) . ' %">'
+        . '<span class="curve-val">' . round($v) . '</span>'
+        . '<span class="curve-bar" style="height:' . round(max(2, min(100, $v))) . '%; background:' . $color . ';'
+        . ($i === $now ? '' : ' opacity:0.55;') . '"></span></div>';
     }
-    $curveN++;
-    $h = max(2, min(100, (float) $v));
-    $curveBars .= '<div class="curve-col" title="' . $range . ' · ' . number_format((float) $v, 1) . ' %">'
-      . '<span class="curve-val">' . round((float) $v) . '</span>'
-      . '<span class="curve-bar" style="height:' . round($h) . '%;'
-      . ($i === $curveNow ? '' : ' opacity:0.55;') . '"></span></div>';
-  }
-  $battCurve = [
-    'bars' => $curveBars,
-    'note' => ($curveN === 0) ? 'nessuna misura ancora'
-      : $curveN . ($curveN === 1 ? ' classe' : ' classi') . ' su ' . count($curve) . ' con misure',
-  ];
+    return ['bars' => $html, 'note' => $curveNote($bins)];
+  };
+
+  $acNow = $d('battAcW');
+  $battCurve = $effChart(batt_curve('eff_dis'), $curveNow($battDischarging, $acNow),
+    'var(--accent-orange)', 'AC');
+  $battCurveChg = $effChart(batt_curve('eff_chg'), $curveNow($battCharging, $acNow),
+    'var(--accent-green)', 'AC');
 
   /* Casa + batteria: what the house and the pack are drawing together.
    *
@@ -2530,6 +2538,8 @@ function meteo_build_payload(mysqli $link): array
     'battEff' => $battEff,
 
     'battCurve' => $battCurve,
+
+    'battCurveChg' => $battCurveChg,
 
     'battDiag' => [
       'show' => ($battDiag !== []),

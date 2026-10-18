@@ -1549,26 +1549,38 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
       </div>
     <?php endif; ?>
 
-    <?php if (!empty($p['battAvailable']) && !empty($p['battCurve'])): ?>
-      <!-- 13 quater. Rendimento in scarica in funzione della potenza prelevata
-           lato AC: una barra per classe di 50 W, da 0 a 900 W. Ogni classe
-           tiene solo il suo valore attuale, aggiornato a ogni misura come
-           media fra il valore memorizzato e l'ultimo (tabella in /dev/shm,
-           vedi trend_store.php). Piena la classe in cui si trova ora. -->
-      <div class="card border-casabatt card-wide" data-card="battCurve"
-        style="display:flex; flex-direction:column; align-items:center;">
-        <div class="card-label">Rendimento scarica per potenza prelevata</div>
-        <div class="curve-chart" data-live-html="battCurve.bars"><?php echo $p['battCurve']['bars']; ?></div>
-        <div class="curve-axis">
-          <?php for ($w = 0; $w <= 900; $w += 150): ?>
-            <span style="left:<?php echo round($w / 900 * 100, 2); ?>%;"><?php echo $w; ?></span>
-          <?php endfor; ?>
+    <?php if (!empty($p['battAvailable'])): ?>
+      <!-- 13 quater. Rendimento per classe di potenza AC, 18 classi da 50 W
+           fra 0 e 900 W: in scarica AC / DC per AC erogata, in carica DC / AC
+           per AC prelevata. Ogni classe tiene solo il suo valore attuale,
+           aggiornato a ogni misura come media fra il valore memorizzato e
+           l'ultimo (tabelle in /dev/shm, vedi trend_store.php). Piena la
+           classe in cui si trova ora il pacco. -->
+      <?php
+      $curveCards = [
+        'battCurve' => ['Rendimento scarica per potenza erogata',
+          'W erogati in AC · rendimento AC / DC in %'],
+        'battCurveChg' => ['Rendimento carica per potenza prelevata',
+          'W prelevati in AC · rendimento DC / AC in %'],
+      ];
+      ?>
+      <?php foreach ($curveCards as $ck => [$cLabel, $cNote]): ?>
+        <?php if (empty($p[$ck])) continue; ?>
+        <div class="card border-casabatt card-wide" data-card="<?php echo $ck; ?>"
+          style="display:flex; flex-direction:column; align-items:center;">
+          <div class="card-label"><?php echo $cLabel; ?></div>
+          <div class="curve-chart" data-live-html="<?php echo $ck; ?>.bars"><?php echo $p[$ck]['bars']; ?></div>
+          <div class="curve-axis">
+            <?php for ($w = 0; $w <= 900; $w += 150): ?>
+              <span style="left:<?php echo round($w / 900 * 100, 2); ?>%;"><?php echo $w; ?></span>
+            <?php endfor; ?>
+          </div>
+          <div style="font-size:0.7rem; color:var(--text-muted); margin-top:6px;">
+            <?php echo $cNote; ?> ·
+            <span data-live="<?php echo $ck; ?>.note"><?php echo $p[$ck]['note']; ?></span>
+          </div>
         </div>
-        <div style="font-size:0.7rem; color:var(--text-muted); margin-top:6px;">
-          W erogati in AC · rendimento AC / DC in % ·
-          <span data-live="battCurve.note"><?php echo $p['battCurve']['note']; ?></span>
-        </div>
-      </div>
+      <?php endforeach; ?>
     <?php endif; ?>
 
     <?php if (!empty($p['battRaw']['show'])): ?>

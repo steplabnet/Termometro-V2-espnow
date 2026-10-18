@@ -235,11 +235,11 @@ function batt_eff_push(int $battTs, float $dc, float $ac): bool
         } else {
             $dis[] = $row;
             $dis = array_slice($dis, -BATT_EFF_SAMPLES);
-            // A new discharge reading also updates its power class in the
-            // efficiency curve. Here, inside the !$seen branch, so a reading
-            // repeated by the Pi is counted once there too.
-            batt_eff_curve_update(abs($dc), abs($ac));
         }
+        // A new reading also updates its per-class table (see
+        // batt_curve_update below). Here, inside the !$seen branch, so a
+        // reading repeated by the Pi is counted once there too.
+        batt_curves_add($dc, $ac);
         $json = json_encode(['chg' => $chg, 'dis' => $dis], JSON_UNESCAPED_SLASHES);
         if ($json !== false) {
             ftruncate($fh, 0);
@@ -282,27 +282,61 @@ function batt_eff_samples(): array
     ];
 }
 
-/* ---------- Discharge efficiency by power class ----------
+/* ---------- Per power class tables: efficiency ----------
  *
- * One value per 50 W class of AC power the inverter delivers, 0..900 W (18
- * classes). Only the current value of each class is kept: a new reading in a
- * class replaces it with the mean of the stored value and its own efficiency,
- * (old + new) / 2, so the latest reading weighs half and older ones fade. An
- * empty class takes the first reading as it is. Above 900 W nothing is kept.
+ * Two tables of 18 classes of 50 W each, 0..900 W, one JSON file each in
+ * tmpfs:
  *
- * RAM only, in the same tmpfs as the rest: a reboot starts the table again.
+ *   eff_dis   discharge efficiency AC / DC, class by AC delivered
+ *   eff_chg   charge efficiency DC / AC,    class by AC drawn from the house
+ *
+ * Only the current value of each class is kept: a new reading replaces it
+ * with (stored + latest) / 2, field by field, so the latest reading weighs
+ * half and older ones fade. An empty class takes the first reading as it is.
+ * A reading at or above 900 W in the class power is not kept.
+ *
+ * RAM only, in the same tmpfs as the rest: a reboot starts the tables again.
  */
-const BATT_EFF_CURVE_FILE = INSTANT_RAM_DIR . '/batt_eff_curve.json';
 const BATT_EFF_CURVE_STEP = 50;
 const BATT_EFF_CURVE_MAX = 900;
+const BATT_CURVE_FILES = [
+    'eff_dis' => INSTANT_RAM_DIR . '/batt_eff_curve.json',
+    'eff_chg' => INSTANT_RAM_DIR . '/batt_eff_curve_chg.json',
+];
 
-/** Fold one discharge reading (DC drawn, AC delivered, both W) into its class. */
-function batt_eff_curve_update(float $dc, float $ac): bool
+/** Route one reading ($dc house-signed, > 0 charging) to its table. */
+function batt_curves_add(float $dc, float $ac): void
 {
-    if ($dc <= 0 || $ac <= 0 || $ac >= BATT_EFF_CURVE_MAX || !instant_ram_ready()) {
+    $dc0 = abs($dc);
+    $ac0 = abs($ac);
+    if ($dc0 <= 0 || $ac0 <= 0) {
+        return;
+    }
+    if ($dc > 0) {
+        batt_curve_update('eff_chg', $ac0, ['eff' => $dc0 / $ac0 * 100]);
+    } else {
+        batt_curve_update('eff_dis', $ac0, ['eff' => $ac0 / $dc0 * 100]);
+    }
+}
+
+/** One stored class as an array of fields. The first discharge efficiency
+ * table stored bare numbers; read them as ['eff' => n]. */
+function batt_curve_bin($v): ?array
+{
+    if (is_numeric($v)) {
+        return ['eff' => (float) $v];
+    }
+    return is_array($v) ? $v : null;
+}
+
+/** Fold one reading into the class of $classW in table $name. */
+function batt_curve_update(string $name, float $classW, array $vals): bool
+{
+    $file = BATT_CURVE_FILES[$name] ?? null;
+    if ($file === null || $classW <= 0 || $classW >= BATT_EFF_CURVE_MAX || !instant_ram_ready()) {
         return false;
     }
-    $fh = @fopen(BATT_EFF_CURVE_FILE, 'c+');
+    $fh = @fopen($file, 'c+');
     if ($fh === false) {
         return false;
     }
@@ -314,12 +348,16 @@ function batt_eff_curve_update(float $dc, float $ac): bool
     $data = ($raw === false || $raw === '') ? [] : json_decode($raw, true);
     $n = intdiv(BATT_EFF_CURVE_MAX, BATT_EFF_CURVE_STEP);
     $bins = (is_array($data) && is_array($data['bins'] ?? null) && count($data['bins']) === $n)
-        ? $data['bins'] : array_fill(0, $n, null);
+        ? array_map('batt_curve_bin', $data['bins']) : array_fill(0, $n, null);
 
-    $i = (int) floor($ac / BATT_EFF_CURVE_STEP);
-    $eff = $ac / $dc * 100;
+    $i = (int) floor($classW / BATT_EFF_CURVE_STEP);
     $old = $bins[$i];
-    $bins[$i] = round(is_numeric($old) ? ((float) $old + $eff) / 2 : $eff, 2);
+    $new = [];
+    foreach ($vals as $k => $v) {
+        $new[$k] = round(is_array($old) && is_numeric($old[$k] ?? null)
+            ? ((float) $old[$k] + $v) / 2 : $v, 2);
+    }
+    $bins[$i] = $new;
 
     $json = json_encode(['t' => time(), 'bins' => $bins]);
     if ($json !== false) {
@@ -333,15 +371,16 @@ function batt_eff_curve_update(float $dc, float $ac): bool
     return $json !== false;
 }
 
-/** The 18 class values (null where nothing has been read yet), lowest first. */
-function batt_eff_curve(): array
+/** The 18 classes of table $name (null where empty), lowest first. */
+function batt_curve(string $name): array
 {
     $n = intdiv(BATT_EFF_CURVE_MAX, BATT_EFF_CURVE_STEP);
     $empty = array_fill(0, $n, null);
-    if (!is_readable(BATT_EFF_CURVE_FILE)) {
+    $file = BATT_CURVE_FILES[$name] ?? null;
+    if ($file === null || !is_readable($file)) {
         return $empty;
     }
-    $fh = @fopen(BATT_EFF_CURVE_FILE, 'r');
+    $fh = @fopen($file, 'r');
     if ($fh === false) {
         return $empty;
     }
@@ -354,5 +393,5 @@ function batt_eff_curve(): array
     fclose($fh);
     $data = ($raw === false || $raw === '') ? null : json_decode($raw, true);
     return (is_array($data) && is_array($data['bins'] ?? null) && count($data['bins']) === $n)
-        ? $data['bins'] : $empty;
+        ? array_map('batt_curve_bin', $data['bins']) : $empty;
 }
