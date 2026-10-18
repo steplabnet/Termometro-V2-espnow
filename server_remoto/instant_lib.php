@@ -155,8 +155,9 @@ defined('BATT_RESERVE_SOC') || define('BATT_RESERVE_SOC', 12.0);
 defined('BATT_FULL_SOC') || define('BATT_FULL_SOC', 100.0);
 
 /** Soglia della card "Autonomia": l'ora in cui, al ritmo di scarica attuale,
- * il pacco scenderebbe a questa percentuale. */
-defined('BATT_AUTONOMY_SOC') || define('BATT_AUTONOMY_SOC', 20.0);
+ * il pacco scenderebbe a questa percentuale. E' la riserva del Venus (12%),
+ * dove il pacco smette davvero di scaricare. */
+defined('BATT_AUTONOMY_SOC') || define('BATT_AUTONOMY_SOC', BATT_RESERVE_SOC);
 
 /** Produzione sotto la quale il fotovoltaico e' considerato spento, in watt.
  * Sotto questi watt e' notte (o quasi) e la scarica della batteria conta come

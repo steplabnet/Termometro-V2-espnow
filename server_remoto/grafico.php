@@ -558,6 +558,115 @@ if ($isMulti) {
 $jsonAcDcChg = json_encode(array_reverse($acDcChg ?? []));
 $jsonAcDcDis = json_encode(array_reverse($acDcDis ?? []));
 
+/* ---- battSoc: the fit the Batteria card works from ----
+ *
+ * Same data and same rules as battSocEtaHours() in instant_lib.php: SoC of
+ * the last half hour from the RAM trend window (dati_meteo when it has fewer
+ * than three samples), least squares SoC(t), used only with at least three
+ * samples across ten minutes and a slope of at least 0.5 %/h.
+ *
+ * Shown only while the battery is actually moving, in the direction it is
+ * moving now (battPower in dati_instant, fresh within BATT_MAX_AGE, outside
+ * the BATT_IDLE_W deadband): discharging, a falling fit extended down to the
+ * reserve; charging, a rising fit extended up to 100 %. Idle, a stale
+ * reading, or a fit going the other way draws nothing.
+ *
+ * Drawn over the window it was fitted on, then extended past the last row in
+ * ten-minute steps until it reaches its target or a day has gone by. The
+ * extension needs labels the chart does not have, so they are appended; the
+ * other series simply end where the data ends.
+ */
+defined('BATT_ETA_WINDOW') || define('BATT_ETA_WINDOW', 1800);
+defined('BATT_RESERVE_SOC') || define('BATT_RESERVE_SOC', 12.0);
+defined('BATT_FULL_SOC') || define('BATT_FULL_SOC', 100.0);
+defined('BATT_IDLE_W') || define('BATT_IDLE_W', 15.0);
+defined('BATT_MAX_AGE') || define('BATT_MAX_AGE', 300);
+$jsonSocFit = 'null';
+$socFitLabel = '';
+$socFitColor = '#f97316';
+if ($variable === 'battSoc' && !$isMulti && !isset($_GET['ieri'])) {
+  // Which way the pack is going right now: +1 charging, -1 discharging, 0 idle.
+  $battDir = 0;
+  $resDir = $link->query("SELECT battPower, battTs FROM dati_instant WHERE id = 1");
+  if ($resDir instanceof mysqli_result && $rowDir = $resDir->fetch_assoc()) {
+    if (is_numeric($rowDir['battPower']) && is_numeric($rowDir['battTs'])
+        && time() - (int) $rowDir['battTs'] <= BATT_MAX_AGE) {
+      $bp = (float) $rowDir['battPower'];
+      $battDir = ($bp > BATT_IDLE_W) ? 1 : (($bp < -BATT_IDLE_W) ? -1 : 0);
+    }
+  }
+
+  require_once __DIR__ . '/trend_store.php';
+  $fitRows = [];
+  foreach (trend_window(BATT_ETA_WINDOW) as $t) {
+    if (isset($t['battSoc'])) {
+      $fitRows[] = [(int) $t['t'], (float) $t['battSoc']];
+    }
+  }
+  if (count($fitRows) < 3) {
+    $fitRows = [];
+    $since = time() - BATT_ETA_WINDOW;
+    $resFit = $link->query("SELECT data, battSoc FROM dati_meteo
+      WHERE data >= $since AND battSoc IS NOT NULL ORDER BY data ASC");
+    if ($resFit instanceof mysqli_result) {
+      while ($r = $resFit->fetch_assoc()) {
+        $fitRows[] = [(int) $r['data'], (float) $r['battSoc']];
+      }
+    }
+  }
+
+  $n = count($fitRows);
+  if ($battDir !== 0 && $n >= 3) {
+    $t0 = $fitRows[0][0];
+    $tEnd = $fitRows[$n - 1][0];
+    $sx = $sy = $sxx = $sxy = 0.0;
+    foreach ($fitRows as [$t, $soc]) {
+      $x = ($t - $t0) / 3600.0;
+      $sx += $x;
+      $sy += $soc;
+      $sxx += $x * $x;
+      $sxy += $x * $soc;
+    }
+    $den = $n * $sxx - $sx * $sx;
+    if ($tEnd - $t0 >= 600 && $den > 0) {
+      $slope = ($n * $sxy - $sx * $sy) / $den;          // %/h
+      $icpt = ($sy - $slope * $sx) / $n;                // SoC at $t0
+      // The fit has to go the way the pack is going, and fast enough to mean it.
+      if ($slope * $battDir >= 0.5) {
+        $target = ($battDir < 0) ? BATT_RESERVE_SOC : BATT_FULL_SOC;
+        $at = static fn(int $t) => $icpt + $slope * ($t - $t0) / 3600.0;
+        $labelsC = array_reverse($labels);
+        $tsC = array_reverse($rawDate1);
+        $fit = [];
+        foreach ($tsC as $t) {
+          $fit[] = ($t >= $t0 - 60) ? round($at((int) $t), 2) : null;
+        }
+        // Past the last row: ten-minute steps to the target, which gets a
+        // point of its own at the exact time it is reached.
+        $last = $tsC === [] ? time() : (int) end($tsC);
+        $targetTs = $t0 + (int) round(($target - $icpt) / $slope * 3600);
+        for ($t = $last + 600; $t <= $last + 86400; $t += 600) {
+          $v = $at($t);
+          if (($v - $target) * $battDir >= 0) {
+            $labelsC[] = date('H:i', $targetTs);
+            $fit[] = $target;
+            break;
+          }
+          $labelsC[] = date('H:i', $t);
+          $fit[] = round($v, 2);
+        }
+        $jsonLabels = json_encode($labelsC);
+        $jsonSocFit = json_encode($fit);
+        $socFitColor = ($battDir < 0) ? '#f97316' : '#22c55e';
+        $socFitLabel = ($battDir < 0 ? 'Retta di scarica ' : 'Retta di carica +')
+          . number_format($slope, 1) . ' %/h · '
+          . ($battDir < 0 ? 'riserva ' . round(BATT_RESERVE_SOC) . '%' : '100%')
+          . ($targetTs <= $last + 86400 ? ' alle ' . date('H:i', $targetTs) : ' oltre 24 h');
+      }
+    }
+  }
+}
+
 ?>
 
 <!doctype html>
@@ -1017,6 +1126,24 @@ $jsonAcDcDis = json_encode(array_reverse($acDcDis ?? []));
           tension: 0.3
         }
       ];
+      // battSoc only: the fit behind the Batteria card's %/h, while the pack
+      // is charging or discharging.
+      const SOC_FIT = <?php echo $jsonSocFit; ?>;
+      if (SOC_FIT) {
+        datasets.push({
+          label: <?php echo json_encode($socFitLabel, JSON_UNESCAPED_UNICODE); ?>,
+          data: SOC_FIT,
+          borderColor: '<?php echo $socFitColor; ?>',
+          backgroundColor: 'transparent',
+          borderWidth: 2,
+          borderDash: [6, 4],
+          pointRadius: 0,
+          pointHoverRadius: 4,
+          spanGaps: true,
+          fill: false,
+          tension: 0
+        });
+      }
       scales = {
         x: xScale,
         y: {

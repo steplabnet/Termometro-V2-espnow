@@ -1262,7 +1262,7 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
 
     <?php if (!empty($p['battAvailable']) && $emAvailable): ?>
       <!-- 9c. Autonomia / Fine carica: in scarica l'ora in cui il pacco
-           arriverebbe al 20% se il ritmo dell'ultima mezz'ora restasse quello;
+           arriverebbe al 12% (riserva) se il ritmo dell'ultima mezz'ora restasse quello;
            in carica l'ora del pieno allo stesso modo. Pura retta, senza sole:
            a pacco fermo la card non si vede. -->
       <div class="card border-inizio" data-card="inizioCarica"
