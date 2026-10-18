@@ -1362,6 +1362,10 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
           <div class="minmax-row">
             <div class="minmax-item"><span class="minmax-label">Picco 24h</span><span class="minmax-val"
                 data-live="casa.peak"><?php echo $p['casa']['peak']; ?></span></div>
+            <!-- Perdita dell'inverter della batteria (ingresso - uscita), a
+                 parte: il consumo qui sopra conta solo il lato AC. -->
+            <div class="minmax-item"><span class="minmax-label">Dispersione</span><span class="minmax-val"
+                data-live="casa.loss"><?php echo $p['casa']['loss'] ?? '--'; ?></span></div>
           </div>
         </a>
       </div>

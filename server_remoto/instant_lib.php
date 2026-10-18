@@ -1197,10 +1197,29 @@ function meteo_build_payload(mysqli $link): array
    * With no fresh battery reading this falls back to the old sum, which is the
    * right answer for a house that has no battery and the best available one
    * for a house whose bridge is down.
+   *
+   * The battery term is its AC side, battAcW (30006): that is what the meters
+   * see, on the house wiring. battPower is the pack's DC side, which differs
+   * from it by the inverter losses. battAcW is signed the other way (> 0
+   * delivering to the house), hence the minus to bring it to the house sign
+   * (> 0 charging). No AC reading: battPower stands in.
    */
+  $safeBattAc0 = ($safeBattPower0 === null) ? null
+    : (isset($battDiag['battAcW']) ? -$battDiag['battAcW'] : $safeBattPower0);
+  /* Dispersione: what the battery's inverter loses converting, input minus
+   * output -- DC - AC discharging, AC - DC charging. Not part of the house
+   * load above (that takes the AC side only); shown beside it. Dashes while
+   * the pack is idle or there is no AC reading. */
+  $battLossW = null;
+  if ($safeBattPower0 !== null && isset($battDiag['battAcW'])
+      && abs($safeBattPower0) > BATT_IDLE_W && abs($battDiag['battAcW']) > BATT_IDLE_W) {
+    $battLossW = ($safeBattPower0 > 0)
+      ? abs($battDiag['battAcW']) - abs($safeBattPower0)
+      : abs($safeBattPower0) - abs($battDiag['battAcW']);
+  }
   $safeCasa0 = ($safePv0 !== null && $safeGrid0 !== null) ? $safePv0 + $safeGrid0 : null;
-  if ($safeCasa0 !== null && $safeBattPower0 !== null) {
-    $safeCasa0 -= $safeBattPower0;
+  if ($safeCasa0 !== null && $safeBattAc0 !== null) {
+    $safeCasa0 -= $safeBattAc0;
   }
 
   // 24h extremes for the same two channels (again isolated from the main query).
@@ -1244,8 +1263,10 @@ function meteo_build_payload(mysqli $link): array
       // the battery was drawing. LEAST(...,0) is the algebra for "count the
       // battery only while it charges" -- casa + max(0,b) is the same as
       // pv + grid - min(b,0), and this way it stays one SQL expression.
+      // The house peak takes the battery's AC side (-battAcW, house sign),
+      // like the Consumo Casa value; rows with no AC reading use battPower.
       $resCasaMM = $link->query(
-        "SELECT MAX(pvPower + gridPower - COALESCE(battPower, 0)) AS max_casa,
+        "SELECT MAX(pvPower + gridPower - COALESCE(-battAcW, battPower, 0)) AS max_casa,
                 MAX(pvPower + gridPower - LEAST(COALESCE(battPower, 0), 0)) AS max_casa_batt
          FROM dati_meteo
          WHERE data >= {$time24hAgo} AND pvPower IS NOT NULL"
@@ -1906,7 +1927,8 @@ function meteo_build_payload(mysqli $link): array
   $mixPvW = null;
   if ($safeCasa0 !== null && $safeCasa0 > 0 && $safeGrid0 !== null) {
     $fromGrid = min(max(0.0, $safeGrid0), $safeCasa0);
-    $fromBatt = ($safeBattPower0 !== null) ? max(0.0, -$safeBattPower0) : 0.0;
+    // AC, like the Consumo Casa value: what the inverter actually delivers.
+    $fromBatt = ($safeBattAc0 !== null) ? max(0.0, -$safeBattAc0) : 0.0;
     $fromBatt = min($fromBatt, max(0.0, $safeCasa0 - $fromGrid));
     $fromPv = max(0.0, $safeCasa0 - $fromGrid - $fromBatt);
     // I due contributi in watt servono anche al contatore di scarica, che su
@@ -2433,6 +2455,7 @@ function meteo_build_payload(mysqli $link): array
       'shareShow' => ($selfShare !== null),
       'share' => ($selfShare !== null) ? $selfShare . $selfLabel : '',
       'peak' => fmtW($em_max_casa),
+      'loss' => fmtW($battLossW),
       // Le tre sorgenti del consumo, gia' in percentuale (larghezze pronte per
       // la barra) e in watt (la legenda sotto).
       'mix' => $mix,
