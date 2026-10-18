@@ -2147,9 +2147,10 @@ function meteo_build_payload(mysqli $link): array
 
   /* Rendimento carica / scarica: the same efficiency, from the last
    * BATT_EFF_SAMPLES battery readings of each direction (trend_store.php)
-   * rather than one. Ratio of the mean powers, not mean of the ratios, so a
-   * 50 W reading does not weigh as much as a 2 kW one. Charging is DC out of
-   * AC in, discharging AC out of DC in. */
+   * rather than one. Mean of the instant efficiencies, one per reading, as
+   * asked: every reading weighs the same whatever its power. Charging is DC
+   * out of AC in, discharging AC out of DC in. The mean powers are kept only
+   * for the detail line under the value. */
   $effSamples = batt_eff_samples();
   $battEff = [];
   foreach (['chg' => true, 'dis' => false] as $dir => $charging) {
@@ -2157,12 +2158,19 @@ function meteo_build_payload(mysqli $link): array
     $n = count($rows);
     $dcSum = 0.0;
     $acSum = 0.0;
+    $effSum = 0.0;
+    $effN = 0;
     foreach ($rows as $r) {
-      $dcSum += (float) ($r['dc'] ?? 0);
-      $acSum += (float) ($r['ac'] ?? 0);
+      $dc = (float) ($r['dc'] ?? 0);
+      $ac = (float) ($r['ac'] ?? 0);
+      $dcSum += $dc;
+      $acSum += $ac;
+      if ($dc > 0 && $ac > 0) {
+        $effSum += $charging ? $dc / $ac : $ac / $dc;
+        $effN++;
+      }
     }
-    $eff = ($n > 0 && $dcSum > 0 && $acSum > 0)
-      ? ($charging ? $dcSum / $acSum : $acSum / $dcSum) * 100 : null;
+    $eff = ($effN > 0) ? $effSum / $effN * 100 : null;
     $first = $n > 0 ? (int) $rows[0]['t'] : null;
     $last = $n > 0 ? (int) $rows[$n - 1]['t'] : null;
     $battEff[$dir] = [

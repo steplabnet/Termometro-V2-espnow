@@ -131,6 +131,14 @@ BATTERY_ALIASES = {
         "discharge_total", "total_discharging_energy", "total_discharge_energy",
         "discharge_energy", "energy_discharged",
     ),
+    # The battery's own daily / monthly totals and its BMS cycle counter.
+    # Not stored in `batteria` (the local page integrates its own daily kWh):
+    # they are here so they reach the snapshot meteo.py forwards.
+    "charge_today": ("charge_today", "total_daily_charging_energy"),
+    "discharge_today": ("discharge_today", "total_daily_discharging_energy"),
+    "charge_month": ("charge_month", "total_monthly_charging_energy"),
+    "discharge_month": ("discharge_month", "total_monthly_discharging_energy"),
+    "cycle_count": ("cycle_count", "battery_cycle_count", "cycles"),
     # The two MOS sensors, kept apart from `temperature` (the internal
     # reading) so a cooling problem is visible as a divergence between them.
     "temp_mos1": ("temp_mos1", "internal_mos1_temperature", "mos1_temp"),
@@ -154,6 +162,8 @@ BATTERY_NUMERIC = {
     "temp_mos1", "temp_mos2", "cell_voltage_max", "cell_voltage_min",
     "ac_voltage", "ac_frequency",
     "charge_total", "discharge_total",
+    "charge_today", "discharge_today", "charge_month", "discharge_month",
+    "cycle_count",
 }
 
 # canonical field -> latest value seen. Kept across messages so the per-field
