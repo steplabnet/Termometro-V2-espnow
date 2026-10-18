@@ -235,6 +235,10 @@ function batt_eff_push(int $battTs, float $dc, float $ac): bool
         } else {
             $dis[] = $row;
             $dis = array_slice($dis, -BATT_EFF_SAMPLES);
+            // A new discharge reading also updates its power class in the
+            // efficiency curve. Here, inside the !$seen branch, so a reading
+            // repeated by the Pi is counted once there too.
+            batt_eff_curve_update(abs($dc), abs($ac));
         }
         $json = json_encode(['chg' => $chg, 'dis' => $dis], JSON_UNESCAPED_SLASHES);
         if ($json !== false) {
@@ -276,4 +280,79 @@ function batt_eff_samples(): array
         'chg' => is_array($data['chg'] ?? null) ? $data['chg'] : [],
         'dis' => is_array($data['dis'] ?? null) ? $data['dis'] : [],
     ];
+}
+
+/* ---------- Discharge efficiency by power class ----------
+ *
+ * One value per 50 W class of AC power the inverter delivers, 0..900 W (18
+ * classes). Only the current value of each class is kept: a new reading in a
+ * class replaces it with the mean of the stored value and its own efficiency,
+ * (old + new) / 2, so the latest reading weighs half and older ones fade. An
+ * empty class takes the first reading as it is. Above 900 W nothing is kept.
+ *
+ * RAM only, in the same tmpfs as the rest: a reboot starts the table again.
+ */
+const BATT_EFF_CURVE_FILE = INSTANT_RAM_DIR . '/batt_eff_curve.json';
+const BATT_EFF_CURVE_STEP = 50;
+const BATT_EFF_CURVE_MAX = 900;
+
+/** Fold one discharge reading (DC drawn, AC delivered, both W) into its class. */
+function batt_eff_curve_update(float $dc, float $ac): bool
+{
+    if ($dc <= 0 || $ac <= 0 || $ac >= BATT_EFF_CURVE_MAX || !instant_ram_ready()) {
+        return false;
+    }
+    $fh = @fopen(BATT_EFF_CURVE_FILE, 'c+');
+    if ($fh === false) {
+        return false;
+    }
+    if (!flock($fh, LOCK_EX)) {
+        fclose($fh);
+        return false;
+    }
+    $raw = stream_get_contents($fh);
+    $data = ($raw === false || $raw === '') ? [] : json_decode($raw, true);
+    $n = intdiv(BATT_EFF_CURVE_MAX, BATT_EFF_CURVE_STEP);
+    $bins = (is_array($data) && is_array($data['bins'] ?? null) && count($data['bins']) === $n)
+        ? $data['bins'] : array_fill(0, $n, null);
+
+    $i = (int) floor($ac / BATT_EFF_CURVE_STEP);
+    $eff = $ac / $dc * 100;
+    $old = $bins[$i];
+    $bins[$i] = round(is_numeric($old) ? ((float) $old + $eff) / 2 : $eff, 2);
+
+    $json = json_encode(['t' => time(), 'bins' => $bins]);
+    if ($json !== false) {
+        ftruncate($fh, 0);
+        rewind($fh);
+        fwrite($fh, $json);
+        fflush($fh);
+    }
+    flock($fh, LOCK_UN);
+    fclose($fh);
+    return $json !== false;
+}
+
+/** The 18 class values (null where nothing has been read yet), lowest first. */
+function batt_eff_curve(): array
+{
+    $n = intdiv(BATT_EFF_CURVE_MAX, BATT_EFF_CURVE_STEP);
+    $empty = array_fill(0, $n, null);
+    if (!is_readable(BATT_EFF_CURVE_FILE)) {
+        return $empty;
+    }
+    $fh = @fopen(BATT_EFF_CURVE_FILE, 'r');
+    if ($fh === false) {
+        return $empty;
+    }
+    if (!flock($fh, LOCK_SH)) {
+        fclose($fh);
+        return $empty;
+    }
+    $raw = stream_get_contents($fh);
+    flock($fh, LOCK_UN);
+    fclose($fh);
+    $data = ($raw === false || $raw === '') ? null : json_decode($raw, true);
+    return (is_array($data) && is_array($data['bins'] ?? null) && count($data['bins']) === $n)
+        ? $data['bins'] : $empty;
 }

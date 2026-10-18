@@ -2171,6 +2171,34 @@ function meteo_build_payload(mysqli $link): array
       }
     }
     $eff = ($effN > 0) ? $effSum / $effN * 100 : null;
+    // The newest reading on its own, for the small line under the mean.
+    $lastDc = $n > 0 ? (float) ($rows[$n - 1]['dc'] ?? 0) : 0.0;
+    $lastAc = $n > 0 ? (float) ($rows[$n - 1]['ac'] ?? 0) : 0.0;
+    $inst = ($lastDc > 0 && $lastAc > 0)
+      ? ($charging ? $lastDc / $lastAc : $lastAc / $lastDc) * 100 : null;
+    /* The ten instant efficiencies as a small bar strip, oldest on the left.
+     * Fixed 50-100 % scale, so the bars can be compared from one minute to
+     * the next; anything under 50 % sits on the floor. Built here as HTML
+     * because the poller swaps it in whole (data-live-html). */
+    $color = $charging ? 'var(--accent-green)' : 'var(--accent-orange)';
+    $bars = '';
+    foreach ($rows as $i => $r) {
+      $bdc = (float) ($r['dc'] ?? 0);
+      $bac = (float) ($r['ac'] ?? 0);
+      if ($bdc <= 0 || $bac <= 0) {
+        continue;
+      }
+      $e = ($charging ? $bdc / $bac : $bac / $bdc) * 100;
+      $h = max(4, min(100, ($e - 50) * 2));
+      $bars .= '<span class="eff-bar" title="' . date('H:i:s', (int) $r['t']) . ' · '
+        . number_format($e, 1) . ' %" style="height:' . round($h) . '%; background:' . $color
+        . ($i === $n - 1 ? '' : '; opacity:0.55') . ';"></span>';
+    }
+    // The mean as a dashed line across the strip, on the same 50-100 % scale.
+    if ($bars !== '' && $eff !== null) {
+      $bars .= '<span class="eff-avg" title="Media ' . number_format($eff, 1) . ' %" style="bottom:'
+        . round(max(0, min(100, ($eff - 50) * 2))) . '%;"></span>';
+    }
     $first = $n > 0 ? (int) $rows[0]['t'] : null;
     $last = $n > 0 ? (int) $rows[$n - 1]['t'] : null;
     $battEff[$dir] = [
@@ -2180,6 +2208,9 @@ function meteo_build_payload(mysqli $link): array
       'val' => ($eff === null) ? '--' : number_format($eff, 1),
       'detail' => ($n === 0) ? 'nessuna lettura'
         : $n . ' letture · DC ' . fmtW($dcSum / $n) . ' / AC ' . fmtW($acSum / $n),
+      'bars' => $bars,
+      'inst' => ($inst === null) ? '--'
+        : number_format($inst, 1) . ' % (' . date('H:i:s', (int) $rows[$n - 1]['t']) . ')',
       'when' => ($n === 0) ? '--'
         : date('H:i:s', $first) . ' – ' . date('H:i:s', $last),
     ];
@@ -2195,6 +2226,36 @@ function meteo_build_payload(mysqli $link): array
   }
   $battEff = $battEff[$effDir];
   unset($battEff['last']);
+
+  /* Rendimento in scarica per classe di potenza (trend_store.php): one bar
+   * per 50 W of AC delivered, 0..900 W, scale 0-100 %. The class the pack is in
+   * right now is drawn full, the others faded. HTML built here because the
+   * poller swaps it in whole (data-live-html). */
+  $curve = batt_eff_curve();
+  $curveNow = ($battDischarging && $d('battAcW') !== null)
+    ? (int) floor(abs($d('battAcW')) / BATT_EFF_CURVE_STEP) : -1;
+  $curveBars = '';
+  $curveN = 0;
+  foreach ($curve as $i => $v) {
+    $lo = $i * BATT_EFF_CURVE_STEP;
+    $range = $lo . '-' . ($lo + BATT_EFF_CURVE_STEP) . ' W';
+    if (!is_numeric($v)) {
+      $curveBars .= '<div class="curve-col" title="' . $range . ' · nessuna misura">'
+        . '<span class="curve-val"></span><span class="curve-bar empty"></span></div>';
+      continue;
+    }
+    $curveN++;
+    $h = max(2, min(100, (float) $v));
+    $curveBars .= '<div class="curve-col" title="' . $range . ' · ' . number_format((float) $v, 1) . ' %">'
+      . '<span class="curve-val">' . round((float) $v) . '</span>'
+      . '<span class="curve-bar" style="height:' . round($h) . '%;'
+      . ($i === $curveNow ? '' : ' opacity:0.55;') . '"></span></div>';
+  }
+  $battCurve = [
+    'bars' => $curveBars,
+    'note' => ($curveN === 0) ? 'nessuna misura ancora'
+      : $curveN . ($curveN === 1 ? ' classe' : ' classi') . ' su ' . count($curve) . ' con misure',
+  ];
 
   /* Casa + batteria: what the house and the pack are drawing together.
    *
@@ -2467,6 +2528,8 @@ function meteo_build_payload(mysqli $link): array
     'battRaw' => $battRaw,
 
     'battEff' => $battEff,
+
+    'battCurve' => $battCurve,
 
     'battDiag' => [
       'show' => ($battDiag !== []),

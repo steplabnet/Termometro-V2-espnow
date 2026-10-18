@@ -655,6 +655,93 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
       font-weight: 700;
     }
 
+    /* Card Rendimento: le ultime 10 misure come barrette. */
+    .eff-bars {
+      display: flex;
+      align-items: flex-end;
+      gap: 3px;
+      height: 34px;
+      width: 100%;
+      max-width: 180px;
+      margin: 8px auto 0;
+      border-bottom: 1px solid var(--text-muted);
+      position: relative;
+    }
+
+    /* Rendimento per classe di potenza: 18 colonne, scala 0-100 %. */
+    .curve-chart {
+      display: flex;
+      align-items: flex-end;
+      gap: 3px;
+      height: 140px;
+      width: 100%;
+      margin-top: 10px;
+      border-bottom: 1px solid var(--text-muted);
+    }
+
+    .curve-col {
+      flex: 1;
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+      align-items: center;
+    }
+
+    .curve-val {
+      font-size: 0.6rem;
+      color: var(--text-muted);
+      line-height: 1.2;
+    }
+
+    .curve-bar {
+      width: 100%;
+      background: var(--accent-orange);
+      border-radius: 2px 2px 0 0;
+    }
+
+    .curve-bar.empty {
+      height: 2px;
+      background: var(--text-muted);
+      opacity: 0.3;
+    }
+
+    .curve-axis {
+      position: relative;
+      width: 100%;
+      height: 14px;
+      font-size: 0.6rem;
+      color: var(--text-muted);
+    }
+
+    .curve-axis span {
+      position: absolute;
+      transform: translateX(-50%);
+    }
+
+    .curve-axis span:first-child {
+      transform: none;
+    }
+
+    .curve-axis span:last-child {
+      transform: translateX(-100%);
+    }
+
+    /* La media delle 10 misure, tratteggiata sopra le barre. */
+    .eff-avg {
+      position: absolute;
+      left: 0;
+      right: 0;
+      border-top: 1.5px dashed var(--text-main);
+      pointer-events: none;
+    }
+
+    .eff-bar {
+      flex: 1;
+      border-radius: 2px 2px 0 0;
+      min-height: 2px;
+    }
+
     .flow-state {
       font-weight: 800;
       font-size: 0.78rem;
@@ -1449,11 +1536,38 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
             data-live-color="battEff.color">
             <?php echo $eff['detail']; ?>
           </div>
+          <!-- Le ultime 10 misure istantanee, la piu' vecchia a sinistra; scala
+               fissa 50-100 %. Passa il dito su una barra per ora e valore. -->
+          <div class="eff-bars" data-live-html="battEff.bars"><?php echo $eff['bars'] ?? ''; ?></div>
           <div class="minmax-row">
+            <div class="minmax-item"><span class="minmax-label">Ultima misura</span><span class="minmax-val"
+                data-live="battEff.inst"><?php echo $eff['inst'] ?? '--'; ?></span></div>
             <div class="minmax-item"><span class="minmax-label">Letture</span><span class="minmax-val"
                 data-live="battEff.when"><?php echo $eff['when']; ?></span></div>
           </div>
         </a>
+      </div>
+    <?php endif; ?>
+
+    <?php if (!empty($p['battAvailable']) && !empty($p['battCurve'])): ?>
+      <!-- 13 quater. Rendimento in scarica in funzione della potenza prelevata
+           lato AC: una barra per classe di 50 W, da 0 a 900 W. Ogni classe
+           tiene solo il suo valore attuale, aggiornato a ogni misura come
+           media fra il valore memorizzato e l'ultimo (tabella in /dev/shm,
+           vedi trend_store.php). Piena la classe in cui si trova ora. -->
+      <div class="card border-casabatt card-wide" data-card="battCurve"
+        style="display:flex; flex-direction:column; align-items:center;">
+        <div class="card-label">Rendimento scarica per potenza prelevata</div>
+        <div class="curve-chart" data-live-html="battCurve.bars"><?php echo $p['battCurve']['bars']; ?></div>
+        <div class="curve-axis">
+          <?php for ($w = 0; $w <= 900; $w += 150): ?>
+            <span style="left:<?php echo round($w / 900 * 100, 2); ?>%;"><?php echo $w; ?></span>
+          <?php endfor; ?>
+        </div>
+        <div style="font-size:0.7rem; color:var(--text-muted); margin-top:6px;">
+          W erogati in AC · rendimento AC / DC in % ·
+          <span data-live="battCurve.note"><?php echo $p['battCurve']['note']; ?></span>
+        </div>
       </div>
     <?php endif; ?>
 
