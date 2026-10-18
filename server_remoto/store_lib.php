@@ -21,6 +21,13 @@ require_once __DIR__ . '/trend_store.php'; // RAM-only 30 min window for trends
 
 /** dati_meteo keeps one row per this many seconds. */
 const METEO_HISTORY_INTERVAL = 600;
+/**
+ * Longest gap between two pvPower readings that is still integrated into the
+ * hourly energy (seconds). MQTT delivers several readings a minute; a longer
+ * hole means the meter or the bridge was down, and bridging it with a straight
+ * line would invent energy.
+ */
+const PV_HOURLY_MAX_GAP = 300;
 /** The Piave flow is read from ARPA Veneto at most this often. */
 const PORTATA_TTL = 600;
 /**
@@ -198,6 +205,76 @@ function store_write_minmax(mysqli $link, int $now): void
  *
  * Returns ['history' => bool, 'rev' => int|null, 'portata' => string].
  */
+/**
+ * Fold one live pvPower reading into `energia_oraria` (Wh per hour).
+ *
+ * Integrated from every MQTT reading, not from the 10-minute history rows:
+ * trapezoids between consecutive readings, split at the hour boundaries so an
+ * interval straddling :00 is shared between the two bars it belongs to. The
+ * previous reading lives in tmpfs; losing it (reboot) costs one interval.
+ *
+ * The read-compute-write is done under an exclusive lock: the bridge can retry
+ * while a slow ingest is still running, and two overlapping calls would
+ * otherwise count the same interval twice.
+ */
+function pv_hourly_accumulate(mysqli $link, ?float $pv, int $now): void
+{
+  if ($pv === null) {
+    return;   // no meter reading in this message: keep the previous sample
+  }
+  $pv = max(0.0, $pv);
+  $fh = @fopen(store_cache_path('pv_hourly_prev.json'), 'c+');
+  if ($fh === false) {
+    return;
+  }
+  try {
+    if (!flock($fh, LOCK_EX)) {
+      return;
+    }
+    $prev = json_decode((string) stream_get_contents($fh), true);
+    $t0 = is_array($prev) ? (int) ($prev['ts'] ?? 0) : 0;
+    $p0 = is_array($prev) ? (float) ($prev['pv'] ?? 0) : 0.0;
+
+    $wh = [];   // hour start ts => Wh
+    if ($t0 > 0 && $now > $t0 && $now - $t0 <= PV_HOURLY_MAX_GAP) {
+      $slope = ($pv - $p0) / ($now - $t0);
+      for ($a = $t0; $a < $now; $a = $b) {
+        $hour = $a - ($a % 3600);
+        $b = min($now, $hour + 3600);
+        $pa = $p0 + $slope * ($a - $t0);
+        $pb = $p0 + $slope * ($b - $t0);
+        $wh[$hour] = ($wh[$hour] ?? 0.0) + ($pa + $pb) / 2.0 * ($b - $a) / 3600.0;
+      }
+    }
+    if ($now >= $t0) {
+      ftruncate($fh, 0);
+      rewind($fh);
+      fwrite($fh, json_encode(['ts' => $now, 'pv' => $pv]));
+      fflush($fh);
+    }
+
+    foreach ($wh as $hour => $e) {
+      $sql = "INSERT INTO energia_oraria (ora, pv_wh) VALUES ({$hour}, " . sprintf('%.4F', $e) . ")
+              ON DUPLICATE KEY UPDATE pv_wh = pv_wh + VALUES(pv_wh)";
+      try {
+        $link->query($sql);
+      } catch (Throwable $e2) {
+        // First run: the table does not exist yet. Create it and retry once.
+        $link->query("CREATE TABLE IF NOT EXISTS energia_oraria (
+            ora   INT UNSIGNED NOT NULL PRIMARY KEY,  -- unix ts of the hour start
+            pv_wh DOUBLE NOT NULL DEFAULT 0
+          )");
+        $link->query($sql);
+      }
+    }
+  } catch (Throwable $e) {
+    error_log('pv hourly energy failed: ' . $e->getMessage());
+  } finally {
+    flock($fh, LOCK_UN);
+    fclose($fh);
+  }
+}
+
 function meteo_store_reading(mysqli $link, array $r): array
 {
   $now = time();
@@ -267,6 +344,9 @@ function meteo_store_reading(mysqli $link, array $r): array
     'battSoc' => $battSoc,
     'battTemp' => $battTemp,
   ]), $now);
+
+  // Hourly PV energy, integrated from every reading (see pv_hourly_accumulate).
+  pv_hourly_accumulate($link, $pvPower, $now);
 
   $get = static fn(string $k) => (isset($r[$k]) && $r[$k] !== '') ? $r[$k] : null;
 

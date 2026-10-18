@@ -958,6 +958,36 @@ function energyToday(mysqli $link, int $since, int $now, array $live): array
   return $out;
 }
 
+/* Produzione FV ora per ora, oggi e ieri, in Wh: le righe di `energia_oraria`
+ * che pv_hourly_accumulate() (store_lib.php) integra da ogni lettura MQTT.
+ * Indice = ora locale 0..23; nel giorno del cambio d'ora l'ora doppia si somma.
+ * null se la tabella non c'e' ancora.
+ */
+function pvHourly(mysqli $link, int $now): ?array
+{
+  $today0 = mktime(0, 0, 0, (int) date('n', $now), (int) date('j', $now), (int) date('Y', $now));
+  $yest0 = mktime(0, 0, 0, (int) date('n', $now), (int) date('j', $now) - 1, (int) date('Y', $now));
+  $out = ['today' => array_fill(0, 24, 0.0), 'yest' => array_fill(0, 24, 0.0)];
+  try {
+    $res = $link->query("SELECT ora, pv_wh FROM energia_oraria WHERE ora >= {$yest0} AND ora <= {$now}");
+  } catch (Throwable $e) {
+    return null;
+  }
+  if (!$res instanceof mysqli_result) {
+    return null;
+  }
+  while ($r = $res->fetch_assoc()) {
+    $ts = (int) $r['ora'];
+    $day = ($ts >= $today0) ? 'today' : 'yest';
+    $out[$day][(int) date('G', $ts)] += (float) $r['pv_wh'];
+  }
+  foreach (['today', 'yest'] as $d) {
+    $out[$d] = array_map(static fn($v) => round($v, 1), $out[$d]);
+  }
+  $out['hour'] = (int) date('G', $now);
+  return $out;
+}
+
 function meteo_build_payload(mysqli $link): array
 {
   $now = time();
@@ -2339,6 +2369,10 @@ function meteo_build_payload(mysqli $link): array
       'cycles' => $battCycles,
       'yield' => $battYield,
     ],
+
+    // Produzione FV per ora (Wh), oggi e ieri: il grafico a barre la disegna
+    // lato browser, quindi resta un array e non passa da data-live.
+    'pvOraria' => $emAvailable ? pvHourly($link, $now) : null,
 
     'battRaw' => $battRaw,
 

@@ -485,6 +485,42 @@ function showStyle($cond): string
       color: var(--accent-yellow);
     }
 
+    /* Produzione FV oraria: card a tutta larghezza, barre disegnate in JS. */
+    .card-wide {
+      grid-column: 1 / -1;
+      min-height: 0;
+    }
+
+    .hourly-chart {
+      width: 100%;
+      height: 220px;
+      display: block;
+    }
+
+    .hourly-chart text {
+      font-size: 11px;
+      fill: var(--text-muted);
+    }
+
+    .hourly-legend {
+      display: flex;
+      gap: 16px;
+      flex-wrap: wrap;
+      justify-content: center;
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      margin-top: 6px;
+    }
+
+    .hourly-legend i {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+      margin-right: 5px;
+      vertical-align: -1px;
+    }
+
     .diag-group .src {
       text-transform: none;
       letter-spacing: 0;
@@ -1434,6 +1470,19 @@ function showStyle($cond): string
       </div>
     <?php endif; ?>
 
+    <?php if (!empty($p['pvOraria'])): ?>
+      <!-- 13a-bis. Produzione FV ora per ora: Wh integrati da ogni lettura
+           MQTT (energia_oraria), oggi in giallo e ieri in grigio dietro. -->
+      <div class="card border-energy card-wide" data-card="pvOraria">
+        <div class="card-label">Produzione FV per ora</div>
+        <svg class="hourly-chart" id="pv-hourly" role="img" aria-label="Produzione fotovoltaica per ora"></svg>
+        <div class="hourly-legend">
+          <span><i style="background:var(--accent-yellow)"></i>Oggi <b id="pv-hourly-today"></b></span>
+          <span><i style="background:#d1d5db"></i>Ieri <b id="pv-hourly-yest"></b></span>
+        </div>
+      </div>
+    <?php endif; ?>
+
     <?php if (!empty($p['stats']['show'])): ?>
       <!-- 13b. Statistiche del pacco: quante volte la batteria e' scesa fino
            alla riserva del 12% e si e' fermata li' (si conta un giorno per
@@ -1587,8 +1636,80 @@ function showStyle($cond): string
         if (updatedEl) updatedEl.classList.add('stale');
       }
 
+      /**
+       * Bar chart of the hourly PV energy: today in yellow, yesterday as a
+       * wider grey bar behind it, the hour in progress lighter (still filling).
+       */
+      var SVGNS = 'http://www.w3.org/2000/svg';
+      function fmtWh(wh) {
+        return wh >= 1000 ? (wh / 1000).toFixed(2) + ' kWh' : Math.round(wh) + ' Wh';
+      }
+      function renderHourly(d) {
+        var svg = document.getElementById('pv-hourly');
+        if (!svg || !d) return;
+        var W = svg.clientWidth || 600, H = 220;
+        var L = 44, R = 8, T = 10, B = 24;
+        var pw = W - L - R, ph = H - T - B, slot = pw / 24;
+        var max = Math.max.apply(null, d.today.concat(d.yest, [100]));
+        // A round axis top: 1, 2 or 5 times a power of ten.
+        var mag = Math.pow(10, Math.floor(Math.log10(max)));
+        var top = [1, 2, 5, 10].map(function (k) { return k * mag; }).filter(function (v) { return v >= max; })[0];
+        var y = function (v) { return T + ph - v / top * ph; };
+
+        function el(name, attrs, text) {
+          var e = document.createElementNS(SVGNS, name);
+          for (var k in attrs) e.setAttribute(k, attrs[k]);
+          if (text != null) e.textContent = text;
+          svg.appendChild(e);
+          return e;
+        }
+
+        svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+        while (svg.firstChild) svg.removeChild(svg.firstChild);
+        for (var g = 0; g <= 4; g++) {
+          var v = top * g / 4, gy = y(v);
+          el('line', { x1: L, x2: W - R, y1: gy, y2: gy, stroke: '#e5e7eb', 'stroke-width': 1 });
+          el('text', { x: L - 6, y: gy + 4, 'text-anchor': 'end' },
+            top >= 1000 ? (v / 1000).toFixed(top >= 4000 ? 0 : 1) + ' kWh' : Math.round(v) + ' Wh');
+        }
+        for (var h = 0; h < 24; h++) {
+          var x = L + h * slot;
+          if (d.yest[h] > 0) {
+            el('rect', { x: x + slot * 0.08, y: y(d.yest[h]), width: slot * 0.84,
+              height: T + ph - y(d.yest[h]), fill: '#d1d5db', rx: 2 });
+          }
+          if (d.today[h] > 0 && h <= d.hour) {
+            el('rect', { x: x + slot * 0.22, y: y(d.today[h]), width: slot * 0.56,
+              height: T + ph - y(d.today[h]), fill: '#eab308', rx: 2,
+              opacity: h === d.hour ? 0.55 : 1 });
+          }
+          if (h % 3 === 0) {
+            el('text', { x: x + slot / 2, y: H - 6, 'text-anchor': 'middle' }, (h < 10 ? '0' : '') + h);
+          }
+          // Full-height hover target carrying both values.
+          var hit = el('rect', { x: x, y: T, width: slot, height: ph, fill: 'transparent' });
+          var t = document.createElementNS(SVGNS, 'title');
+          t.textContent = (h < 10 ? '0' : '') + h + ':00–' + (h < 9 ? '0' : '') + (h + 1) + ':00\n' +
+            'Oggi: ' + (h <= d.hour ? fmtWh(d.today[h]) + (h === d.hour ? ' (in corso)' : '') : '—') +
+            '\nIeri: ' + fmtWh(d.yest[h]);
+          hit.appendChild(t);
+        }
+        var sum = function (a) { return a.reduce(function (s, v) { return s + v; }, 0); };
+        var tEl = document.getElementById('pv-hourly-today');
+        var yEl = document.getElementById('pv-hourly-yest');
+        if (tEl) tEl.textContent = fmtWh(sum(d.today));
+        if (yEl) yEl.textContent = fmtWh(sum(d.yest));
+      }
+      var hourlyData = <?php echo json_encode($p['pvOraria'] ?? null); ?>;
+      renderHourly(hourlyData);
+      window.addEventListener('resize', function () { renderHourly(hourlyData); });
+
       function apply(p) {
         var f = flatten(p, '', {});
+        if (p.pvOraria) {
+          hourlyData = p.pvOraria;
+          renderHourly(hourlyData);
+        }
 
         document.querySelectorAll('[data-live]').forEach(function (el) {
           var k = el.getAttribute('data-live');
