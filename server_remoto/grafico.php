@@ -122,6 +122,7 @@ $BATT_DIAG_VARS = [
   'battTempSpread' => ['Δ Temperatura Celle', '°C'],
   'battCellVSpread'=> ['Δ Tensione Celle',    'mV'],
   'battAcCurr'     => ['Corrente Rete',       'A'],
+  'battAcDcRatio'  => ['Rendimento Inverter', '%'],
 ];
 if (isset($BATT_DIAG_VARS[$variable])) {
   [$titolo, $unit] = $BATT_DIAG_VARS[$variable];
@@ -253,6 +254,20 @@ function batt_derived(string $variable, array $row)
     $min = $n('battCellVMin');
     return ($max === null || $min === null) ? null : round(($max - $min) * 1000, 1);
   }
+  // Inverter efficiency, as on the card: what comes out over what goes in.
+  // Discharging that is AC / DC, charging DC / AC (battPower > 0), so both
+  // directions read below 100%. Blank inside the idle deadband, where both
+  // powers are noise.
+  if ($variable === 'battAcDcRatio') {
+    $dc = $n('battPower');
+    $ac = $n('battAcW');
+    if ($dc === null || $ac === null || abs($dc) <= 15 || abs($ac) <= 15) {
+      return null;
+    }
+    return ($dc > 0)
+      ? round(abs($dc) / abs($ac) * 100, 1)
+      : round(abs($ac) / abs($dc) * 100, 1);
+  }
   // battAcCurr
   $w = $n('battAcW');
   $v = $n('battAcV');
@@ -262,7 +277,7 @@ function batt_derived(string $variable, array $row)
 /** Variables computed from other columns rather than read from one. */
 const CALC_VARS = [
   'casa', 'prelievo', 'casaBatt',
-  'battTempSpread', 'battCellVSpread', 'battAcCurr',
+  'battTempSpread', 'battCellVSpread', 'battAcCurr', 'battAcDcRatio',
 ];
 
 /** The derived ('calc') series, by variable name. */
@@ -429,8 +444,25 @@ $result = $link->query($queryMain);
 $dataSeries1 = [];
 $rawDate1 = [];
 $labels = [];
+// Efficiency is drawn as two lines, charging and discharging, split on the sign
+// of battPower (> 0 charging). Every row is kept, idle ones as null, so the
+// X axis stays true to time and a pause shows as a gap rather than being
+// squeezed out.
+$isAcDcSplit = ($variable === 'battAcDcRatio');
+$acDcChg = [];
+$acDcDis = [];
 
 while ($row = $result->fetch_array(MYSQLI_ASSOC)) {
+  if ($isAcDcSplit) {
+    $val = calc_power($variable, $row);
+    $bp = is_numeric($row['battPower'] ?? null) ? (float) $row['battPower'] : 0.0;
+    $acDcChg[] = ($val !== null && $bp > 0) ? $val : null;
+    $acDcDis[] = ($val !== null && $bp < 0) ? $val : null;
+    $dataSeries1[] = $val;
+    $labels[] = date("H:i", $row['data']);
+    $rawDate1[] = $row['data'];
+    continue;
+  }
   if ($variable == 'press') {
     $val = round(press_qff($row['press'], $row['chip']), 1);
   } elseif (in_array($variable, CALC_VARS, true)) {
@@ -523,6 +555,8 @@ if ($isMulti) {
   $jsonData2  = json_encode(array_reverse($alignedSeries2));
   $jsonMulti  = '[]';
 }
+$jsonAcDcChg = json_encode(array_reverse($acDcChg ?? []));
+$jsonAcDcDis = json_encode(array_reverse($acDcDis ?? []));
 
 ?>
 
@@ -917,6 +951,47 @@ if ($isMulti) {
         spanGaps: true,
         yAxisID: s.axis
       }));
+    } else if (<?php echo !empty($isAcDcSplit) ? 'true' : 'false'; ?>) {
+      // Efficiency: one line per direction, gaps while idle, and the 100%
+      // line as the ceiling -- a point above it is a meter or sign error.
+      const line = (label, data, color) => ({
+        label, data, borderColor: color, backgroundColor: color,
+        borderWidth: 2, pointRadius: 1.5, pointHoverRadius: 5,
+        tension: 0.3, spanGaps: false
+      });
+      // Average of each direction as a flat dashed line in its colour, the
+      // value in the legend. Plain mean of the 10-minute samples.
+      const avgLine = (label, data, color) => {
+        const v = data.filter(x => x !== null);
+        if (!v.length) return null;
+        const avg = Math.round(v.reduce((a, b) => a + b, 0) / v.length * 10) / 10;
+        return {
+          label: label + ' ' + avg + ' %', data: LABELS.map(() => avg),
+          borderColor: color, borderWidth: 1.5, borderDash: [8, 4],
+          pointRadius: 0, pointHoverRadius: 0
+        };
+      };
+      const chg = <?php echo $jsonAcDcChg; ?>;
+      const dis = <?php echo $jsonAcDcDis; ?>;
+      datasets = [
+        line('In carica', chg, '#22c55e'),
+        line('In scarica', dis, '#f97316'),
+        avgLine('Media carica', chg, '#22c55e'),
+        avgLine('Media scarica', dis, '#f97316'),
+        {
+          label: '100%', data: LABELS.map(() => 100),
+          borderColor: 'rgba(255, 255, 255, 0.4)', borderWidth: 1,
+          borderDash: [5, 5], pointRadius: 0, pointHoverRadius: 0
+        }
+      ].filter(Boolean);
+      scales = {
+        x: xScale,
+        y: {
+          grid: { color: '#373b3e', drawBorder: false },
+          ticks: { color: '#adb5bd', callback: v => v + ' %' },
+          beginAtZero: false
+        }
+      };
     } else {
       datasets = [
         {

@@ -385,6 +385,12 @@ function meteo_store_reading(mysqli $link, array $r): array
     'battTemp' => $battTemp,
   ]), $now);
 
+  // Every distinct battery reading, for the two efficiency cards (see
+  // batt_eff_push in trend_store.php). Silent on failure, like trend_push.
+  if ($battTs !== null && $battPower !== null && isset($battLive['battAcW'])) {
+    batt_eff_push($battTs, $battPower, $battLive['battAcW']);
+  }
+
   // Hourly PV, house and battery energy, integrated from every reading (see
   // energy_hourly_accumulate). battPower is already null when undated.
   energy_hourly_accumulate($link, $pvPower, $gridPower, $battPower, $now);

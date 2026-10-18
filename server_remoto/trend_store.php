@@ -174,3 +174,106 @@ function trend_series(string $field, ?int $seconds = null): array
     }
     return $out;
 }
+
+/* ---------- Inverter efficiency: the last battery readings, per direction ----------
+ *
+ * The efficiency cards average the last BATT_EFF_SAMPLES readings the battery
+ * itself produced, not the 10-minute history rows and not the 20-second
+ * buckets of the trend window above. The Pi forwards the same battery reading
+ * in several messages, so a reading is identified by battTs (when the BATTERY
+ * was read) and taken once.
+ *
+ * Charging and discharging keep separate lists, so each card still has its
+ * last ten when the pack has switched direction. Idle readings (either power
+ * inside the deadband) are not kept: their ratio is noise.
+ *
+ * RAM only, like the trend window: losing it costs ten readings.
+ */
+const BATT_EFF_RAM_FILE = INSTANT_RAM_DIR . '/batt_eff.json';
+const BATT_EFF_SAMPLES = 10;
+const BATT_EFF_IDLE_W = 15.0;
+
+/** Store one battery reading. $dc is battPower (house sign, > 0 charging). */
+function batt_eff_push(int $battTs, float $dc, float $ac): bool
+{
+    if (!instant_ram_ready()) {
+        return false;
+    }
+    if (abs($dc) <= BATT_EFF_IDLE_W || abs($ac) <= BATT_EFF_IDLE_W) {
+        return false;
+    }
+    $fh = @fopen(BATT_EFF_RAM_FILE, 'c+');
+    if ($fh === false) {
+        return false;
+    }
+    if (!flock($fh, LOCK_EX)) {
+        fclose($fh);
+        return false;
+    }
+    $raw = stream_get_contents($fh);
+    $data = ($raw === false || $raw === '') ? [] : json_decode($raw, true);
+    if (!is_array($data)) {
+        $data = [];
+    }
+    $chg = is_array($data['chg'] ?? null) ? $data['chg'] : [];
+    $dis = is_array($data['dis'] ?? null) ? $data['dis'] : [];
+
+    // Already have this reading (same battTs in either list): nothing to do.
+    $seen = false;
+    foreach ([$chg, $dis] as $list) {
+        $lastRow = $list === [] ? null : $list[count($list) - 1];
+        if (is_array($lastRow) && (int) ($lastRow['t'] ?? 0) === $battTs) {
+            $seen = true;
+        }
+    }
+    $ok = true;
+    if (!$seen) {
+        $row = ['t' => $battTs, 'dc' => abs($dc), 'ac' => abs($ac)];
+        if ($dc > 0) {
+            $chg[] = $row;
+            $chg = array_slice($chg, -BATT_EFF_SAMPLES);
+        } else {
+            $dis[] = $row;
+            $dis = array_slice($dis, -BATT_EFF_SAMPLES);
+        }
+        $json = json_encode(['chg' => $chg, 'dis' => $dis], JSON_UNESCAPED_SLASHES);
+        if ($json !== false) {
+            ftruncate($fh, 0);
+            rewind($fh);
+            fwrite($fh, $json);
+            fflush($fh);
+        }
+        $ok = ($json !== false);
+    }
+    flock($fh, LOCK_UN);
+    fclose($fh);
+    return $ok;
+}
+
+/** ['chg' => [...], 'dis' => [...]], each oldest first; empty lists when unknown. */
+function batt_eff_samples(): array
+{
+    $empty = ['chg' => [], 'dis' => []];
+    if (!is_readable(BATT_EFF_RAM_FILE)) {
+        return $empty;
+    }
+    $fh = @fopen(BATT_EFF_RAM_FILE, 'r');
+    if ($fh === false) {
+        return $empty;
+    }
+    if (!flock($fh, LOCK_SH)) {
+        fclose($fh);
+        return $empty;
+    }
+    $raw = stream_get_contents($fh);
+    flock($fh, LOCK_UN);
+    fclose($fh);
+    $data = ($raw === false || $raw === '') ? null : json_decode($raw, true);
+    if (!is_array($data)) {
+        return $empty;
+    }
+    return [
+        'chg' => is_array($data['chg'] ?? null) ? $data['chg'] : [],
+        'dis' => is_array($data['dis'] ?? null) ? $data['dis'] : [],
+    ];
+}

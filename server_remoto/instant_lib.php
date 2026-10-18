@@ -2130,6 +2130,64 @@ function meteo_build_payload(mysqli $link): array
   $acCurrent = ($d('battAcW') !== null && $d('battAcV') !== null && $d('battAcV') > 50)
     ? abs($d('battAcW')) / $d('battAcV') : null;
 
+  /* Inverter efficiency, from the pack's own power (30001, battPower) and the
+   * inverter's AC power (30006, battAcW), both as magnitudes: what comes out
+   * over what goes in. Discharging that is AC / DC, charging DC / AC, so both
+   * directions read below 100%. Inside the idle deadband both are a few watts
+   * of noise and the ratio means nothing, so it shows dashes there. */
+  $acDcRatio = null;
+  $acDcDir = '';
+  if ($safeBattPower0 !== null && $d('battAcW') !== null
+      && abs($safeBattPower0) > BATT_IDLE_W && abs($d('battAcW')) > BATT_IDLE_W) {
+    $acDcRatio = ($safeBattPower0 > 0)
+      ? abs($safeBattPower0) / abs($d('battAcW')) * 100
+      : abs($d('battAcW')) / abs($safeBattPower0) * 100;
+    $acDcDir = ($safeBattPower0 > 0) ? ' (carica)' : ' (scarica)';
+  }
+
+  /* Rendimento carica / scarica: the same efficiency, from the last
+   * BATT_EFF_SAMPLES battery readings of each direction (trend_store.php)
+   * rather than one. Ratio of the mean powers, not mean of the ratios, so a
+   * 50 W reading does not weigh as much as a 2 kW one. Charging is DC out of
+   * AC in, discharging AC out of DC in. */
+  $effSamples = batt_eff_samples();
+  $battEff = [];
+  foreach (['chg' => true, 'dis' => false] as $dir => $charging) {
+    $rows = $effSamples[$dir];
+    $n = count($rows);
+    $dcSum = 0.0;
+    $acSum = 0.0;
+    foreach ($rows as $r) {
+      $dcSum += (float) ($r['dc'] ?? 0);
+      $acSum += (float) ($r['ac'] ?? 0);
+    }
+    $eff = ($n > 0 && $dcSum > 0 && $acSum > 0)
+      ? ($charging ? $dcSum / $acSum : $acSum / $dcSum) * 100 : null;
+    $first = $n > 0 ? (int) $rows[0]['t'] : null;
+    $last = $n > 0 ? (int) $rows[$n - 1]['t'] : null;
+    $battEff[$dir] = [
+      'last' => $last,
+      'label' => $charging ? 'Rendimento carica' : 'Rendimento scarica',
+      'color' => $charging ? 'var(--accent-green)' : 'var(--accent-orange)',
+      'val' => ($eff === null) ? '--' : number_format($eff, 1),
+      'detail' => ($n === 0) ? 'nessuna lettura'
+        : $n . ' letture · DC ' . fmtW($dcSum / $n) . ' / AC ' . fmtW($acSum / $n),
+      'when' => ($n === 0) ? '--'
+        : date('H:i:s', $first) . ' – ' . date('H:i:s', $last),
+    ];
+  }
+  /* One card, following the pack: the direction it is moving in now, and
+   * while idle the one it moved in last, so the card keeps a figure. */
+  if ($battCharging) {
+    $effDir = 'chg';
+  } elseif ($battDischarging) {
+    $effDir = 'dis';
+  } else {
+    $effDir = (($battEff['chg']['last'] ?? 0) > ($battEff['dis']['last'] ?? 0)) ? 'chg' : 'dis';
+  }
+  $battEff = $battEff[$effDir];
+  unset($battEff['last']);
+
   /* Casa + batteria: what the house and the pack are drawing together.
    *
    * Only a CHARGING battery is added. A discharging one is not consumption --
@@ -2400,6 +2458,8 @@ function meteo_build_payload(mysqli $link): array
 
     'battRaw' => $battRaw,
 
+    'battEff' => $battEff,
+
     'battDiag' => [
       'show' => ($battDiag !== []),
       'tCellMax' => $fmtNum($safeBattTemp0, 1, '°C'),
@@ -2421,6 +2481,9 @@ function meteo_build_payload(mysqli $link): array
       'hz' => $fmtNum($d('battAcHz'), 2, 'Hz'),
       'iPack' => $fmtNum($d('battCurr'), 1, 'A'),
       'iAc' => $fmtNum($acCurrent, 1, 'A'),
+      'pDc' => $fmtNum($safeBattPower0, 0, 'W'),
+      'pAc' => $fmtNum($d('battAcW'), 0, 'W'),
+      'acDc' => $fmtNum($acDcRatio, 1, '%') . $acDcDir,
     ],
 
     // Autonomia in scarica (ora in cui si arriva a BATT_AUTONOMY_SOC), fine

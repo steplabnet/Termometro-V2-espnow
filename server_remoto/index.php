@@ -1419,6 +1419,41 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
             <span class="k">Pacco</span><span class="v"><a href="grafico.php?var=battCurr" data-live="battDiag.iPack"><?php echo $p['battDiag']['iPack']; ?></a></span>
             <span class="k">Rete AC (da W/V)</span><span class="v"><a href="grafico.php?var=battAcCurr" data-live="battDiag.iAc"><?php echo $p['battDiag']['iAc']; ?></a></span>
         </div>
+
+        <div class="diag-group">Potenze</div>
+        <div class="diag-rows">
+            <span class="k">Pacco DC</span><span class="v"><a href="grafico.php?var=battPower" data-live="battDiag.pDc"><?php echo $p['battDiag']['pDc']; ?></a></span>
+            <span class="k">Rete AC</span><span class="v"><a href="grafico.php?var=battAcW" data-live="battDiag.pAc"><?php echo $p['battDiag']['pAc']; ?></a></span>
+            <span class="k">Rendimento</span><span class="v"><a href="grafico.php?var=battAcDcRatio" data-live="battDiag.acDc"><?php echo $p['battDiag']['acDc']; ?></a></span>
+        </div>
+      </div>
+    <?php endif; ?>
+
+    <?php if (!empty($p['battAvailable']) && !empty($p['battEff'])): ?>
+      <!-- 13 ter. Rendimento dell'inverter dalle ultime 10 letture istantanee
+           della batteria (non dalle righe ogni 10 minuti), nella direzione in
+           cui il pacco si muove ora; a riposo, l'ultima usata. Rapporto fra le
+           potenze medie: in carica DC / AC, in scarica AC / DC. -->
+      <?php $eff = $p['battEff']; ?>
+      <div class="card border-casabatt" data-card="battEff">
+        <a href="grafico.php?var=battAcDcRatio">
+          <svg xmlns="http://www.w3.org/2000/svg" class="card-icon" viewBox="0 0 24 24" style="color:<?php echo $eff['color']; ?>;"
+            data-live-color="battEff.color"
+            fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M13 2 4 14h7l-1 8 9-12h-7l1-8z" />
+          </svg>
+          <div class="card-label" data-live="battEff.label"><?php echo $eff['label']; ?></div>
+          <div class="card-value"><span data-live="battEff.val"><?php echo $eff['val']; ?></span><span
+              class="card-unit">%</span></div>
+          <div class="flow-state" style="color:<?php echo $eff['color']; ?>;" data-live="battEff.detail"
+            data-live-color="battEff.color">
+            <?php echo $eff['detail']; ?>
+          </div>
+          <div class="minmax-row">
+            <div class="minmax-item"><span class="minmax-label">Letture</span><span class="minmax-val"
+                data-live="battEff.when"><?php echo $eff['when']; ?></span></div>
+          </div>
+        </a>
       </div>
     <?php endif; ?>
 
