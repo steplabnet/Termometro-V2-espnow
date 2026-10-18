@@ -958,20 +958,35 @@ function energyToday(mysqli $link, int $since, int $now, array $live): array
   return $out;
 }
 
-/* Produzione FV ora per ora, oggi e ieri, in Wh: le righe di `energia_oraria`
- * che pv_hourly_accumulate() (store_lib.php) integra da ogni lettura MQTT.
- * Indice = ora locale 0..23; nel giorno del cambio d'ora l'ora doppia si somma.
- * null se la tabella non c'e' ancora.
+/* Energia ora per ora, oggi e ieri, in Wh: le righe di `energia_oraria` che
+ * energy_hourly_accumulate() (store_lib.php) integra da ogni lettura MQTT.
+ * Canali: pv (prodotta), casa (consumo al netto della batteria), batt
+ * (scaricata dalla batteria), e casa_grid / casa_batt / casa_pv, le tre
+ * sorgenti del consumo di casa (sommano a casa). Indice = ora locale 0..23; nel giorno del
+ * cambio d'ora l'ora doppia si somma. null se la tabella non c'e' ancora.
  */
-function pvHourly(mysqli $link, int $now): ?array
+function energyHourly(mysqli $link, int $now): ?array
 {
   $today0 = mktime(0, 0, 0, (int) date('n', $now), (int) date('j', $now), (int) date('Y', $now));
   $yest0 = mktime(0, 0, 0, (int) date('n', $now), (int) date('j', $now) - 1, (int) date('Y', $now));
-  $out = ['today' => array_fill(0, 24, 0.0), 'yest' => array_fill(0, 24, 0.0)];
-  try {
-    $res = $link->query("SELECT ora, pv_wh FROM energia_oraria WHERE ora >= {$yest0} AND ora <= {$now}");
-  } catch (Throwable $e) {
-    return null;
+  $chans = ['pv', 'casa', 'batt', 'casa_grid', 'casa_batt', 'casa_pv'];
+  $out = ['hour' => (int) date('G', $now)];
+  foreach ($chans as $ch) {
+    $out[$ch] = ['today' => array_fill(0, 24, 0.0), 'yest' => array_fill(0, 24, 0.0)];
+  }
+  // Tutte le colonne, poi sempre meno: prima della prima scrittura di una
+  // versione nuova le sue colonne non esistono ancora.
+  $res = null;
+  foreach ([implode(', ', array_map(static fn($c) => "{$c}_wh", $chans)),
+            'pv_wh, casa_wh, batt_wh', 'pv_wh'] as $cols) {
+    try {
+      $res = $link->query("SELECT ora, {$cols} FROM energia_oraria WHERE ora >= {$yest0} AND ora <= {$now}");
+      if ($res instanceof mysqli_result) {
+        break;
+      }
+    } catch (Throwable $e) {
+      $res = null;
+    }
   }
   if (!$res instanceof mysqli_result) {
     return null;
@@ -979,12 +994,16 @@ function pvHourly(mysqli $link, int $now): ?array
   while ($r = $res->fetch_assoc()) {
     $ts = (int) $r['ora'];
     $day = ($ts >= $today0) ? 'today' : 'yest';
-    $out[$day][(int) date('G', $ts)] += (float) $r['pv_wh'];
+    $h = (int) date('G', $ts);
+    foreach ($chans as $ch) {
+      $out[$ch][$day][$h] += (float) ($r[$ch . '_wh'] ?? 0);
+    }
   }
-  foreach (['today', 'yest'] as $d) {
-    $out[$d] = array_map(static fn($v) => round($v, 1), $out[$d]);
+  foreach ($chans as $ch) {
+    foreach (['today', 'yest'] as $d) {
+      $out[$ch][$d] = array_map(static fn($v) => round($v, 1), $out[$ch][$d]);
+    }
   }
-  $out['hour'] = (int) date('G', $now);
   return $out;
 }
 
@@ -2370,9 +2389,14 @@ function meteo_build_payload(mysqli $link): array
       'yield' => $battYield,
     ],
 
-    // Produzione FV per ora (Wh), oggi e ieri: il grafico a barre la disegna
-    // lato browser, quindi resta un array e non passa da data-live.
-    'pvOraria' => $emAvailable ? pvHourly($link, $now) : null,
+    // Energia per ora (Wh), oggi e ieri: i grafici a barre la disegnano lato
+    // browser, quindi resta un array e non passa da data-live. pv e casa
+    // vogliono il quadro, batt la batteria.
+    'oraria' => ($emAvailable || $battAvailable) ? (energyHourly($link, $now) ?? []) + [
+      'pvShow' => $emAvailable,
+      'casaShow' => $emAvailable,
+      'battShow' => $battAvailable,
+    ] : null,
 
     'battRaw' => $battRaw,
 

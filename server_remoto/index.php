@@ -42,6 +42,10 @@ function showStyle($cond): string
 {
   return $cond ? '' : 'display:none;';
 }
+
+// Consumo casa leads to its hourly bar chart further down the page; to the
+// line chart only when the bar chart is not there.
+$casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var=casa';
 ?>
 <!doctype html>
 <html lang="it">
@@ -500,6 +504,29 @@ function showStyle($cond): string
     .hourly-chart text {
       font-size: 11px;
       fill: var(--text-muted);
+    }
+
+    .hourly-block {
+      width: 100%;
+    }
+
+    /* Arrivati dal link di Consumo casa: un lampo per dire quale grafico. */
+    .hourly-block {
+      scroll-margin-top: 20px;
+      border-radius: 12px;
+    }
+
+    .hourly-block:target {
+      animation: hourly-flash 1.6s ease-out;
+    }
+
+    @keyframes hourly-flash {
+      from { background: rgba(139, 92, 246, 0.15); }
+      to { background: transparent; }
+    }
+
+    .hourly-block + .hourly-block {
+      margin-top: 18px;
     }
 
     .hourly-legend {
@@ -1211,7 +1238,7 @@ function showStyle($cond): string
 
       <!-- 10. Consumo di casa = produzione + scambio rete -->
       <div class="card border-house" data-card="casa">
-        <a href="grafico.php?var=casa">
+        <a href="<?php echo $casaHref; ?>">
           <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-house" viewBox="0 0 24 24" fill="currentColor">
             <path d="M12 3 2 12h3v9h6v-6h2v6h6v-9h3L12 3z" />
           </svg>
@@ -1440,7 +1467,7 @@ function showStyle($cond): string
           <div class="diag-group">Oggi</div>
           <div class="diag-rows">
             <span class="k">Prodotta FV</span><span class="v"><a href="grafico.php?var=pvPower" data-live="energia.pv"><?php echo $p['energia']['pv']; ?></a></span>
-            <span class="k">Consumo casa</span><span class="v"><a href="grafico.php?var=casa" data-live="energia.casa"><?php echo $p['energia']['casa']; ?></a></span>
+            <span class="k">Consumo casa</span><span class="v"><a href="<?php echo $casaHref; ?>" data-live="energia.casa"><?php echo $p['energia']['casa']; ?></a></span>
             <span class="k">Prelevata</span><span class="v"><a href="grafico.php?var=gridPower" data-live="energia.import"><?php echo $p['energia']['import']; ?></a></span>
             <span class="k">Immessa</span><span class="v"><a href="grafico.php?var=gridPower" data-live="energia.export"><?php echo $p['energia']['export']; ?></a></span>
             <span class="k">Autoconsumo</span><span class="v" data-live="energia.selfUse"><?php echo $p['energia']['selfUse']; ?></span>
@@ -1470,16 +1497,33 @@ function showStyle($cond): string
       </div>
     <?php endif; ?>
 
-    <?php if (!empty($p['pvOraria'])): ?>
-      <!-- 13a-bis. Produzione FV ora per ora: Wh integrati da ogni lettura
-           MQTT (energia_oraria), oggi in giallo e ieri in grigio dietro. -->
-      <div class="card border-energy card-wide" data-card="pvOraria">
-        <div class="card-label">Produzione FV per ora</div>
-        <svg class="hourly-chart" id="pv-hourly" role="img" aria-label="Produzione fotovoltaica per ora"></svg>
-        <div class="hourly-legend">
-          <span><i style="background:var(--accent-yellow)"></i>Oggi <b id="pv-hourly-today"></b></span>
-          <span><i style="background:#d1d5db"></i>Ieri <b id="pv-hourly-yest"></b></span>
-        </div>
+    <?php if (!empty($p['oraria'])): ?>
+      <!-- 13a-bis. Energia ora per ora: Wh integrati da ogni lettura MQTT
+           (energia_oraria), oggi a colori e ieri in grigio dietro. Le barre
+           le disegna renderHourly() nello script in fondo. -->
+      <div class="card border-energy card-wide" data-card="oraria">
+        <?php foreach ([
+          'pv' => ['Produzione FV per ora', 'var(--accent-yellow)'],
+          'casa' => ['Consumo casa per ora', 'var(--accent-purple)'],
+          'batt' => ['Energia dalla batteria per ora', 'var(--accent-green)'],
+        ] as $ch => [$title, $color]): ?>
+          <div class="hourly-block" id="oraria-<?php echo $ch; ?>" style="<?php echo showStyle($p['oraria'][$ch . 'Show'] ?? false); ?>"
+            data-live-show="oraria.<?php echo $ch; ?>Show">
+            <div class="card-label"><?php echo $title; ?></div>
+            <svg class="hourly-chart" id="hourly-<?php echo $ch; ?>" role="img"
+              aria-label="<?php echo $title; ?>"></svg>
+            <div class="hourly-legend">
+              <span><i style="background:<?php echo $color; ?>"></i>Oggi <b id="hourly-<?php echo $ch; ?>-today"></b></span>
+              <?php if ($ch === 'casa'): ?>
+                <!-- Le tre sorgenti, coi colori della barra mix della card Consumo Casa. -->
+                <span><i style="background:var(--accent-green)"></i>FV <b id="hourly-casa_pv-today"></b></span>
+                <span><i style="background:var(--accent-yellow)"></i>Batteria <b id="hourly-casa_batt-today"></b></span>
+                <span><i style="background:var(--accent-red)"></i>Rete <b id="hourly-casa_grid-today"></b></span>
+              <?php endif; ?>
+              <span><i style="background:#d1d5db"></i>Ieri <b id="hourly-<?php echo $ch; ?>-yest"></b></span>
+            </div>
+          </div>
+        <?php endforeach; ?>
       </div>
     <?php endif; ?>
 
@@ -1637,16 +1681,36 @@ function showStyle($cond): string
       }
 
       /**
-       * Bar chart of the hourly PV energy: today in yellow, yesterday as a
-       * wider grey bar behind it, the hour in progress lighter (still filling).
+       * Bar charts of the hourly energy (PV, house, battery): today in the
+       * channel's colour, yesterday as a wider grey bar behind it, the hour in
+       * progress lighter (still filling).
        */
       var SVGNS = 'http://www.w3.org/2000/svg';
+      var HOURLY_COLORS = { pv: '#eab308', casa: '#8b5cf6', batt: '#16a34a' };
+      // Consumo casa stacked by source, bottom to top, in the colours of the
+      // card's mix bar. Whatever the parts do not cover (hours from before
+      // they were recorded) stays in the plain casa colour on top.
+      var CASA_PARTS = [
+        { key: 'casa_pv', label: 'FV', color: '#16a34a' },
+        { key: 'casa_batt', label: 'Batteria', color: '#eab308' },
+        { key: 'casa_grid', label: 'Rete', color: '#ef4444' }
+      ];
       function fmtWh(wh) {
         return wh >= 1000 ? (wh / 1000).toFixed(2) + ' kWh' : Math.round(wh) + ' Wh';
       }
-      function renderHourly(d) {
-        var svg = document.getElementById('pv-hourly');
+      function renderAllHourly(o) {
+        if (!o) return;
+        Object.keys(HOURLY_COLORS).forEach(function (ch) {
+          if (!o[ch]) return;
+          var parts = (ch === 'casa') ? CASA_PARTS.filter(function (pt) { return o[pt.key]; })
+            .map(function (pt) { return { key: pt.key, label: pt.label, color: pt.color, vals: o[pt.key].today }; }) : null;
+          renderHourly(ch, { today: o[ch].today, yest: o[ch].yest, hour: o.hour, parts: parts });
+        });
+      }
+      function renderHourly(ch, d) {
+        var svg = document.getElementById('hourly-' + ch);
         if (!svg || !d) return;
+        var color = HOURLY_COLORS[ch];
         var W = svg.clientWidth || 600, H = 220;
         var L = 44, R = 8, T = 10, B = 24;
         var pw = W - L - R, ph = H - T - B, slot = pw / 24;
@@ -1670,7 +1734,7 @@ function showStyle($cond): string
           var v = top * g / 4, gy = y(v);
           el('line', { x1: L, x2: W - R, y1: gy, y2: gy, stroke: '#e5e7eb', 'stroke-width': 1 });
           el('text', { x: L - 6, y: gy + 4, 'text-anchor': 'end' },
-            top >= 1000 ? (v / 1000).toFixed(top >= 4000 ? 0 : 1) + ' kWh' : Math.round(v) + ' Wh');
+            top >= 1000 ? (v / 1000).toFixed(top >= 4000 ? 0 : top >= 2000 ? 1 : 2) + ' kWh' : Math.round(v) + ' Wh');
         }
         for (var h = 0; h < 24; h++) {
           var x = L + h * slot;
@@ -1679,9 +1743,19 @@ function showStyle($cond): string
               height: T + ph - y(d.yest[h]), fill: '#d1d5db', rx: 2 });
           }
           if (d.today[h] > 0 && h <= d.hour) {
-            el('rect', { x: x + slot * 0.22, y: y(d.today[h]), width: slot * 0.56,
-              height: T + ph - y(d.today[h]), fill: '#eab308', rx: 2,
-              opacity: h === d.hour ? 0.55 : 1 });
+            // Stacked segments (casa by source), or one bar; the rest of the
+            // total, if the parts fall short, on top in the channel colour.
+            var segs = [], base = 0;
+            (d.parts || []).forEach(function (pt) {
+              var v = Math.min(pt.vals[h], d.today[h] - base);
+              if (v > 0) { segs.push([base, v, pt.color]); base += v; }
+            });
+            if (d.today[h] - base > 0.5 || !segs.length) segs.push([base, d.today[h] - base, color]);
+            segs.forEach(function (sg) {
+              el('rect', { x: x + slot * 0.22, y: y(sg[0] + sg[1]), width: slot * 0.56,
+                height: y(sg[0]) - y(sg[0] + sg[1]), fill: sg[2],
+                opacity: h === d.hour ? 0.55 : 1 });
+            });
           }
           if (h % 3 === 0) {
             el('text', { x: x + slot / 2, y: H - 6, 'text-anchor': 'middle' }, (h < 10 ? '0' : '') + h);
@@ -1691,24 +1765,30 @@ function showStyle($cond): string
           var t = document.createElementNS(SVGNS, 'title');
           t.textContent = (h < 10 ? '0' : '') + h + ':00–' + (h < 9 ? '0' : '') + (h + 1) + ':00\n' +
             'Oggi: ' + (h <= d.hour ? fmtWh(d.today[h]) + (h === d.hour ? ' (in corso)' : '') : '—') +
+            (h <= d.hour ? (d.parts || []).map(function (pt) {
+              return '\n  ' + pt.label + ': ' + fmtWh(pt.vals[h]);
+            }).join('') : '') +
             '\nIeri: ' + fmtWh(d.yest[h]);
           hit.appendChild(t);
         }
         var sum = function (a) { return a.reduce(function (s, v) { return s + v; }, 0); };
-        var tEl = document.getElementById('pv-hourly-today');
-        var yEl = document.getElementById('pv-hourly-yest');
+        var tEl = document.getElementById('hourly-' + ch + '-today');
+        var yEl = document.getElementById('hourly-' + ch + '-yest');
         if (tEl) tEl.textContent = fmtWh(sum(d.today));
         if (yEl) yEl.textContent = fmtWh(sum(d.yest));
+        (d.parts || []).forEach(function (pt) {
+          var pEl = document.getElementById('hourly-' + pt.key + '-today');
+          if (pEl) pEl.textContent = fmtWh(sum(pt.vals));
+        });
       }
-      var hourlyData = <?php echo json_encode($p['pvOraria'] ?? null); ?>;
-      renderHourly(hourlyData);
-      window.addEventListener('resize', function () { renderHourly(hourlyData); });
+      var hourlyData = <?php echo json_encode($p['oraria'] ?? null); ?>;
+      renderAllHourly(hourlyData);
+      window.addEventListener('resize', function () { renderAllHourly(hourlyData); });
 
       function apply(p) {
         var f = flatten(p, '', {});
-        if (p.pvOraria) {
-          hourlyData = p.pvOraria;
-          renderHourly(hourlyData);
+        if (p.oraria) {
+          hourlyData = p.oraria;
         }
 
         document.querySelectorAll('[data-live]').forEach(function (el) {
@@ -1811,6 +1891,9 @@ function showStyle($cond): string
         if (card('batteria') && p.batteria) {
           card('batteria').classList.toggle('discharging', !!p.batteria.discharging);
         }
+
+        // Last, after data-live-show: a chart that just appeared has its width.
+        renderAllHourly(hourlyData);
       }
 
       function schedule(ms) {

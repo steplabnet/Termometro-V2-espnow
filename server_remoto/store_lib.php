@@ -22,12 +22,12 @@ require_once __DIR__ . '/trend_store.php'; // RAM-only 30 min window for trends
 /** dati_meteo keeps one row per this many seconds. */
 const METEO_HISTORY_INTERVAL = 600;
 /**
- * Longest gap between two pvPower readings that is still integrated into the
+ * Longest gap between two meter readings that is still integrated into the
  * hourly energy (seconds). MQTT delivers several readings a minute; a longer
  * hole means the meter or the bridge was down, and bridging it with a straight
  * line would invent energy.
  */
-const PV_HOURLY_MAX_GAP = 300;
+const ENERGY_HOURLY_MAX_GAP = 300;
 /** The Piave flow is read from ARPA Veneto at most this often. */
 const PORTATA_TTL = 600;
 /**
@@ -206,24 +206,48 @@ function store_write_minmax(mysqli $link, int $now): void
  * Returns ['history' => bool, 'rev' => int|null, 'portata' => string].
  */
 /**
- * Fold one live pvPower reading into `energia_oraria` (Wh per hour).
+ * Fold one live reading into `energia_oraria` (Wh per hour), per channel:
+ *   pv   = photovoltaic production;
+ *   casa = house load net of the battery, pv + grid - batt, the same figure as
+ *          the Consumo Casa card and energyToday() (a reading with no battery
+ *          counts it as 0, as there);
+ *   batt = energy the battery delivered (discharge only, -battPower when < 0);
+ *   casa_grid / casa_batt / casa_pv = where the house load came from, split
+ *          like the mix bar of the Consumo Casa card (meteo_build_payload):
+ *          grid first (its import), then the battery's discharge, PV the rest.
+ *          The three add up to casa sample by sample, hence hour by hour.
  *
  * Integrated from every MQTT reading, not from the 10-minute history rows:
  * trapezoids between consecutive readings, split at the hour boundaries so an
- * interval straddling :00 is shared between the two bars it belongs to. The
- * previous reading lives in tmpfs; losing it (reboot) costs one interval.
+ * interval straddling :00 is shared between the two bars it belongs to. Each
+ * channel keeps its own previous sample, so a message missing one meter does
+ * not break the others. The previous samples live in tmpfs; losing them
+ * (reboot) costs one interval.
  *
  * The read-compute-write is done under an exclusive lock: the bridge can retry
  * while a slow ingest is still running, and two overlapping calls would
  * otherwise count the same interval twice.
  */
-function pv_hourly_accumulate(mysqli $link, ?float $pv, int $now): void
+function energy_hourly_accumulate(mysqli $link, ?float $pv, ?float $grid, ?float $batt, int $now): void
 {
-  if ($pv === null) {
-    return;   // no meter reading in this message: keep the previous sample
+  $casa = ($pv === null || $grid === null) ? null : max(0.0, $pv + $grid - ($batt ?? 0.0));
+  $vals = [
+    'pv' => ($pv === null) ? null : max(0.0, $pv),
+    'casa' => $casa,
+    'batt' => ($batt === null) ? null : max(0.0, -$batt),
+    'casa_grid' => null,
+    'casa_batt' => null,
+    'casa_pv' => null,
+  ];
+  if ($casa !== null) {
+    $vals['casa_grid'] = min(max(0.0, $grid), $casa);
+    $vals['casa_batt'] = min(max(0.0, -($batt ?? 0.0)), $casa - $vals['casa_grid']);
+    $vals['casa_pv'] = max(0.0, $casa - $vals['casa_grid'] - $vals['casa_batt']);
   }
-  $pv = max(0.0, $pv);
-  $fh = @fopen(store_cache_path('pv_hourly_prev.json'), 'c+');
+  if (!array_filter($vals, static fn($v) => $v !== null)) {
+    return;   // no meter reading in this message: keep the previous samples
+  }
+  $fh = @fopen(store_cache_path('energy_hourly_prev.json'), 'c+');
   if ($fh === false) {
     return;
   }
@@ -232,43 +256,59 @@ function pv_hourly_accumulate(mysqli $link, ?float $pv, int $now): void
       return;
     }
     $prev = json_decode((string) stream_get_contents($fh), true);
-    $t0 = is_array($prev) ? (int) ($prev['ts'] ?? 0) : 0;
-    $p0 = is_array($prev) ? (float) ($prev['pv'] ?? 0) : 0.0;
+    $prev = is_array($prev) ? $prev : [];
 
-    $wh = [];   // hour start ts => Wh
-    if ($t0 > 0 && $now > $t0 && $now - $t0 <= PV_HOURLY_MAX_GAP) {
-      $slope = ($pv - $p0) / ($now - $t0);
-      for ($a = $t0; $a < $now; $a = $b) {
-        $hour = $a - ($a % 3600);
-        $b = min($now, $hour + 3600);
-        $pa = $p0 + $slope * ($a - $t0);
-        $pb = $p0 + $slope * ($b - $t0);
-        $wh[$hour] = ($wh[$hour] ?? 0.0) + ($pa + $pb) / 2.0 * ($b - $a) / 3600.0;
+    $wh = [];   // hour start ts => channel => Wh
+    foreach ($vals as $ch => $v) {
+      if ($v === null) {
+        continue;
       }
+      $t0 = (int) ($prev[$ch]['ts'] ?? 0);
+      $p0 = (float) ($prev[$ch]['w'] ?? 0);
+      if ($now < $t0) {
+        continue;   // out-of-order reading: leave the newer sample alone
+      }
+      if ($t0 > 0 && $now > $t0 && $now - $t0 <= ENERGY_HOURLY_MAX_GAP) {
+        $slope = ($v - $p0) / ($now - $t0);
+        for ($a = $t0; $a < $now; $a = $b) {
+          $hour = $a - ($a % 3600);
+          $b = min($now, $hour + 3600);
+          $pa = $p0 + $slope * ($a - $t0);
+          $pb = $p0 + $slope * ($b - $t0);
+          $wh[$hour][$ch] = ($wh[$hour][$ch] ?? 0.0) + ($pa + $pb) / 2.0 * ($b - $a) / 3600.0;
+        }
+      }
+      $prev[$ch] = ['ts' => $now, 'w' => $v];
     }
-    if ($now >= $t0) {
-      ftruncate($fh, 0);
-      rewind($fh);
-      fwrite($fh, json_encode(['ts' => $now, 'pv' => $pv]));
-      fflush($fh);
-    }
+    ftruncate($fh, 0);
+    rewind($fh);
+    fwrite($fh, json_encode($prev));
+    fflush($fh);
 
     foreach ($wh as $hour => $e) {
-      $sql = "INSERT INTO energia_oraria (ora, pv_wh) VALUES ({$hour}, " . sprintf('%.4F', $e) . ")
-              ON DUPLICATE KEY UPDATE pv_wh = pv_wh + VALUES(pv_wh)";
+      $chans = array_keys($vals);
+      $cols = implode(', ', array_map(static fn($ch) => "{$ch}_wh", $chans));
+      $nums = implode(', ', array_map(static fn($ch) => sprintf('%.4F', $e[$ch] ?? 0.0), $chans));
+      $upd = implode(', ', array_map(static fn($ch) => "{$ch}_wh = {$ch}_wh + VALUES({$ch}_wh)", $chans));
+      $sql = "INSERT INTO energia_oraria (ora, {$cols}) VALUES ({$hour}, {$nums})
+              ON DUPLICATE KEY UPDATE {$upd}";
       try {
         $link->query($sql);
       } catch (Throwable $e2) {
-        // First run: the table does not exist yet. Create it and retry once.
+        // First run of a version: the table or a column is missing. Create
+        // them and retry once.
         $link->query("CREATE TABLE IF NOT EXISTS energia_oraria (
             ora   INT UNSIGNED NOT NULL PRIMARY KEY,  -- unix ts of the hour start
             pv_wh DOUBLE NOT NULL DEFAULT 0
           )");
+        foreach (array_keys($vals) as $ch) {
+          ensure_column($link, 'energia_oraria', "{$ch}_wh", 'DOUBLE NOT NULL DEFAULT 0');
+        }
         $link->query($sql);
       }
     }
   } catch (Throwable $e) {
-    error_log('pv hourly energy failed: ' . $e->getMessage());
+    error_log('hourly energy failed: ' . $e->getMessage());
   } finally {
     flock($fh, LOCK_UN);
     fclose($fh);
@@ -345,8 +385,9 @@ function meteo_store_reading(mysqli $link, array $r): array
     'battTemp' => $battTemp,
   ]), $now);
 
-  // Hourly PV energy, integrated from every reading (see pv_hourly_accumulate).
-  pv_hourly_accumulate($link, $pvPower, $now);
+  // Hourly PV, house and battery energy, integrated from every reading (see
+  // energy_hourly_accumulate). battPower is already null when undated.
+  energy_hourly_accumulate($link, $pvPower, $gridPower, $battPower, $now);
 
   $get = static fn(string $k) => (isset($r[$k]) && $r[$k] !== '') ? $r[$k] : null;
 
