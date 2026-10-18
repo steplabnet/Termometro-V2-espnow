@@ -146,6 +146,42 @@ function hourly_actual() {
   return $out;
 }
 
+// Heater ON time from heater_daily (written by crono_watcher.py, flushed every
+// ~2 min): totals for today / last 7 days / month / year, the 7 days before for
+// comparison, and the last 7 days each paired with the same weekday a week earlier.
+function heater_report($db) {
+  $days = [];
+  $from = min(date('Y-01-01'), date('Y-m-d', strtotime('-13 days')));
+  $st = @$db->prepare('SELECT day, on_sec FROM heater_daily WHERE day >= :f');
+  if (!$st) return null;   // table not created yet: watcher not updated
+  $st->bindValue(':f', $from, SQLITE3_TEXT);
+  $res = $st->execute();
+  while ($r = $res->fetchArray(SQLITE3_ASSOC)) $days[$r['day']] = (int)$r['on_sec'];
+  $first = $db->querySingle('SELECT MIN(day) FROM heater_daily');
+
+  $sum = function ($a, $b) use ($days) {   // inclusive 'Y-m-d' range
+    $s = 0;
+    foreach ($days as $d => $sec) if ($d >= $a && $d <= $b) $s += $sec;
+    return $s;
+  };
+  $d = function ($n) { return date('Y-m-d', strtotime("-$n days")); };
+  $week = [];
+  for ($i = 6; $i >= 0; $i--) {
+    $ts = strtotime("-$i days");
+    $week[] = ['day' => date('Y-m-d', $ts), 'dow' => (int)date('N', $ts), 'dom' => (int)date('j', $ts),
+               'cur' => $days[$d($i)] ?? 0, 'prev' => $days[$d($i + 7)] ?? 0];
+  }
+  return [
+    'today' => $sum($d(0), $d(0)),
+    'week'  => $sum($d(6), $d(0)),
+    'prev'  => $sum($d(13), $d(7)),
+    'month' => $sum(date('Y-m-01'), $d(0)),
+    'year'  => $sum(date('Y-01-01'), $d(0)),
+    'days'  => $week,
+    'since' => $first ?: null,
+  ];
+}
+
 function clamp_target($raw, $fallback) {
   $raw = str_replace(',', '.', trim((string)$raw));
   return is_numeric($raw) ? max(5.0, min(30.0, round((float)$raw * 2) / 2)) : $fallback;
@@ -182,6 +218,7 @@ function build_snapshot() {
     'today'    => $today,
     'plan'     => hourly_plan($db, $settings['default_target']),
     'actual'   => hourly_actual(),
+    'runtime'  => heater_report($db),
     'now'      => ['hm' => date('H:i'), 'hour' => (int)date('G'), 'dow' => (int)date('N')],
   ];
 }

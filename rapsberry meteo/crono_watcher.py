@@ -76,10 +76,15 @@ SHELLY_STATUS_MAX_AGE = 150  # no status for this long ⇒ "the Shelly isn't ans
 SHELLY_GRACE = 120         # heater must be wanted ON this long before we alert
 SHELLY_REALERT = 3600      # repeat the alert this often while the problem persists
 
+# ── Runtime log (heater_daily) ──────────────────────────────────────────────
+RUNTIME_FLUSH = 120        # write the accumulated ON seconds to crono.db this often
+RUNTIME_MAX_GAP = 180      # a longer gap between cycles is not counted (watcher stalled/down)
+
 DEFAULT_HYSTERESIS = 0.3
 DEFAULT_TARGET = 7.0       # antifreeze fallback when no band matches
 DEFAULT_MANUAL_TARGET = 20.0  # fixed target used in manual mode
 MORNING_HOUR = 6           # "fino a domani" resumes the schedule at this hour
+LOOKAHEAD_MIN = 10         # this close to a lower setpoint, regulate to it already
 
 # ── Learning ────────────────────────────────────────────────────────────────
 SLOT_MIN = 15              # learning resolution: 96 slots/day
@@ -161,6 +166,11 @@ def ensure_crono_schema():
             off_score REAL NOT NULL DEFAULT 0,
             weight    REAL NOT NULL DEFAULT 0,
             PRIMARY KEY (dow, slot)
+        )""")
+        # Seconds the heater relay was ON per local day (report on crono.php).
+        con.execute("""CREATE TABLE IF NOT EXISTS heater_daily (
+            day    TEXT PRIMARY KEY,    -- local 'YYYY-MM-DD'
+            on_sec INTEGER NOT NULL DEFAULT 0
         )""")
         # Migrate a pre-existing bands table that lacks the origin column.
         cols = [r[1] for r in con.execute("PRAGMA table_info(bands)")]
@@ -399,7 +409,8 @@ def decide(settings, bands, override, row, prev_heater):
         return {"heater": heater, "target": target, "temp": temp, "source": "manual",
                 "note": f"{temp:.1f}°C vs target {target:.1f}°C ±{hyst:.1f} (manuale) → {heater}."}
 
-    target, band = active_target(bands, now_local())
+    now = now_local()
+    target, band = active_target(bands, now)
     if target is None:
         target = settings["default_target"]
         source = "default"
@@ -408,9 +419,28 @@ def decide(settings, bands, override, row, prev_heater):
         source = "learned" if band.get("origin") == "learned" else "band"
         label = f"fascia {band.get('origin', 'manual')} #{band.get('id')}"
 
+    # Close to a drop in setpoint, regulate to the coming (lower) one already: no
+    # point firing the heater to reach 19°C at 10:55 when 11:00 asks for 12°C.
+    # Only lowers; a rise is never anticipated.
+    def scheduled(when):
+        t, _ = active_target(bands, when)
+        return settings["default_target"] if t is None else t
+
+    anticipo = None
+    ahead = scheduled(now + timedelta(minutes=LOOKAHEAD_MIN))
+    if ahead < target:
+        # First minute the lower setpoint applies, for the page's "from HH:MM".
+        at = next((now + timedelta(minutes=m) for m in range(1, LOOKAHEAD_MIN + 1)
+                   if scheduled(now + timedelta(minutes=m)) <= ahead),
+                  now + timedelta(minutes=LOOKAHEAD_MIN))
+        anticipo = {"from": target, "to": ahead, "at": at.strftime("%H:%M")}
+        label += f", anticipo {ahead:.1f}°C dalle {anticipo['at']}"
+        target = ahead
+
     heater = regulate(temp, target, hyst, prev_heater)
     note = f"{temp:.1f}°C vs target {target:.1f}°C ±{hyst:.1f} ({label}) → {heater}."
-    return {"heater": heater, "target": target, "temp": temp, "source": source, "note": note}
+    return {"heater": heater, "target": target, "temp": temp, "source": source, "note": note,
+            "anticipo": anticipo}
 
 
 # ── MQTT ────────────────────────────────────────────────────────────────────
@@ -975,6 +1005,38 @@ def check_actuator(con, client, ctl, decision):
     return problem
 
 
+# ── Runtime log ─────────────────────────────────────────────────────────────
+def relay_on(now):
+    """Whether the heater is really burning: the Shelly's relay, when it answers.
+    An unreachable Shelly counts as OFF (the page shows it as "Caldaia spenta")."""
+    return shelly_unreachable(now) is None and SHELLY["output"] is True
+
+
+def track_runtime(con, ctl):
+    """Add the time since the last cycle to today's ON seconds if the relay was
+    ON over it, splitting at midnight. Buffered, flushed every RUNTIME_FLUSH."""
+    now = time.time()
+    last, was_on = ctl.get("rt_last"), ctl.get("rt_on", False)
+    ctl["rt_last"], ctl["rt_on"] = now, relay_on(now)
+    pending = ctl.setdefault("rt_pending", {})
+    if last is not None and was_on and 0 < now - last <= RUNTIME_MAX_GAP:
+        t = last
+        while t < now:
+            day_start = datetime.fromtimestamp(t).replace(hour=0, minute=0, second=0, microsecond=0)
+            end = min(now, (day_start + timedelta(days=1)).timestamp())
+            key = day_start.strftime("%Y-%m-%d")
+            pending[key] = pending.get(key, 0.0) + (end - t)
+            t = end
+
+    if pending and (now - ctl.get("rt_flush", 0.0) >= RUNTIME_FLUSH or len(pending) > 1):
+        rows = [(day, int(round(sec))) for day, sec in pending.items() if sec >= 0.5]
+        con.executemany("""INSERT INTO heater_daily (day, on_sec) VALUES (?, ?)
+                           ON CONFLICT(day) DO UPDATE SET on_sec = on_sec + excluded.on_sec""", rows)
+        con.commit()
+        pending.clear()
+        ctl["rt_flush"] = now
+
+
 # ── Control cycle ───────────────────────────────────────────────────────────
 def run_control(con, settings, client, ctl, force_publish=False):
     override = get_active_override(con)
@@ -1000,6 +1062,11 @@ def run_control(con, settings, client, ctl, force_publish=False):
         log(f"[alert] actuator check error: {e}")
         actuator = None
 
+    try:
+        track_runtime(con, ctl)
+    except Exception as e:
+        log(f"[runtime] error: {e}")
+
     save_state({
         "mode": settings["mode"],
         "learning": "on" if settings.get("learning_on", True) else "off",
@@ -1009,6 +1076,7 @@ def run_control(con, settings, client, ctl, force_publish=False):
         "source": decision["source"],
         "override": override,
         "note": decision["note"],
+        "anticipo": decision.get("anticipo"),   # {from, to, at} while a lower setpoint is anticipated
         "actuator_problem": actuator,
         "shelly_output": SHELLY["output"],
         "shelly_available": shelly_unreachable(time.time()) is None,

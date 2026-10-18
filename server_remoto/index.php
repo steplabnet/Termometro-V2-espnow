@@ -453,6 +453,16 @@ function showStyle($cond): string
       color: var(--accent-ice);
     }
 
+    /* Dati Venus E: i valori grezzi del pacco, stessa griglia della
+       diagnostica. Grigio perche' non interpreta niente: e' la fonte. */
+    .border-raw {
+      border-top-color: var(--text-muted);
+    }
+
+    .icon-raw {
+      color: var(--text-muted);
+    }
+
     /* Quadro principale: stessa griglia della diagnostica batteria (riusa
        .diag-group / .diag-rows), altro colore perche' guarda l'impianto e non
        il pacco. Nessun valore e' un link: queste letture non sono storicizzate,
@@ -463,6 +473,22 @@ function showStyle($cond): string
 
     .icon-quadro {
       color: var(--accent-purple);
+    }
+
+    /* Energia: stessa griglia della diagnostica (.diag-group / .diag-rows),
+       giallo come il sole da cui arriva quasi tutta. */
+    .border-energy {
+      border-top-color: var(--accent-yellow);
+    }
+
+    .icon-energy {
+      color: var(--accent-yellow);
+    }
+
+    .diag-group .src {
+      text-transform: none;
+      letter-spacing: 0;
+      font-weight: 400;
     }
 
     .diag-rows .v .dir {
@@ -1329,6 +1355,81 @@ function showStyle($cond): string
         <div class="diag-rows">
             <span class="k">Pacco</span><span class="v"><a href="grafico.php?var=battCurr" data-live="battDiag.iPack"><?php echo $p['battDiag']['iPack']; ?></a></span>
             <span class="k">Rete AC (da W/V)</span><span class="v"><a href="grafico.php?var=battAcCurr" data-live="battDiag.iAc"><?php echo $p['battDiag']['iAc']; ?></a></span>
+        </div>
+      </div>
+    <?php endif; ?>
+
+    <?php if (!empty($p['battRaw']['show'])): ?>
+      <!-- 13 bis. Dati Venus E: tutto quello che il pacco manda, cosi' com'e'
+           salvato -- niente conti, soglie o colori. Serve a controllare le
+           altre card contro la fonte. Le righe vengono da BATT_RAW_ROWS. -->
+      <div class="card border-raw" data-card="battRaw"
+        style="display:flex; flex-direction:column; align-items:center;">
+        <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-raw" viewBox="0 0 24 24"
+          fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="3" width="18" height="18" rx="2" />
+          <path d="M3 9h18M3 15h18M9 3v18" />
+        </svg>
+        <div class="card-label">Dati Venus E</div>
+
+        <div class="diag-rows">
+            <span class="k">Letti alle</span><span class="v" data-live="battRaw.ts"><?php echo $p['battRaw']['ts']; ?></span>
+        </div>
+        <?php foreach (BATT_RAW_ROWS as $group => $rows): ?>
+          <div class="diag-group"><?php echo htmlspecialchars($group); ?></div>
+          <div class="diag-rows">
+            <?php foreach ($rows as $k => [$label]): ?>
+              <span class="k"><?php echo htmlspecialchars($label); ?></span><span class="v" data-live="battRaw.<?php echo $k; ?>"><?php echo $p['battRaw'][$k]; ?></span>
+            <?php endforeach; ?>
+          </div>
+        <?php endforeach; ?>
+      </div>
+    <?php endif; ?>
+
+    <?php if (!empty($p['energia']['show'])): ?>
+      <!-- 13a. Energia: i kWh di oggi (impianto e batteria) e i totali di
+           sempre che il Venus E conta da se'. Come la diagnostica non e'
+           avvolta in un <a>: i valori di oggi portano ciascuno al proprio
+           grafico. I totali no, perche' non hanno un grafico dietro. -->
+      <div class="card border-energy" data-card="energia"
+        style="display:flex; flex-direction:column; align-items:center;">
+        <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-energy" viewBox="0 0 24 24"
+          fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M13 2 3 14h9l-1 8 10-12h-9l1-8z" />
+        </svg>
+        <div class="card-label">Energia</div>
+
+        <div style="width:100%; <?php echo showStyle($p['energia']['emShow']); ?>"
+          data-live-show="energia.emShow">
+          <div class="diag-group">Oggi</div>
+          <div class="diag-rows">
+            <span class="k">Prodotta FV</span><span class="v"><a href="grafico.php?var=pvPower" data-live="energia.pv"><?php echo $p['energia']['pv']; ?></a></span>
+            <span class="k">Consumo casa</span><span class="v"><a href="grafico.php?var=casa" data-live="energia.casa"><?php echo $p['energia']['casa']; ?></a></span>
+            <span class="k">Prelevata</span><span class="v"><a href="grafico.php?var=gridPower" data-live="energia.import"><?php echo $p['energia']['import']; ?></a></span>
+            <span class="k">Immessa</span><span class="v"><a href="grafico.php?var=gridPower" data-live="energia.export"><?php echo $p['energia']['export']; ?></a></span>
+            <span class="k">Autoconsumo</span><span class="v" data-live="energia.selfUse"><?php echo $p['energia']['selfUse']; ?></span>
+            <span class="k">Autosufficienza</span><span class="v" data-live="energia.selfSuff"><?php echo $p['energia']['selfSuff']; ?></span>
+          </div>
+        </div>
+
+        <div style="width:100%; <?php echo showStyle($p['energia']['battShow']); ?>"
+          data-live-show="energia.battShow">
+          <div class="diag-group">Batteria oggi <span class="src" data-live="energia.battSrc"><?php echo $p['energia']['battSrc']; ?></span></div>
+          <div class="diag-rows">
+            <span class="k">Caricata</span><span class="v"><a href="grafico.php?var=battPower" data-live="energia.chg"><?php echo $p['energia']['chg']; ?></a></span>
+            <span class="k">Scaricata</span><span class="v"><a href="grafico.php?var=battPower" data-live="energia.dis"><?php echo $p['energia']['dis']; ?></a></span>
+          </div>
+        </div>
+
+        <div style="width:100%; <?php echo showStyle($p['energia']['totShow']); ?>"
+          data-live-show="energia.totShow">
+          <div class="diag-group">Totali Venus E</div>
+          <div class="diag-rows">
+            <span class="k">Caricata</span><span class="v" data-live="energia.chgTot"><?php echo $p['energia']['chgTot']; ?></span>
+            <span class="k">Scaricata</span><span class="v" data-live="energia.disTot"><?php echo $p['energia']['disTot']; ?></span>
+            <span class="k">Cicli equivalenti</span><span class="v" data-live="energia.cycles"><?php echo $p['energia']['cycles']; ?></span>
+            <span class="k">Rendimento</span><span class="v" data-live="energia.yield"><?php echo $p['energia']['yield']; ?></span>
+          </div>
         </div>
       </div>
     <?php endif; ?>

@@ -55,8 +55,16 @@ defined('BATTERY_DIAG_FIELDS') || define('BATTERY_DIAG_FIELDS', [
   'battAcW',
 ]);
 
-/** kWh counters the pack keeps itself -- lifetime, today, this month -- and
- * its BMS cycle count. Live row only, stored as DOUBLE by store_lib.php. */
+/**
+ * The Venus E's own energy counters, kWh -- lifetime (registers 33000 /
+ * 33002, 0.01 kWh steps), today, this month -- and its BMS cycle count.
+ *
+ * Kept apart from BATTERY_DIAG_FIELDS because they are not a reading of the
+ * pack's condition and the diagnostics card has nothing to do with them. They
+ * go to both tables, as DOUBLE (store_lib.php): the Energia card needs the
+ * lifetime value at midnight to say how much moved today, and that value
+ * lives in `dati_meteo`.
+ */
 defined('BATTERY_ENERGY_FIELDS') || define('BATTERY_ENERGY_FIELDS', [
   'battChgTot',
   'battDisTot',
@@ -65,6 +73,45 @@ defined('BATTERY_ENERGY_FIELDS') || define('BATTERY_ENERGY_FIELDS', [
   'battChgMon',
   'battDisMon',
   'battCycles',
+]);
+
+/**
+ * Card "Dati Venus E": every battery value as stored, grouped as the card shows
+ * them. group => [field => [label, unit]]. index.php draws the rows from this
+ * same list, so a field added here shows up without touching the markup.
+ */
+defined('BATT_RAW_ROWS') || define('BATT_RAW_ROWS', [
+  'Stato' => [
+    'battSoc' => ['Carica', '%'],
+    'battPower' => ['Potenza', 'W'],
+  ],
+  'Temperature' => [
+    'battTemp' => ['Cella max', '°C'],
+    'battTempMin' => ['Cella min', '°C'],
+    'battTempInt' => ['Interna', '°C'],
+    'battTempMos1' => ['MOS 1', '°C'],
+    'battTempMos2' => ['MOS 2', '°C'],
+  ],
+  'Pacco DC' => [
+    'battVolt' => ['Tensione', 'V'],
+    'battCurr' => ['Corrente', 'A'],
+    'battCellVMax' => ['Cella max', 'V'],
+    'battCellVMin' => ['Cella min', 'V'],
+  ],
+  'Lato AC' => [
+    'battAcV' => ['Tensione', 'V'],
+    'battAcHz' => ['Frequenza', 'Hz'],
+    'battAcW' => ['Potenza', 'W'],
+  ],
+  'Contatori' => [
+    'battChgDay' => ['Caricata oggi', 'kWh'],
+    'battDisDay' => ['Scaricata oggi', 'kWh'],
+    'battChgMon' => ['Caricata mese', 'kWh'],
+    'battDisMon' => ['Scaricata mese', 'kWh'],
+    'battChgTot' => ['Caricata totale', 'kWh'],
+    'battDisTot' => ['Scaricata totale', 'kWh'],
+    'battCycles' => ['Cicli (BMS)', ''],
+  ],
 ]);
 
 /**
@@ -807,6 +854,110 @@ function battReserveHits(mysqli $link, int $now, int $days): array
   return $out;
 }
 
+/* Energia di oggi, in kWh, integrata sulle righe di `dati_meteo` da $since.
+ *
+ * Stessa regola dei riquadri kWh di grafico.php: trapezi sui timestamp veri,
+ * e un buco di piu' di un'ora non viene colmato -- un logger fermo non deve
+ * inventare energia. Due differenze volute:
+ *   - prelievo e immissione, carica e scarica sono separati campione per
+ *     campione (max(0, x)) e non dal segno del trapezio, cosi' un passaggio da
+ *     prelievo a immissione dentro un intervallo non si annulla da solo;
+ *   - $live, la lettura di adesso, chiude la serie: le righe storiche sono una
+ *     ogni dieci minuti, e senza l'ultimo tratto la card resterebbe ferma
+ *     fino alla riga successiva.
+ *
+ * Le righe partono dieci minuti prima di $since, ma si integra solo la parte
+ * dopo: servono a trovare il valore dei contatori del Venus a mezzanotte, che
+ * torna in chgTot0 / disTot0 (null se le colonne o i valori non ci sono).
+ */
+function energyToday(mysqli $link, int $since, int $now, array $live): array
+{
+  $out = [
+    'pv' => null, 'casa' => null, 'import' => null, 'export' => null,
+    'chg' => null, 'dis' => null, 'chgTot0' => null, 'disTot0' => null,
+  ];
+  $from = $since - 600;
+  $base = 'data, pvPower, gridPower, battPower';
+
+  // Prima con i contatori, poi senza: su un database che non li ha ancora
+  // mysqli lancia sulla colonna sconosciuta, e il resto va mostrato lo stesso.
+  $rows = null;
+  foreach (["$base, battChgTot, battDisTot", $base] as $sel) {
+    try {
+      $res = $link->query(
+        "SELECT $sel FROM dati_meteo WHERE data >= {$from} AND data <= {$now} ORDER BY data ASC"
+      );
+      if ($res instanceof mysqli_result) {
+        $rows = [];
+        while ($r = $res->fetch_assoc()) {
+          $rows[] = $r;
+        }
+        break;
+      }
+    } catch (Throwable $e) {
+      // Colonna mancante: si riprova con la select ridotta.
+    }
+  }
+  if ($rows === null) {
+    return $out;
+  }
+
+  foreach ($rows as $r) {
+    if ($out['chgTot0'] === null && is_numeric($r['battChgTot'] ?? null)) {
+      $out['chgTot0'] = (float) $r['battChgTot'];
+    }
+    if ($out['disTot0'] === null && is_numeric($r['battDisTot'] ?? null)) {
+      $out['disTot0'] = (float) $r['battDisTot'];
+    }
+  }
+
+  $lastTs = $rows ? (int) end($rows)['data'] : 0;
+  if ($now > $lastTs) {
+    $rows[] = $live + ['data' => $now];
+  }
+
+  $acc = [];
+  $prev = [];
+  foreach ($rows as $r) {
+    $t = (int) $r['data'];
+    $num = static fn($k) => is_numeric($r[$k] ?? null) ? (float) $r[$k] : null;
+    $pv = $num('pvPower');
+    if ($pv !== null && abs($pv) < PV_ZERO_THRESHOLD) {
+      $pv = 0.0;
+    }
+    $grid = $num('gridPower');
+    $batt = $num('battPower');
+
+    // Casa al netto della batteria, come la card Consumo Casa; una riga di
+    // prima della batteria ha battPower NULL e tiene la somma semplice.
+    $v = [
+      'pv' => $pv,
+      'import' => ($grid === null) ? null : max(0.0, $grid),
+      'export' => ($grid === null) ? null : max(0.0, -$grid),
+      'casa' => ($pv === null || $grid === null) ? null : $pv + $grid - ($batt ?? 0.0),
+      'chg' => ($batt === null) ? null : max(0.0, $batt),
+      'dis' => ($batt === null) ? null : max(0.0, -$batt),
+    ];
+
+    foreach ($v as $ch => $w) {
+      if ($w === null) {
+        continue;
+      }
+      $acc[$ch] = $acc[$ch] ?? 0.0;
+      if (isset($prev[$ch]) && $t > $since && $t - $prev[$ch][0] <= 3600) {
+        $dt = $t - max($prev[$ch][0], $since);
+        $acc[$ch] += ($w + $prev[$ch][1]) / 2.0 * $dt / 3600.0;
+      }
+      $prev[$ch] = [$t, $w];
+    }
+  }
+
+  foreach ($acc as $ch => $wh) {
+    $out[$ch] = $wh / 1000.0;
+  }
+  return $out;
+}
+
 function meteo_build_payload(mysqli $link): array
 {
   $now = time();
@@ -922,7 +1073,10 @@ function meteo_build_payload(mysqli $link): array
   // array so a column the bridge does not publish yet simply does not appear,
   // and the card shows a dash for it instead of a zero.
   $battDiag = [];
+  // Lifetime counters (BATTERY_ENERGY_FIELDS), same rule: only what is stored.
+  $battEnergy = [];
   $battAge = null;
+  $battTs = null;
   try {
     $resB = $link->query("SELECT `battPower`,`battSoc`,`battTemp`,`battTs` FROM `dati_instant` WHERE `id` = 1");
     if ($resB instanceof mysqli_result && $rowB = $resB->fetch_assoc()) {
@@ -952,6 +1106,24 @@ function meteo_build_payload(mysqli $link): array
           }
         } catch (Throwable $e) {
           // Diagnostics columns not created yet: the card shows dashes.
+        }
+
+        // Lifetime kWh counters, for the Energia card. Their own query for
+        // the same reason: a Pi that does not forward them yet must not cost
+        // the diagnostics above.
+        try {
+          $cols = implode(',', array_map(
+            static fn($c) => "`$c`", BATTERY_ENERGY_FIELDS));
+          $resE = $link->query("SELECT $cols FROM `dati_instant` WHERE `id` = 1");
+          if ($resE instanceof mysqli_result && $rowE = $resE->fetch_assoc()) {
+            foreach ($rowE as $k => $v) {
+              if (is_numeric($v)) {
+                $battEnergy[$k] = (float) $v;
+              }
+            }
+          }
+        } catch (Throwable $e) {
+          // Counter columns not created yet: the card omits the totals.
         }
       }
     }
@@ -1786,6 +1958,65 @@ function meteo_build_payload(mysqli $link): array
     }
   }
 
+  /* ---------- 7e. ENERGIA (KWH OGGI + CONTATORI DEL VENUS) ----------
+   * Oggi: integrato dalle righe storiche piu' la lettura di adesso (vedi
+   * energyToday). Per la batteria c'e' di meglio: i contatori che il Venus
+   * tiene da se'. Quello che e' entrato e uscito oggi e' la differenza fra il
+   * valore di adesso e quello di mezzanotte, cioe' la misura del pacco e non
+   * un campione ogni dieci minuti. Si torna all'integrale se i contatori
+   * mancano o danno un numero impossibile (azzerati da un aggiornamento
+   * firmware, o una lettura fuori mappa).
+   */
+  $midnight = mktime(0, 0, 0, (int) date('n'), (int) date('j'), (int) date('Y'));
+  $en = ($emAvailable || $battAvailable)
+    ? energyToday($link, $midnight, $now, [
+      'pvPower' => $safePv0,
+      'gridPower' => $safeGrid0,
+      'battPower' => $safeBattPower0,
+    ])
+    : null;
+
+  $chgTot = $battEnergy['battChgTot'] ?? null;
+  $disTot = $battEnergy['battDisTot'] ?? null;
+  $counterDelta = static function (?float $nowVal, ?float $base): ?float {
+    if ($nowVal === null || $base === null) {
+      return null;
+    }
+    $d = $nowVal - $base;
+    // Piu' di quattro pieni in un giorno non e' fisica, e' un contatore rotto.
+    return ($d < 0 || $d > 4 * BATT_CAPACITY_KWH) ? null : $d;
+  };
+  $chgToday = $counterDelta($chgTot, $en['chgTot0'] ?? null);
+  $disToday = $counterDelta($disTot, $en['disTot0'] ?? null);
+  $battFromCounters = ($chgToday !== null && $disToday !== null);
+  if (!$battFromCounters) {
+    $chgToday = $en['chg'] ?? null;
+    $disToday = $en['dis'] ?? null;
+  }
+
+  $kwh = static fn(?float $v) => ($v === null) ? '--'
+    : number_format($v, ($v >= 100) ? 1 : 2) . ' kWh';
+  $pct = static fn(?float $num, ?float $den) => ($num === null || $den === null || $den < 0.05)
+    ? '--' : (int) round(min(100, max(0, $num / $den * 100))) . '%';
+
+  // Autoconsumo: la parte della produzione usata in casa (o messa nel pacco)
+  // invece che regalata alla rete. Autosufficienza: la parte del consumo che
+  // non si e' comprata. Due domande diverse, e ognuna nasconde l'altra.
+  $enPv = $en['pv'] ?? null;
+  $enCasa = $en['casa'] ?? null;
+  $enImport = $en['import'] ?? null;
+  $enExport = $en['export'] ?? null;
+  $selfUse = $pct(($enPv !== null && $enExport !== null) ? $enPv - $enExport : null, $enPv);
+  $selfSuff = $pct(($enCasa !== null && $enImport !== null) ? $enCasa - $enImport : null, $enCasa);
+
+  // Cicli equivalenti: quanti pacchi interi ha restituito da quando esiste.
+  // E' il numero con cui si misura l'usura (il Venus E e' garantito a cicli).
+  // Il rendimento e' scaricato / caricato: approssimato, perche' l'energia
+  // ancora dentro il pacco e' contata fra le cariche ma non fra le scariche.
+  $battCycles = ($disTot === null) ? '--' : number_format($disTot / BATT_CAPACITY_KWH, 1);
+  $battYield = ($chgTot !== null && $disTot !== null && $chgTot >= 1.0)
+    ? $pct($disTot, $chgTot) : '--';
+
   /* Cell temperature, coloured by what it means for the pack rather than by
    * how warm it sounds. Below 0 °C the BMS refuses to CHARGE (discharge is
    * fine down to -20), which is normal on a winter night and worth flagging
@@ -1815,6 +2046,28 @@ function meteo_build_payload(mysqli $link): array
   $d = static fn(string $k) => $battDiag[$k] ?? null;
   $fmtNum = static fn($v, int $dec, string $unit)
     => ($v === null) ? '--' : number_format((float) $v, $dec) . ' ' . $unit;
+
+  /* Dati Venus E: i valori cosi' come sono salvati, senza conti ne' soglie,
+   * per poter controllare le altre card contro la fonte. Fino a tre decimali,
+   * senza zeri in coda: e' la precisione che il pacco manda. */
+  $rawSrc = $battDiag + $battEnergy + [
+    'battPower' => $safeBattPower0,
+    'battSoc' => $safeBattSoc0,
+    'battTemp' => $safeBattTemp0,
+  ];
+  $battRaw = [
+    'show' => $battAvailable,
+    'ts' => ($battTs === null) ? '--'
+      : date('H:i:s', $battTs) . ' (' . max(0, (int) $battAge) . ' s fa)',
+  ];
+  foreach (BATT_RAW_ROWS as $rows) {
+    foreach ($rows as $k => [, $unit]) {
+      $v = $rawSrc[$k] ?? null;
+      $battRaw[$k] = ($v === null) ? '--' : trim(
+        rtrim(rtrim(number_format((float) $v, 3, '.', ''), '0'), '.') . ' ' . $unit
+      );
+    }
+  }
 
   $cellTempSpread = ($safeBattTemp0 !== null && $d('battTempMin') !== null)
     ? $safeBattTemp0 - $d('battTempMin') : null;
@@ -2064,6 +2317,30 @@ function meteo_build_payload(mysqli $link): array
       'totFull' => $statsTotFull,
       'totPart' => $statsTotPart,
     ],
+
+    // Energia: kWh di oggi (impianto e batteria) e i totali di sempre che il
+    // Venus conta da se'. Tre gruppi, ognuno visibile solo se ha una fonte.
+    'energia' => [
+      'show' => ($emAvailable || $battAvailable),
+      'emShow' => $emAvailable,
+      'pv' => $kwh($enPv),
+      'casa' => $kwh($enCasa),
+      'import' => $kwh($enImport),
+      'export' => $kwh($enExport),
+      'selfUse' => $selfUse,
+      'selfSuff' => $selfSuff,
+      'battShow' => $battAvailable,
+      'chg' => $kwh($chgToday),
+      'dis' => $kwh($disToday),
+      'battSrc' => $battFromCounters ? 'dai contatori del Venus' : 'stimata dai campioni',
+      'totShow' => ($battAvailable && ($chgTot !== null || $disTot !== null)),
+      'chgTot' => $kwh($chgTot),
+      'disTot' => $kwh($disTot),
+      'cycles' => $battCycles,
+      'yield' => $battYield,
+    ],
+
+    'battRaw' => $battRaw,
 
     'battDiag' => [
       'show' => ($battDiag !== []),

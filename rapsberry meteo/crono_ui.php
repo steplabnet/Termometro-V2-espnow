@@ -14,7 +14,9 @@
 //   ufficio   latest office reading {temp, heater, ...} or null
 //   today     today's enabled bands [{time_from, time_to, target, origin}]
 //   plan      24 × {h, target, src}      actual  24 × null|{temp, on}
-//   now       {hm, hour, dow}            (Pi local time, dow 1 = Monday)
+//   runtime   null | {today, week, prev, month, year (ON seconds), since,
+//             days: 7 × {day, dow, dom, cur, prev}}  (prev = same weekday a week before)
+//   now      {hm, hour, dow}            (Pi local time, dow 1 = Monday)
 
 const DAY_LABELS = ['Lun', 'Mar', 'Mer', 'Gio', 'Ven', 'Sab', 'Dom'];
 const MODE_LABELS = ['auto' => 'Auto', 'manual' => 'Manuale', 'off' => 'Spento'];
@@ -22,6 +24,14 @@ const MORNING_HOUR = 6;       // matches crono_watcher.py: "fino a domani" ends 
 
 function fmt_t($v) {
   return rtrim(rtrim(number_format((float)$v, 1, '.', ''), '0'), '.');
+}
+
+// Seconds → "45 min", "3 h 05", "312 h".
+function fmt_dur($sec) {
+  $m = (int)round($sec / 60);
+  if ($m < 60) return $m . ' min';
+  if ($m >= 6000) return round($m / 60) . ' h';
+  return intdiv($m, 60) . ' h ' . sprintf('%02d', $m % 60);
 }
 
 // $opt: flash, flash_ok, load_err, stale (banner text or ''), other_href,
@@ -32,6 +42,7 @@ function render_crono_page(array $snap, array $opt) {
   $today    = $snap['today'] ?? [];
   $plan     = $snap['plan'] ?? [];
   $actual   = $snap['actual'] ?? array_fill(0, 24, null);
+  $runtime  = $snap['runtime'] ?? null;
   $now      = ($snap['now'] ?? []) + ['hm' => date('H:i'), 'hour' => (int)date('G'), 'dow' => (int)date('N')];
   $mode     = isset(MODE_LABELS[$settings['mode']]) ? $settings['mode'] : 'auto';
   $manualT  = (float)$settings['manual_target'];
@@ -114,6 +125,8 @@ function render_crono_page(array $snap, array $opt) {
     .pill.cmd { background: var(--accent-soft); color: var(--accent-ink); }
     .pill.fault { background: var(--hot); color: #fff; }
     .note { margin-top: 12px; font-size: .8rem; color: var(--faint); line-height: 1.4; }
+    .antic { margin-top: 12px; padding: 8px 12px; border-radius: 12px; font-size: .88rem; line-height: 1.35;
+             background: var(--cool-soft); color: var(--cool); font-weight: 500; }
 
     /* Override banner */
     .override { display: flex; align-items: center; gap: 12px; border: 2px solid var(--accent); }
@@ -201,6 +214,29 @@ function render_crono_page(array $snap, array $opt) {
     .tbl th { text-align: left; color: var(--faint); font-size: .72rem; text-transform: uppercase; padding: 6px 4px; }
     .tbl td { padding: 6px 4px; border-top: 1px solid var(--line); }
 
+    /* Heater runtime report */
+    .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+    .stat { background: var(--chip); border-radius: 12px; padding: 10px 6px; text-align: center; }
+    .stat .k { display: block; font-size: .7rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+    .stat .v { display: block; font-size: 1.05rem; font-weight: 800; margin-top: 4px; font-variant-numeric: tabular-nums; }
+    .cmp { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin: 16px 0 10px;
+           font-size: .9rem; color: var(--muted); }
+    .cmp b { color: var(--text); font-variant-numeric: tabular-nums; }
+    .delta { font-weight: 700; padding: 3px 9px; border-radius: 999px; background: var(--chip); color: var(--text);
+             white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .sw-cur { background: var(--accent); }
+    .sw-prev { background: var(--s-default); }
+    .wk { list-style: none; }
+    .wk li { display: grid; grid-template-columns: 52px 1fr 64px; align-items: center; gap: 8px; padding: 5px 0; }
+    .wk .d { font-size: .85rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .wk li.today .d { color: var(--accent-ink); font-weight: 700; }
+    .wk .bars { display: grid; gap: 2px; }
+    .wk .b { height: 9px; border-radius: 0 4px 4px 0; min-width: 2px; }
+    .wk .b.cur { background: var(--accent); }
+    .wk .b.prev { background: var(--s-default); }
+    .wk .n { text-align: right; font-size: .8rem; line-height: 1.25; font-variant-numeric: tabular-nums; }
+    .wk .n span { display: block; color: var(--faint); }
+
     [hidden] { display: none !important; }
   </style>
 </head>
@@ -228,6 +264,7 @@ function render_crono_page(array $snap, array $opt) {
       <span class="pill" id="s-heater">Caldaia —</span>
       <span class="pill" id="s-mode"><?= htmlspecialchars(MODE_LABELS[$mode]) ?></span>
     </div>
+    <p class="antic" id="s-antic" hidden></p>
     <p class="note" id="s-note"></p>
   </div>
 
@@ -366,6 +403,49 @@ function render_crono_page(array $snap, array $opt) {
       </ul>
     <?php endif; ?>
   </div>
+
+  <!-- ── Heater runtime ── -->
+  <?php if ($runtime):
+    $wkMax = 1;
+    foreach ($runtime['days'] as $dd) $wkMax = max($wkMax, $dd['cur'], $dd['prev']);
+    $cur = (int)$runtime['week']; $prev = (int)$runtime['prev'];
+    $delta = $prev > 0 ? (int)round(100 * ($cur - $prev) / $prev) : null; ?>
+  <div class="card">
+    <h2>Ore di accensione caldaia</h2>
+    <div class="stats">
+      <div class="stat"><span class="k">Oggi</span><span class="v"><?= fmt_dur($runtime['today']) ?></span></div>
+      <div class="stat"><span class="k">7 giorni</span><span class="v"><?= fmt_dur($cur) ?></span></div>
+      <div class="stat"><span class="k">Mese</span><span class="v"><?= fmt_dur($runtime['month']) ?></span></div>
+      <div class="stat"><span class="k">Anno</span><span class="v"><?= fmt_dur($runtime['year']) ?></span></div>
+    </div>
+
+    <div class="cmp">
+      <span>Ultimi 7 giorni <b><?= fmt_dur($cur) ?></b> · 7 precedenti <b><?= fmt_dur($prev) ?></b></span>
+      <span class="delta"><?= $delta === null ? '—' : ($delta > 0 ? '▲ +' : ($delta < 0 ? '▼ ' : '')) . $delta . '%' ?></span>
+    </div>
+    <div class="legend">
+      <span><i class="sw sw-cur"></i>Questa settimana</span>
+      <span><i class="sw sw-prev"></i>Stesso giorno, settimana prima</span>
+    </div>
+    <ul class="wk">
+      <?php foreach ($runtime['days'] as $i => $dd):
+        $lbl = DAY_LABELS[max(1, min(7, (int)$dd['dow'])) - 1] . ' ' . (int)$dd['dom']; ?>
+        <li class="<?= $i === 6 ? 'today' : '' ?>"
+            title="<?= htmlspecialchars($lbl . ': ' . fmt_dur($dd['cur']) . ' · settimana prima ' . fmt_dur($dd['prev'])) ?>">
+          <span class="d"><?= $lbl ?></span>
+          <span class="bars">
+            <i class="b cur" style="width: <?= round(100 * $dd['cur'] / $wkMax, 1) ?>%"></i>
+            <i class="b prev" style="width: <?= round(100 * $dd['prev'] / $wkMax, 1) ?>%"></i>
+          </span>
+          <span class="n"><?= fmt_dur($dd['cur']) ?><span><?= fmt_dur($dd['prev']) ?></span></span>
+        </li>
+      <?php endforeach; ?>
+    </ul>
+    <p class="note">Tempo con il relè Shelly acceso<?= !empty($runtime['since'])
+      ? ' · dati dal ' . htmlspecialchars(date('d/m/Y', strtotime($runtime['since']))) : '' ?>.
+      Oggi è aggiornato ogni ~2 minuti.</p>
+  </div>
+  <?php endif; ?>
 
   <div class="foot">
     <?php if (!empty($opt['schedule_href'])): ?>
@@ -570,6 +650,12 @@ function render_crono_page(array $snap, array $opt) {
           modeEl.textContent = MODES[st.mode] || st.mode; modeEl.className = 'pill';
         }
         $('s-note').textContent = (st.note || '') + (st.updated ? ' · ' + st.updated : '');
+
+        // The watcher is already holding the next, lower setpoint (end of a band).
+        const an = st.anticipo;
+        $('s-antic').hidden = !an;
+        if (an) $('s-antic').textContent = 'Setpoint limitato a ' + fmt(an.to) + '° (invece di ' + fmt(an.from) +
+          '°): dalle ' + an.at + ' il programma scende, inutile scaldare ora.';
 
         const ov = d.override;
         $('ov-card').hidden = !ov;

@@ -231,12 +231,13 @@ function meteo_store_reading(mysqli $link, array $r): array
   $battTemp = isset($r['battTemp']) && is_numeric($r['battTemp']) ? (float) $r['battTemp'] : null;
   $battTs = isset($r['battTs']) && is_numeric($r['battTs']) ? (int) $r['battTs'] : null;
 
-  // The diagnostics ride on the same timestamp: undated, they would sit on the
-  // card looking live long after the bridge stopped. The history row needs no
-  // such guard -- it is stamped by `data` like every other column in it.
+  // The diagnostics and the kWh counters ride on the same timestamp: undated,
+  // they would sit on the card looking live long after the bridge stopped.
+  // The history row needs no such guard -- it is stamped by `data` like every
+  // other column in it.
   $battLive = [];
   if ($battTs !== null) {
-    foreach (BATTERY_DIAG_FIELDS as $f) {
+    foreach (array_merge(BATTERY_DIAG_FIELDS, BATTERY_ENERGY_FIELDS) as $f) {
       if (isset($r[$f]) && is_numeric($r[$f])) {
         $battLive[$f] = (float) $r[$f];
       }
@@ -299,6 +300,14 @@ function meteo_store_reading(mysqli $link, array $r): array
     foreach (BATTERY_DIAG_FIELDS as $c) {
       ensure_column($link, 'dati_instant', $c, 'FLOAT NULL');
       ensure_column($link, 'dati_meteo', $c, 'FLOAT NULL');
+    }
+    // The lifetime counters too: the Energia card needs the value they had at
+    // midnight to say how much went in and out today. DOUBLE, not FLOAT: a
+    // single-precision float carries ~7 digits, which would start eating the
+    // 0.01 kWh step once the counters pass a few thousand kWh.
+    foreach (BATTERY_ENERGY_FIELDS as $c) {
+      ensure_column($link, 'dati_instant', $c, 'DOUBLE NULL');
+      ensure_column($link, 'dati_meteo', $c, 'DOUBLE NULL');
     }
     // Live row only: the quadro card reads them, nothing charts them.
     foreach (EM_DETAIL_FIELDS as $c) {
@@ -405,6 +414,9 @@ function meteo_store_reading(mysqli $link, array $r): array
       foreach (array_merge(['pvPower', 'gridPower', 'battPower', 'battSoc', 'battTemp'],
                           BATTERY_DIAG_FIELDS, EM_DETAIL_FIELDS) as $c) {
         ensure_column($link, 'dati_instant', $c, 'FLOAT NULL');
+      }
+      foreach (BATTERY_ENERGY_FIELDS as $c) {
+        ensure_column($link, 'dati_instant', $c, 'DOUBLE NULL');
       }
       ensure_column($link, 'dati_instant', 'battTs', 'INT NULL');
       $link->query($sql);

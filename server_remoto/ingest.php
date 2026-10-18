@@ -74,6 +74,11 @@ $fields = [
   'battTempMin', 'battTempInt', 'battTempMos1', 'battTempMos2',
   'battVolt', 'battCurr', 'battCellVMax', 'battCellVMin',
   'battAcV', 'battAcHz', 'battAcW',
+  // kWh counters the pack keeps itself -- lifetime, today, this month -- and
+  // its BMS cycle count. They ride on battTs like the diagnostics -- see
+  // BATTERY_ENERGY_FIELDS.
+  'battChgTot', 'battDisTot', 'battChgDay', 'battDisDay',
+  'battChgMon', 'battDisMon', 'battCycles',
   // Shelly Pro EM-50 clamp detail: voltage, current and power factor per
   // clamp plus the mains frequency. Live row only -- see EM_DETAIL_FIELDS.
   'emPvV', 'emPvA', 'emPvPf', 'emGridV', 'emGridA', 'emGridPf', 'emHz',
