@@ -2250,25 +2250,29 @@ function meteo_build_payload(mysqli $link): array
   $battEff = $battEff[$effDir];
   unset($battEff['last']);
 
-  /* The two efficiency-by-power charts (trend_store.php): 18 bars of 50 W
-   * of AC, 0..900 W, scale 0-100 %. HTML built here because the poller swaps
-   * it in whole (data-live-html). The class the pack is in right now is
-   * drawn full, the others faded. */
+  /* The two efficiency-by-power charts (trend_store.php): bars of AC power
+   * classes (discharge 0..900 W, charge 0..2000 W), scale 0-100 %. HTML built
+   * here because the poller swaps it in whole (data-live-html). The class the
+   * pack is in right now is drawn full, the others faded. */
   $curveNote = static function (array $bins): string {
     $n = count(array_filter($bins, 'is_array'));
     return ($n === 0) ? 'nessuna misura ancora'
       : $n . ($n === 1 ? ' classe' : ' classi') . ' su ' . count($bins) . ' con misure';
   };
-  $curveNow = static fn(bool $active, ?float $w) => ($active && $w !== null)
-    ? (int) floor(abs($w) / BATT_EFF_CURVE_STEP) : -1;
+  $curveNow = static fn(bool $active, ?float $w, int $step) => ($active && $w !== null)
+    ? (int) floor(abs($w) / $step) : -1;
   $emptyCol = static fn(string $range) => '<div class="curve-col" title="' . $range . ' · nessuna misura">'
     . '<span class="curve-val"></span><span class="curve-bar empty"></span></div>';
 
-  $effChart = static function (array $bins, int $now, string $color, string $unit) use ($curveNote, $emptyCol): array {
+  $effChart = static function (string $name, ?float $acNow, bool $active, string $color, string $unit)
+    use ($curveNote, $emptyCol, $curveNow): array {
+    $step = BATT_CURVES[$name]['step'];
+    $bins = batt_curve($name);
+    $now = $curveNow($active, $acNow, $step);
     $html = '';
     foreach ($bins as $i => $b) {
-      $lo = $i * BATT_EFF_CURVE_STEP;
-      $range = $lo . '-' . ($lo + BATT_EFF_CURVE_STEP) . ' W ' . $unit;
+      $lo = $i * $step;
+      $range = $lo . '-' . ($lo + $step) . ' W ' . $unit;
       if (!is_array($b) || !is_numeric($b['eff'] ?? null)) {
         $html .= $emptyCol($range);
         continue;
@@ -2283,10 +2287,31 @@ function meteo_build_payload(mysqli $link): array
   };
 
   $acNow = $d('battAcW');
-  $battCurve = $effChart(batt_curve('eff_dis'), $curveNow($battDischarging, $acNow),
-    'var(--accent-orange)', 'AC');
-  $battCurveChg = $effChart(batt_curve('eff_chg'), $curveNow($battCharging, $acNow),
-    'var(--accent-green)', 'AC');
+  $battCurve = $effChart('eff_dis', $acNow, $battDischarging, 'var(--accent-orange)', 'AC');
+  $battCurveChg = $effChart('eff_chg', $acNow, $battCharging, 'var(--accent-green)', 'AC');
+
+  /* Consumo casa, the last 10 samples of the RAM trend window (one per 20 s
+   * bucket), same formula as the card: pv + grid minus the battery's AC side
+   * (battPower when there is no AC reading, nothing when the battery reading
+   * was refused). Scale 0..the highest of the ten, oldest on the left. */
+  $casaSamples = [];
+  foreach (array_slice(trend_window(), -10) as $r) {
+    if (!isset($r['pvPower'], $r['gridPower'])) {
+      continue;
+    }
+    $w = (float) $r['pvPower'] + (float) $r['gridPower'];
+    if (isset($r['battPower'])) {
+      $w -= isset($r['battAcW']) ? -(float) $r['battAcW'] : (float) $r['battPower'];
+    }
+    $casaSamples[] = ['t' => (int) $r['t'], 'w' => max(0.0, $w)];
+  }
+  $casaBars = '';
+  $casaTop = max(array_merge([1.0], array_column($casaSamples, 'w')));
+  foreach ($casaSamples as $i => $s) {
+    $casaBars .= '<span class="eff-bar" title="' . date('H:i:s', $s['t']) . ' · ' . round($s['w'])
+      . ' W" style="height:' . round(max(4, $s['w'] / $casaTop * 100)) . '%; background:var(--accent-purple)'
+      . ($i === count($casaSamples) - 1 ? '' : '; opacity:0.55') . ';"></span>';
+  }
 
   /* Casa + batteria: what the house and the pack are drawing together.
    *
@@ -2457,6 +2482,8 @@ function meteo_build_payload(mysqli $link): array
       'share' => ($selfShare !== null) ? $selfShare . $selfLabel : '',
       'peak' => fmtW($em_max_casa),
       'loss' => fmtW($battLossW),
+      'bars' => $casaBars,
+      'barsMax' => ($casaSamples === []) ? '' : fmtW($casaTop),
       // Le tre sorgenti del consumo, gia' in percentuale (larghezze pronte per
       // la barra) e in watt (la legenda sotto).
       'mix' => $mix,

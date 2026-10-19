@@ -185,7 +185,9 @@ function trend_series(string $field, ?int $seconds = null): array
  *
  * Charging and discharging keep separate lists, so each card still has its
  * last ten when the pack has switched direction. Idle readings (either power
- * inside the deadband) are not kept: their ratio is noise.
+ * inside the deadband) are not kept: their ratio is noise. Neither are
+ * readings with an efficiency over 100 % (discharge with AC above DC, charge
+ * with DC above AC): the two powers were not read at the same instant.
  *
  * RAM only, like the trend window: losing it costs ten readings.
  */
@@ -201,6 +203,9 @@ function batt_eff_push(int $battTs, float $dc, float $ac): bool
     }
     if (abs($dc) <= BATT_EFF_IDLE_W || abs($ac) <= BATT_EFF_IDLE_W) {
         return false;
+    }
+    if ($dc < 0 ? abs($ac) > abs($dc) : abs($dc) > abs($ac)) {
+        return false;   // efficiency over 100 % (discharge AC / DC, charge DC / AC)
     }
     $fh = @fopen(BATT_EFF_RAM_FILE, 'c+');
     if ($fh === false) {
@@ -284,24 +289,24 @@ function batt_eff_samples(): array
 
 /* ---------- Per power class tables: efficiency ----------
  *
- * Two tables of 18 classes of 50 W each, 0..900 W, one JSON file each in
- * tmpfs:
+ * Two tables of power classes, one JSON file each in tmpfs:
  *
- *   eff_dis   discharge efficiency AC / DC, class by AC delivered
- *   eff_chg   charge efficiency DC / AC,    class by AC drawn from the house
+ *   eff_dis   discharge efficiency AC / DC, class by AC delivered,
+ *             18 classes of 50 W, 0..900 W
+ *   eff_chg   charge efficiency DC / AC,    class by AC drawn from the house,
+ *             20 classes of 100 W, 0..2000 W
  *
  * Only the current value of each class is kept: a new reading replaces it
  * with (stored + latest) / 2, field by field, so the latest reading weighs
  * half and older ones fade. An empty class takes the first reading as it is.
- * A reading at or above 900 W in the class power is not kept.
+ * A reading at or above the table's max in the class power is not kept.
+ * A stored table with a different class count is dropped and starts again.
  *
  * RAM only, in the same tmpfs as the rest: a reboot starts the tables again.
  */
-const BATT_EFF_CURVE_STEP = 50;
-const BATT_EFF_CURVE_MAX = 900;
-const BATT_CURVE_FILES = [
-    'eff_dis' => INSTANT_RAM_DIR . '/batt_eff_curve.json',
-    'eff_chg' => INSTANT_RAM_DIR . '/batt_eff_curve_chg.json',
+const BATT_CURVES = [
+    'eff_dis' => ['file' => INSTANT_RAM_DIR . '/batt_eff_curve.json', 'step' => 50, 'max' => 900],
+    'eff_chg' => ['file' => INSTANT_RAM_DIR . '/batt_eff_curve_chg.json', 'step' => 100, 'max' => 2000],
 ];
 
 /** Route one reading ($dc house-signed, > 0 charging) to its table. */
@@ -332,10 +337,11 @@ function batt_curve_bin($v): ?array
 /** Fold one reading into the class of $classW in table $name. */
 function batt_curve_update(string $name, float $classW, array $vals): bool
 {
-    $file = BATT_CURVE_FILES[$name] ?? null;
-    if ($file === null || $classW <= 0 || $classW >= BATT_EFF_CURVE_MAX || !instant_ram_ready()) {
+    $cfg = BATT_CURVES[$name] ?? null;
+    if ($cfg === null || $classW <= 0 || $classW >= $cfg['max'] || !instant_ram_ready()) {
         return false;
     }
+    $file = $cfg['file'];
     $fh = @fopen($file, 'c+');
     if ($fh === false) {
         return false;
@@ -346,11 +352,11 @@ function batt_curve_update(string $name, float $classW, array $vals): bool
     }
     $raw = stream_get_contents($fh);
     $data = ($raw === false || $raw === '') ? [] : json_decode($raw, true);
-    $n = intdiv(BATT_EFF_CURVE_MAX, BATT_EFF_CURVE_STEP);
+    $n = intdiv($cfg['max'], $cfg['step']);
     $bins = (is_array($data) && is_array($data['bins'] ?? null) && count($data['bins']) === $n)
         ? array_map('batt_curve_bin', $data['bins']) : array_fill(0, $n, null);
 
-    $i = (int) floor($classW / BATT_EFF_CURVE_STEP);
+    $i = (int) floor($classW / $cfg['step']);
     $old = $bins[$i];
     $new = [];
     foreach ($vals as $k => $v) {
@@ -371,13 +377,17 @@ function batt_curve_update(string $name, float $classW, array $vals): bool
     return $json !== false;
 }
 
-/** The 18 classes of table $name (null where empty), lowest first. */
+/** The classes of table $name (null where empty), lowest first. */
 function batt_curve(string $name): array
 {
-    $n = intdiv(BATT_EFF_CURVE_MAX, BATT_EFF_CURVE_STEP);
+    $cfg = BATT_CURVES[$name] ?? null;
+    if ($cfg === null) {
+        return [];
+    }
+    $n = intdiv($cfg['max'], $cfg['step']);
     $empty = array_fill(0, $n, null);
-    $file = BATT_CURVE_FILES[$name] ?? null;
-    if ($file === null || !is_readable($file)) {
+    $file = $cfg['file'];
+    if (!is_readable($file)) {
         return $empty;
     }
     $fh = @fopen($file, 'r');

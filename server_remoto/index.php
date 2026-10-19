@@ -679,9 +679,13 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
       border-bottom: 1px solid var(--text-muted);
     }
 
+    /* L'altezza % della barra e' sull'area sotto il padding: l'etichetta
+       sta nel padding, cosi' non schiaccia la barra e 100 % e' tutta l'area. */
     .curve-col {
       flex: 1;
       height: 100%;
+      box-sizing: border-box;
+      padding-top: 12px;
       display: flex;
       flex-direction: column;
       justify-content: flex-end;
@@ -691,10 +695,15 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
     .curve-val {
       font-size: 0.6rem;
       color: var(--text-muted);
-      line-height: 1.2;
+      line-height: 12px;
+      height: 12px;
+      margin-bottom: -12px;
+      transform: translateY(-12px);
+      flex-shrink: 0;
     }
 
     .curve-bar {
+      flex-shrink: 0;
       width: 100%;
       background: var(--accent-orange);
       border-radius: 2px 2px 0 0;
@@ -1332,6 +1341,11 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
           <div class="card-label">Consumo Casa</div>
           <div class="card-value"><span data-live="casa.val"><?php echo $p['casa']['val']; ?></span><span
               class="card-unit">W</span></div>
+          <!-- Le ultime 10 letture (una ogni 20 s), scala 0-massimo delle dieci. -->
+          <div class="eff-bars" data-live-html="casa.bars"><?php echo $p['casa']['bars'] ?? ''; ?></div>
+          <div style="font-size:0.65rem; color:var(--text-muted); margin-top:2px;">
+            ultime 10 letture · max <span data-live="casa.barsMax"><?php echo $p['casa']['barsMax'] ?? ''; ?></span>
+          </div>
           <div class="flow-state" style="color:var(--accent-purple); <?php echo showStyle($p['casa']['shareShow']); ?>"
             data-live-show="casa.shareShow" data-live="casa.share">
             <?php echo $p['casa']['share']; ?>
@@ -1554,9 +1568,9 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
     <?php endif; ?>
 
     <?php if (!empty($p['battAvailable'])): ?>
-      <!-- 13 quater. Rendimento per classe di potenza AC, 18 classi da 50 W
-           fra 0 e 900 W: in scarica AC / DC per AC erogata, in carica DC / AC
-           per AC prelevata. Ogni classe tiene solo il suo valore attuale,
+      <!-- 13 quater. Rendimento per classe di potenza AC: in scarica AC / DC
+           per AC erogata (18 classi da 50 W, 0-900 W), in carica DC / AC per
+           AC prelevata (20 classi da 100 W, 0-2000 W). Ogni classe tiene solo il suo valore attuale,
            aggiornato a ogni misura come media fra il valore memorizzato e
            l'ultimo (tabelle in /dev/shm, vedi trend_store.php). Piena la
            classe in cui si trova ora il pacco. -->
@@ -1570,13 +1584,17 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
       ?>
       <?php foreach ($curveCards as $ck => [$cLabel, $cNote]): ?>
         <?php if (empty($p[$ck])) continue; ?>
+        <?php
+        $cMax = BATT_CURVES[$ck === 'battCurveChg' ? 'eff_chg' : 'eff_dis']['max'];
+        $cTick = $cMax > 1000 ? 250 : 150;
+        ?>
         <div class="card border-casabatt card-wide" data-card="<?php echo $ck; ?>"
           style="display:flex; flex-direction:column; align-items:center;">
           <div class="card-label"><?php echo $cLabel; ?></div>
           <div class="curve-chart" data-live-html="<?php echo $ck; ?>.bars"><?php echo $p[$ck]['bars']; ?></div>
           <div class="curve-axis">
-            <?php for ($w = 0; $w <= 900; $w += 150): ?>
-              <span style="left:<?php echo round($w / 900 * 100, 2); ?>%;"><?php echo $w; ?></span>
+            <?php for ($w = 0; $w <= $cMax; $w += $cTick): ?>
+              <span style="left:<?php echo round($w / $cMax * 100, 2); ?>%;"><?php echo $w; ?></span>
             <?php endfor; ?>
           </div>
           <div style="font-size:0.7rem; color:var(--text-muted); margin-top:6px;">
@@ -1863,6 +1881,9 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
       function fmtWh(wh) {
         return wh >= 1000 ? (wh / 1000).toFixed(2) + ' kWh' : Math.round(wh) + ' Wh';
       }
+      function whH(wh) {
+        return Math.round(wh) + ' Wh';
+      }
       function renderAllHourly(o) {
         if (!o) return;
         Object.keys(HOURLY_COLORS).forEach(function (ch) {
@@ -1877,7 +1898,7 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
         if (!svg || !d) return;
         var color = HOURLY_COLORS[ch];
         var W = svg.clientWidth || 600, H = 220;
-        var L = 44, R = 8, T = 10, B = 24;
+        var L = 52, R = 8, T = 10, B = 24;
         var pw = W - L - R, ph = H - T - B, slot = pw / 24;
         var max = Math.max.apply(null, d.today.concat(d.yest, [100]));
         // A round axis top: 1, 2 or 5 times a power of ten.
@@ -1898,8 +1919,9 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
         for (var g = 0; g <= 4; g++) {
           var v = top * g / 4, gy = y(v);
           el('line', { x1: L, x2: W - R, y1: gy, y2: gy, stroke: '#e5e7eb', 'stroke-width': 1 });
-          el('text', { x: L - 6, y: gy + 4, 'text-anchor': 'end' },
-            top >= 1000 ? (v / 1000).toFixed(top >= 4000 ? 0 : top >= 2000 ? 1 : 2) + ' kWh' : Math.round(v) + ' Wh');
+          // Per-hour energy always in Wh (= mean W over that hour); only the
+          // daily totals in the legend switch to kWh.
+          el('text', { x: L - 6, y: gy + 4, 'text-anchor': 'end' }, Math.round(v) + ' Wh');
         }
         for (var h = 0; h < 24; h++) {
           var x = L + h * slot;
@@ -1929,11 +1951,11 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
           var hit = el('rect', { x: x, y: T, width: slot, height: ph, fill: 'transparent' });
           var t = document.createElementNS(SVGNS, 'title');
           t.textContent = (h < 10 ? '0' : '') + h + ':00–' + (h < 9 ? '0' : '') + (h + 1) + ':00\n' +
-            'Oggi: ' + (h <= d.hour ? fmtWh(d.today[h]) + (h === d.hour ? ' (in corso)' : '') : '—') +
+            'Oggi: ' + (h <= d.hour ? whH(d.today[h]) + (h === d.hour ? ' (in corso)' : '') : '—') +
             (h <= d.hour ? (d.parts || []).map(function (pt) {
-              return '\n  ' + pt.label + ': ' + fmtWh(pt.vals[h]);
+              return '\n  ' + pt.label + ': ' + whH(pt.vals[h]);
             }).join('') : '') +
-            '\nIeri: ' + fmtWh(d.yest[h]);
+            '\nIeri: ' + whH(d.yest[h]);
           hit.appendChild(t);
         }
         var sum = function (a) { return a.reduce(function (s, v) { return s + v; }, 0); };
