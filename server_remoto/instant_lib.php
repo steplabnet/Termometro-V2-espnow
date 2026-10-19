@@ -2290,21 +2290,11 @@ function meteo_build_payload(mysqli $link): array
   $battCurve = $effChart('eff_dis', $acNow, $battDischarging, 'var(--accent-orange)', 'AC');
   $battCurveChg = $effChart('eff_chg', $acNow, $battCharging, 'var(--accent-green)', 'AC');
 
-  /* Consumo casa, the last 10 samples of the RAM trend window (one per 20 s
-   * bucket), same formula as the card: pv + grid minus the battery's AC side
-   * (battPower when there is no AC reading, nothing when the battery reading
-   * was refused). Scale 0..the highest of the ten, oldest on the left. */
-  $casaSamples = [];
-  foreach (array_slice(trend_window(), -10) as $r) {
-    if (!isset($r['pvPower'], $r['gridPower'])) {
-      continue;
-    }
-    $w = (float) $r['pvPower'] + (float) $r['gridPower'];
-    if (isset($r['battPower'])) {
-      $w -= isset($r['battAcW']) ? -(float) $r['battAcW'] : (float) $r['battPower'];
-    }
-    $casaSamples[] = ['t' => (int) $r['t'], 'w' => max(0.0, $w)];
-  }
+  /* Consumo casa, the last 10 readings as they arrived (casa_push in
+   * trend_store.php). Scale 0..the highest of the ten, oldest on the left. */
+  $casaSamples = array_values(array_filter(casa_samples(),
+    static fn($s) => is_array($s) && is_numeric($s['t'] ?? null) && is_numeric($s['w'] ?? null)));
+  $casaSamples = array_map(static fn($s) => ['t' => (int) $s['t'], 'w' => (float) $s['w']], $casaSamples);
   $casaBars = '';
   $casaTop = max(array_merge([1.0], array_column($casaSamples, 'w')));
   foreach ($casaSamples as $i => $s) {

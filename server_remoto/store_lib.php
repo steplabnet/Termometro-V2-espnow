@@ -385,6 +385,17 @@ function meteo_store_reading(mysqli $link, array $r): array
     'battTemp' => $battTemp,
   ]), $now);
 
+  // Every reading's house load, for the bar strip of the Consumo Casa card
+  // (casa_push in trend_store.php). Same formula as the card: pv + grid minus
+  // the battery's AC side, battPower when there is no AC reading.
+  if ($pvPower !== null && $gridPower !== null) {
+    $casaW = $pvPower + $gridPower;
+    if ($battPower !== null) {
+      $casaW -= isset($battLive['battAcW']) ? -$battLive['battAcW'] : $battPower;
+    }
+    casa_push($now, max(0.0, $casaW));
+  }
+
   // Every distinct battery reading, for the two efficiency cards (see
   // batt_eff_push in trend_store.php). Silent on failure, like trend_push.
   if ($battTs !== null && $battPower !== null && isset($battLive['battAcW'])) {

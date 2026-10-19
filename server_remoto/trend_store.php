@@ -175,6 +175,59 @@ function trend_series(string $field, ?int $seconds = null): array
     return $out;
 }
 
+/* ---------- Consumo casa: the last readings, one by one ----------
+ *
+ * The bar strip of the Consumo Casa card. Not taken from the trend window:
+ * that keeps one sample per 20 s bucket, so readings in between were
+ * overwritten and the strip missed most of what the card's number showed.
+ * Here every reading is appended. RAM only, like the rest.
+ */
+const CASA_RAM_FILE = INSTANT_RAM_DIR . '/casa_last.json';
+const CASA_SAMPLES = 10;
+
+/** Append one house-load reading (W) taken at $ts. */
+function casa_push(int $ts, float $w): bool
+{
+    if (!instant_ram_ready()) {
+        return false;
+    }
+    $fh = @fopen(CASA_RAM_FILE, 'c+');
+    if ($fh === false) {
+        return false;
+    }
+    if (!flock($fh, LOCK_EX)) {
+        fclose($fh);
+        return false;
+    }
+    $raw = stream_get_contents($fh);
+    $rows = ($raw === false || $raw === '') ? [] : json_decode($raw, true);
+    $rows = is_array($rows) ? $rows : [];
+    $last = $rows === [] ? null : $rows[count($rows) - 1];
+    // The bridge retrying the same message: once is enough.
+    if (!(is_array($last) && (int) ($last['t'] ?? 0) === $ts && (float) ($last['w'] ?? -1) === round($w, 1))) {
+        $rows[] = ['t' => $ts, 'w' => round($w, 1)];
+        $rows = array_slice($rows, -CASA_SAMPLES);
+        $json = json_encode($rows);
+        if ($json !== false) {
+            ftruncate($fh, 0);
+            rewind($fh);
+            fwrite($fh, $json);
+            fflush($fh);
+        }
+    }
+    flock($fh, LOCK_UN);
+    fclose($fh);
+    return true;
+}
+
+/** The last CASA_SAMPLES readings, oldest first: [['t' => ts, 'w' => W], ...]. */
+function casa_samples(): array
+{
+    $raw = is_readable(CASA_RAM_FILE) ? @file_get_contents(CASA_RAM_FILE) : false;
+    $rows = ($raw === false || $raw === '') ? [] : json_decode($raw, true);
+    return is_array($rows) ? $rows : [];
+}
+
 /* ---------- Inverter efficiency: the last battery readings, per direction ----------
  *
  * The efficiency cards average the last BATT_EFF_SAMPLES readings the battery

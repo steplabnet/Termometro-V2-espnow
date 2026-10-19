@@ -1341,7 +1341,7 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
           <div class="card-label">Consumo Casa</div>
           <div class="card-value"><span data-live="casa.val"><?php echo $p['casa']['val']; ?></span><span
               class="card-unit">W</span></div>
-          <!-- Le ultime 10 letture (una ogni 20 s), scala 0-massimo delle dieci. -->
+          <!-- Le ultime 10 letture, una per messaggio, scala 0-massimo delle dieci. -->
           <div class="eff-bars" data-live-html="casa.bars"><?php echo $p['casa']['bars'] ?? ''; ?></div>
           <div style="font-size:0.65rem; color:var(--text-muted); margin-top:2px;">
             ultime 10 letture · max <span data-live="casa.barsMax"><?php echo $p['casa']['barsMax'] ?? ''; ?></span>
