@@ -16,6 +16,8 @@ Three layers, in priority order:
                  here from the history of commands (see the learning engine).
                  When bands overlap, the LAST one wins; learned bands are ordered
                  after manual ones, so learning adapts the manual baseline.
+                 crono.php can also correct the learned value of chosen hours
+                 by hand (slot_corrections); later commands keep adapting it.
   3. Default   — the antifreeze target, used outside any band.
 
 "Off" — an OFF command or the global "off" mode — does not cut the heater: it
@@ -158,6 +160,19 @@ def ensure_crono_schema():
             permanent INTEGER NOT NULL DEFAULT 0,
             processed INTEGER NOT NULL DEFAULT 0
         )""")
+        # Hand corrections of the learned model from crono.php: whole hours of
+        # one weekday set to a target, to off, or forgotten.
+        con.execute("""CREATE TABLE IF NOT EXISTS slot_corrections (
+            id        INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts        TEXT,             -- local 'YYYY-MM-DD HH:MM:SS' when entered
+            dow       INTEGER NOT NULL, -- 0=Mon … 6=Sun
+            hours     INTEGER NOT NULL, -- bit h set ⇒ hour h (0–23)
+            target    REAL,             -- for type 'set'
+            processed INTEGER NOT NULL DEFAULT 0,
+            type      TEXT              -- 'set' | 'off' | 'forget' (NULL: set, or forget if no target)
+        )""")
+        if "type" not in [r[1] for r in con.execute("PRAGMA table_info(slot_corrections)")]:
+            con.execute("ALTER TABLE slot_corrections ADD COLUMN type TEXT")
         # Per-weekday/per-slot EMA model the learned bands are rebuilt from.
         con.execute("""CREATE TABLE IF NOT EXISTS slots (
             dow       INTEGER NOT NULL,
@@ -749,6 +764,54 @@ def process_web_commands(con, settings):
     return True
 
 
+def process_slot_corrections(con, settings):
+    """Apply hand corrections queued by crono.php to the learned model: the
+    hour's slots take the target as their learned value ('set'), become an
+    "off" preference ('off') or are dropped ('forget'). Corrected slots then
+    keep adapting to later commands like any learned slot. Applied even with
+    learning off, since the user asked for it explicitly. Returns True if any
+    were found."""
+    try:
+        rows = con.execute(
+            "SELECT id, dow, hours, target, type FROM slot_corrections WHERE processed = 0 ORDER BY id"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return False
+    if not rows:
+        return False
+
+    for r in rows:
+        con.execute("UPDATE slot_corrections SET processed = 1 WHERE id = ?", (r["id"],))
+        dow, target = int(r["dow"]), to_float(r["target"])
+        kind = r["type"] or ("set" if target is not None else "forget")
+        if not 0 <= dow <= 6 or kind not in ("set", "off", "forget") or (kind == "set" and target is None):
+            continue
+        slots = [h * (60 // SLOT_MIN) + q for h in range(24) if int(r["hours"]) & (1 << h)
+                 for q in range(60 // SLOT_MIN)]
+        for slot in slots:
+            if kind == "forget":
+                con.execute("DELETE FROM slots WHERE dow = ? AND slot = ?", (dow, slot))
+            elif kind == "off":
+                # Keep the slot's learned temperature: only the off preference changes.
+                con.execute(
+                    "INSERT INTO slots (dow, slot, target, off_score, weight) VALUES (?, ?, NULL, 1, ?) "
+                    "ON CONFLICT(dow, slot) DO UPDATE SET off_score = 1, weight = MAX(weight, excluded.weight)",
+                    (dow, slot, MIN_WEIGHT),
+                )
+            else:
+                con.execute(
+                    "INSERT INTO slots (dow, slot, target, off_score, weight) VALUES (?, ?, ?, 0, ?) "
+                    "ON CONFLICT(dow, slot) DO UPDATE SET target = excluded.target, off_score = 0, "
+                    "weight = MAX(weight, excluded.weight)",
+                    (dow, slot, target, MIN_WEIGHT),
+                )
+        what = {"forget": "forgotten", "off": "set to off"}.get(kind) or f"set to {target:.1f}°C"
+        log(f"[web] learned slots {what}: dow {dow}, hours mask {int(r['hours']):#08x}")
+    con.commit()
+    relearn_bands(con, settings)
+    return True
+
+
 def _slot_to_hhmm(slot):
     m = slot * SLOT_MIN
     return f"{m // 60:02d}:{m % 60:02d}"
@@ -1122,6 +1185,7 @@ def main():
             # A web command may have set an override or a new learned band:
             # publish at once instead of waiting for a heater/target change.
             web = process_web_commands(con, settings)
+            web = process_slot_corrections(con, settings) or web
             run_control(con, settings, client, ctl, force_publish=web)
             con.close()
         except Exception as e:

@@ -14,12 +14,15 @@
 //   ufficio   latest office reading {temp, heater, ...} or null
 //   today     today's enabled bands [{time_from, time_to, target, origin}]
 //   plan      24 × {h, target, src}      actual  24 × null|{temp, on}
+//   week      7 × plan, Monday first (for the per-day hour editor)
+//   pending   hand corrections not yet applied by the watcher
 //   runtime   null | {today, week, prev, month, year (ON seconds), since,
 //             days: 7 × {day, dow, dom, cur, prev}}  (prev = same weekday a week before)
 //   now      {hm, hour, dow}            (Pi local time, dow 1 = Monday)
 
 const DAY_LABELS = ['Lun', 'Mar', 'Mer', 'Gio', 'Ven', 'Sab', 'Dom'];
 const MODE_LABELS = ['auto' => 'Auto', 'manual' => 'Manuale', 'off' => 'Spento'];
+const SRC_LABELS = ['manual' => 'Manuale', 'learned' => 'Appreso', 'default' => 'Antigelo'];
 const MORNING_HOUR = 6;       // matches crono_watcher.py: "fino a domani" ends here
 
 function fmt_t($v) {
@@ -41,6 +44,7 @@ function render_crono_page(array $snap, array $opt) {
   $override = $snap['override'] ?? null;
   $today    = $snap['today'] ?? [];
   $plan     = $snap['plan'] ?? [];
+  $week     = $snap['week'] ?? [];
   $actual   = $snap['actual'] ?? array_fill(0, 24, null);
   $runtime  = $snap['runtime'] ?? null;
   $now      = ($snap['now'] ?? []) + ['hm' => date('H:i'), 'hour' => (int)date('G'), 'dow' => (int)date('N')];
@@ -214,6 +218,24 @@ function render_crono_page(array $snap, array $opt) {
     .tbl th { text-align: left; color: var(--faint); font-size: .72rem; text-transform: uppercase; padding: 6px 4px; }
     .tbl td { padding: 6px 4px; border-top: 1px solid var(--line); }
 
+    /* Per-day hour editor */
+    .chips.days { grid-template-columns: repeat(7, 1fr); gap: 6px; }
+    .chips.days button { min-height: 44px; font-size: .85rem; padding: 0; }
+    .hgrid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 6px; }
+    .hgrid button { border: 2px solid transparent; background: var(--chip); border-radius: 10px; min-height: 50px;
+                    padding: 4px 0 4px 4px; display: flex; flex-direction: column; align-items: center; justify-content: center;
+                    font-variant-numeric: tabular-nums; box-shadow: inset 4px 0 0 var(--s-default); }
+    .hgrid button.manual  { box-shadow: inset 4px 0 0 var(--s-manual); }
+    .hgrid button.learned { box-shadow: inset 4px 0 0 var(--s-learned); }
+    .hgrid .hh { font-size: .7rem; color: var(--muted); }
+    .hgrid .hv { font-size: .95rem; font-weight: 700; }
+    .hgrid button.now .hh { color: var(--accent); font-weight: 700; }
+    .hgrid button.sel { border-color: var(--accent); background: var(--accent-soft); }
+    .links { display: flex; gap: 16px; margin-top: 8px; font-size: .85rem; }
+    .links button { border: 0; background: none; color: var(--accent); font-weight: 600; padding: 10px 0; }
+    .links button:disabled { color: var(--faint); }
+    .btn:disabled { opacity: .45; }
+
     /* Heater runtime report */
     .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
     .stat { background: var(--chip); border-radius: 12px; padding: 10px 6px; text-align: center; }
@@ -375,7 +397,7 @@ function render_crono_page(array $snap, array $opt) {
               <tr>
                 <td><?= sprintf('%02d:00', $p['h']) ?></td>
                 <td><?= fmt_t($p['target']) ?>°</td>
-                <td><?= ['manual' => 'Manuale', 'learned' => 'Appreso', 'default' => 'Antigelo'][$p['src']] ?? '' ?></td>
+                <td><?= SRC_LABELS[$p['src']] ?? '' ?></td>
                 <td><?= $a ? fmt_t($a['temp']) . '°' : '—' ?></td>
                 <td><?= $a ? (int)$a['on'] . '%' : '—' ?></td>
               </tr>
@@ -403,6 +425,53 @@ function render_crono_page(array $snap, array $opt) {
       </ul>
     <?php endif; ?>
   </div>
+
+  <!-- ── Hand corrections of the learned hours, per weekday ── -->
+  <?php if (count($week) === 7): $todayIdx = max(1, min(7, (int)$now['dow'])) - 1; ?>
+  <div class="card">
+    <h2>Setpoint orari per giorno</h2>
+    <!-- Same controls as "Comando temporaneo": the duration chips become days and hours. -->
+    <form method="post" id="fx-form">
+      <input type="hidden" name="action" value="learn">
+      <input type="hidden" name="type" value="set">
+      <input type="hidden" name="days" value="<?= 1 << $todayIdx ?>">
+      <input type="hidden" name="hours" value="0">
+      <div class="stepper" data-min="5" data-max="30" data-step="0.5">
+        <button type="button" data-d="-1" aria-label="Diminuisci">−</button>
+        <div class="val"><span>19</span><small>°C</small></div>
+        <button type="button" data-d="1" aria-label="Aumenta">+</button>
+        <input type="hidden" name="target" value="19">
+      </div>
+      <div class="row-label">Giorni</div>
+      <div class="chips days" id="fx-days">
+        <?php foreach (DAY_LABELS as $i => $lbl): ?>
+          <button type="button" data-days="<?= 1 << $i ?>" class="<?= $i === $todayIdx ? 'active' : '' ?>"><?= $lbl ?></button>
+        <?php endforeach; ?>
+      </div>
+      <div class="chips" id="fx-days-quick" style="margin-top: 8px">
+        <button type="button" data-days="31" class="wide">Lun–Ven</button>
+        <button type="button" data-days="96">Sab–Dom</button>
+        <button type="button" data-days="127">Tutti</button>
+      </div>
+      <div class="row-label">Ore <span id="fx-ref"></span></div>
+      <div class="hgrid" id="fx-grid"></div>
+      <div class="chips" id="fx-hours-quick" style="margin-top: 8px">
+        <button type="button" data-hours="all" class="wide">Tutte</button>
+        <button type="button" data-hours="none" class="wide">Nessuna</button>
+      </div>
+      <p class="note" id="fx-hint"></p>
+      <div class="btn-pair">
+        <button type="submit" class="btn primary" data-type="set" disabled>Scalda a <span class="echo">19</span>°C</button>
+        <button type="submit" class="btn ghost" data-type="off" disabled>Spegni · <?= fmt_t($settings['default_target']) ?>°</button>
+      </div>
+      <div class="links" style="justify-content: center">
+        <button type="submit" data-type="forget" disabled>Dimentica l'appreso di queste ore</button>
+      </div>
+      <p class="note" id="fx-pending" <?= !empty($snap['pending']) ? '' : 'hidden' ?>>Correzione in corso: il
+        programma si aggiorna entro ~30 s, ricarica la pagina.</p>
+    </form>
+  </div>
+  <?php endif; ?>
 
   <!-- ── Heater runtime ── -->
   <?php if ($runtime):
@@ -521,7 +590,7 @@ function render_crono_page(array $snap, array $opt) {
       const PLAN = <?= json_encode(array_values($plan)) ?>;
       const ACT = <?= json_encode(array_values($actual)) ?>;
       const NOW_H = <?= (int)$now['hour'] ?>;
-      const SRC = { manual: 'Manuale', learned: 'Appreso', default: 'Antigelo' };
+      const SRC = <?= json_encode(SRC_LABELS) ?>;
       const W = 360, H = 190, L = 24, R = 4, T = 8, B = 20;
       const pw = W - L - R, ph = H - T - B, slot = pw / 24, bw = slot - 2;
 
@@ -604,6 +673,83 @@ function render_crono_page(array $snap, array $opt) {
       }
       svg.addEventListener('pointerleave', function (e) { if (e.pointerType === 'mouse') hide(); });
       document.addEventListener('click', hide);
+    })();
+
+    // ── Per-day hour editor: pick days and hours, then heat / off / forget ──
+    (function () {
+      const form = document.getElementById('fx-form');
+      if (!form) return;
+      const WEEK = <?= json_encode(array_values($week)) ?>;
+      const SRC = <?= json_encode(SRC_LABELS) ?>;
+      const DAYS = <?= json_encode(DAY_LABELS) ?>;
+      const TODAY = <?= (int)$now['dow'] ?>, NOW_H = <?= (int)$now['hour'] ?>;
+      const grid = document.getElementById('fx-grid');
+      const dayChips = document.querySelectorAll('#fx-days button');
+      const btns = form.querySelectorAll('button[type="submit"]');
+      // dow: the day whose values the hour grid shows (last day tapped that is selected).
+      let days = +form.elements['days'].value, mask = 0, dow = TODAY;
+
+      function bits(m, n) { const out = []; for (let i = 0; i < n; i++) if (m & (1 << i)) out.push(i); return out; }
+      function sync() {
+        form.elements['days'].value = days;
+        form.elements['hours'].value = mask;
+        dayChips.forEach(function (b) { b.classList.toggle('active', !!(days & +b.dataset.days)); });
+        Array.prototype.forEach.call(grid.children, function (b, h) { b.classList.toggle('sel', !!(mask & (1 << h))); });
+        const anyLearned = bits(days, 7).some(function (d) {
+          return bits(mask, 24).some(function (h) { return WEEK[d][h].src === 'learned'; });
+        });
+        btns.forEach(function (b) { b.disabled = b.dataset.type === 'forget' ? !anyLearned : !(days && mask); });
+        const nd = bits(days, 7).length, nh = bits(mask, 24).length;
+        document.getElementById('fx-hint').textContent = !(nd && nh)
+          ? 'Scegli giorni e ore: diventano il valore appreso, che i comandi successivi continuano ad adattare.'
+          : nh + (nh === 1 ? ' ora' : ' ore') + ' × ' + nd + (nd === 1 ? ' giorno' : ' giorni') +
+            ': diventa il valore appreso, i comandi successivi continuano ad adattarlo.';
+      }
+      function draw() {
+        if (!(days & (1 << (dow - 1)))) dow = days ? bits(days, 7)[0] + 1 : TODAY;
+        document.getElementById('fx-ref').textContent = '· valori di ' + DAYS[dow - 1];
+        grid.innerHTML = '';
+        WEEK[dow - 1].forEach(function (p) {
+          const b = document.createElement('button');
+          const hh = String(p.h).padStart(2, '0');
+          b.type = 'button';
+          b.className = p.src + (dow === TODAY && p.h === NOW_H ? ' now' : '');
+          b.title = hh + ':00 · ' + p.target.toFixed(1) + '° · ' + SRC[p.src];
+          b.innerHTML = '<span class="hh">' + hh + '</span><span class="hv">' + (+p.target.toFixed(1)) + '°</span>';
+          grid.appendChild(b);
+        });
+        sync();
+      }
+      grid.addEventListener('click', function (e) {
+        const b = e.target.closest('button');
+        if (!b) return;
+        mask ^= 1 << Array.prototype.indexOf.call(grid.children, b);
+        sync();
+        if (navigator.vibrate) navigator.vibrate(8);
+      });
+      document.getElementById('fx-days').addEventListener('click', function (e) {
+        const b = e.target.closest('button[data-days]');
+        if (!b) return;
+        days ^= +b.dataset.days;
+        if (days & +b.dataset.days) dow = bits(+b.dataset.days, 7)[0] + 1;
+        draw();
+      });
+      document.getElementById('fx-days-quick').addEventListener('click', function (e) {
+        const b = e.target.closest('button[data-days]');
+        if (!b) return;
+        days = +b.dataset.days;
+        draw();
+      });
+      document.getElementById('fx-hours-quick').addEventListener('click', function (e) {
+        const b = e.target.closest('button[data-hours]');
+        if (!b) return;
+        mask = b.dataset.hours === 'all' ? 0xFFFFFF : 0;
+        sync();
+      });
+      form.addEventListener('submit', function (e) {
+        if (e.submitter && e.submitter.dataset.type) form.elements['type'].value = e.submitter.dataset.type;
+      });
+      draw();
     })();
 
     // ── Live status polling ──

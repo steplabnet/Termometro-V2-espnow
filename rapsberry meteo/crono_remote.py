@@ -48,8 +48,9 @@ CMD_MAX_AGE = 120          # drop commands older than this (delayed by an outage
 CMD_MAX_SKEW = 60          # ...or stamped this far in the future
 
 # Form fields a remote command may carry; anything else is dropped.
-ACTIONS = {"mode", "manual_target", "default_target", "command", "cancel_override"}
-FIELDS = ("mode", "target", "type", "dur")
+ACTIONS = {"mode", "manual_target", "default_target", "command", "cancel_override",
+           "learn"}
+FIELDS = ("mode", "target", "type", "dur", "days", "hours")
 
 commands: "queue.Queue[dict]" = queue.Queue()
 seen_ids = deque(maxlen=200)

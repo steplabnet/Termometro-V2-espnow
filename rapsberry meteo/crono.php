@@ -1,6 +1,7 @@
 <?php
-// Mobile-first control page for the office thermostat. Quick actions only —
-// the weekly schedule is still edited on cronotermostato.php. Reads/writes the
+// Mobile-first control page for the office thermostat. Quick actions and hand
+// corrections of the learned hours — the manual bands are still edited on
+// cronotermostato.php. Reads/writes the
 // same crono.db that crono_watcher.py polls (~30s), so every change here is
 // picked up on the watcher's next cycle.
 //
@@ -35,6 +36,17 @@ function open_db() {
     ts TEXT, type TEXT, target REAL, minutes INTEGER,
     permanent INTEGER NOT NULL DEFAULT 0, processed INTEGER NOT NULL DEFAULT 0
   )");
+  // Hand corrections of the learned model, applied by crono_watcher.py
+  // (dow 0 = Monday, hours = 24-bit mask, type set | off | forget).
+  $db->exec("CREATE TABLE IF NOT EXISTS slot_corrections (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT, dow INTEGER NOT NULL, hours INTEGER NOT NULL, target REAL,
+    processed INTEGER NOT NULL DEFAULT 0, type TEXT
+  )");
+  $cols = [];
+  $res = $db->query('PRAGMA table_info(slot_corrections)');
+  while ($c = $res->fetchArray(SQLITE3_ASSOC)) $cols[$c['name']] = true;
+  if (!isset($cols['type'])) $db->exec('ALTER TABLE slot_corrections ADD COLUMN type TEXT');
   return $db;
 }
 
@@ -84,12 +96,13 @@ function hm_to_min($s) {
   return (int)($p[0] ?? 0) * 60 + (int)($p[1] ?? 0);
 }
 
-// Hourly setpoints for today, evaluated like crono_watcher.active_target():
-// manual bands then learned ones, last match wins, default outside any band.
-// Each hour is sampled at its four quarter midpoints and the value holding
-// most of the hour is kept, so a band starting at :30 doesn't flip the bar.
-function hourly_plan($db, $default) {
-  $bit = 1 << ((int)date('N') - 1);
+// Hourly setpoints for a weekday (1 = Monday, default today), evaluated like
+// crono_watcher.active_target(): manual bands then learned ones, last match
+// wins, default outside any band. Each hour is sampled at its four quarter
+// midpoints and the value holding most of the hour is kept, so a band starting
+// at :30 doesn't flip the bar.
+function hourly_plan($db, $default, $dow = null) {
+  $bit = 1 << ((int)($dow ?? date('N')) - 1);
   $bands = [];
   $res = @$db->query("SELECT time_from, time_to, target, origin FROM bands
                       WHERE enabled = 1 AND (days_mask & $bit)
@@ -116,6 +129,25 @@ function hourly_plan($db, $default) {
     $plan[] = ['h' => $h, 'target' => (float)$tgt, 'src' => $src];
   }
   return $plan;
+}
+
+// Hours (0–23) set in a 24-bit mask posted by the page.
+function mask_hours($raw) {
+  $mask = ctype_digit((string)$raw) ? (int)$raw & 0xFFFFFF : 0;
+  $hours = [];
+  for ($h = 0; $h < 24; $h++) if ($mask & (1 << $h)) $hours[] = $h;
+  return $hours;
+}
+
+// "08–12, 15–16" for the flash message.
+function hours_label(array $hours) {
+  $runs = [];
+  foreach ($hours as $h) {
+    $last = count($runs) - 1;
+    if ($last >= 0 && $runs[$last][1] === $h - 1) $runs[$last][1] = $h;
+    else $runs[] = [$h, $h];
+  }
+  return implode(', ', array_map(function ($r) { return sprintf('%02d–%02d', $r[0], $r[1] + 1); }, $runs));
 }
 
 // Today's office readings averaged per local hour (meteo.db stores UTC ISO).
@@ -203,6 +235,8 @@ function build_snapshot() {
                       WHERE enabled = 1 AND (days_mask & $bit)
                       ORDER BY time_from, CASE WHEN origin = 'learned' THEN 1 ELSE 0 END");
   if ($res) while ($b = $res->fetchArray(SQLITE3_ASSOC)) $today[] = $b;
+  $week = [];
+  for ($d = 1; $d <= 7; $d++) $week[] = hourly_plan($db, $settings['default_target'], $d);
   $uff = latest_ufficio();
   return [
     'settings' => [
@@ -216,7 +250,9 @@ function build_snapshot() {
     'ufficio'  => $uff ? ['temp' => $uff['temp'] ?? null, 'heater' => $uff['heater'] ?? null,
                           'timestamp' => $uff['timestamp'] ?? null] : null,
     'today'    => $today,
-    'plan'     => hourly_plan($db, $settings['default_target']),
+    'plan'     => $week[(int)date('N') - 1],
+    'week'     => $week,
+    'pending'  => (int)$db->querySingle('SELECT COUNT(*) FROM slot_corrections WHERE processed = 0'),
     'actual'   => hourly_actual(),
     'runtime'  => heater_report($db),
     'now'      => ['hm' => date('H:i'), 'hour' => (int)date('G'), 'dow' => (int)date('N')],
@@ -317,6 +353,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       $msg = $perm
         ? "$what memorizzato nel programma di " . DAY_LABELS[(int)date('N') - 1] . ' da ' . date('H:i')
         : "$what fino alle " . date('H:i', $end) . ($learning ? ' · lo imparo' : '');
+
+    } elseif ($action === 'learn') {
+      // Correct the learned value of some hours on some weekdays: heat to a
+      // target, off (antigelo), or forget. Queued for crono_watcher.py, which
+      // owns the learning model; later commands keep adapting these hours.
+      $dmask = ctype_digit((string)($_POST['days'] ?? '')) ? (int)$_POST['days'] & 127 : 0;
+      $dows = array_values(array_filter(range(0, 6), function ($d) use ($dmask) { return $dmask & (1 << $d); }));
+      if (!$dows) throw new RuntimeException('Nessun giorno selezionato');
+      $hours = mask_hours($_POST['hours'] ?? '');
+      if (!$hours) throw new RuntimeException('Nessuna ora selezionata');
+      $type = in_array($_POST['type'] ?? '', ['set', 'off', 'forget'], true) ? $_POST['type'] : 'set';
+      $t = $type === 'set' ? clamp_target($_POST['target'] ?? '', 19.0) : null;
+      $hmask = array_sum(array_map(function ($h) { return 1 << $h; }, $hours));
+
+      $db->exec('BEGIN');
+      $q = $db->prepare("INSERT INTO slot_corrections (ts, dow, hours, target, type) VALUES (:ts, :d, :h, :t, :ty)");
+      foreach ($dows as $d) {
+        $q->bindValue(':ts', date('Y-m-d H:i:s'), SQLITE3_TEXT);
+        $q->bindValue(':d', $d, SQLITE3_INTEGER);
+        $q->bindValue(':h', $hmask, SQLITE3_INTEGER);
+        $q->bindValue(':t', $t, $t === null ? SQLITE3_NULL : SQLITE3_FLOAT);
+        $q->bindValue(':ty', $type, SQLITE3_TEXT);
+        $q->execute();
+        $q->reset();
+      }
+      $db->exec('COMMIT');
+      $when = implode(', ', array_map(function ($d) { return DAY_LABELS[$d]; }, $dows)) . ' ' . hours_label($hours);
+      $what = ['set' => 'appreso ' . fmt_t($t) . '°C', 'off' => 'appreso antigelo ' . fmt_t($settings['default_target']) . '°C',
+               'forget' => 'appreso dimenticato'][$type];
+      $msg = "$when: $what · il programma si aggiorna entro ~30 s";
 
     } elseif ($action === 'cancel_override') {
       $db->exec('DELETE FROM override WHERE id = 1');

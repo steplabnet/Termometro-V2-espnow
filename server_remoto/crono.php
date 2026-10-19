@@ -136,7 +136,7 @@ if (($_GET['api'] ?? '') === 'status') {
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   $id = bin2hex(random_bytes(12));
   $cmd = ['id' => $id, 'ts' => time(), 'action' => (string)($_POST['action'] ?? '')];
-  foreach (['mode', 'target', 'type', 'dur'] as $k) {
+  foreach (['mode', 'target', 'type', 'dur', 'days', 'hours'] as $k) {
     if (isset($_POST[$k])) $cmd[$k] = substr((string)$_POST[$k], 0, 16);
   }
   try {
