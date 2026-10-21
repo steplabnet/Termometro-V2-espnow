@@ -395,6 +395,10 @@ function meteo_store_reading(mysqli $link, array $r): array
     }
     casa_push($now, max(0.0, $casaW));
   }
+  // And the PV reading itself, for the same strip on the Produzione card.
+  if ($pvPower !== null) {
+    pv_push($now, max(0.0, $pvPower));
+  }
 
   // Every distinct battery reading, for the two efficiency cards (see
   // batt_eff_push in trend_store.php). Silent on failure, like trend_push.

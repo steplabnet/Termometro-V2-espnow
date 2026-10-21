@@ -337,13 +337,16 @@ date_default_timezone_set('Europe/Rome');
             datasets: [
               {
                 type: 'bar', label: 'Pioggia (mm)', yAxisID: 'mm',
-                data: h.precipitation.slice(r[0], r[1]),
+                // Open-Meteo stamps rain with the END of its hour (12:00 =
+                // 11-12); shifted by one so the bar at 11:00 is 11-12, as on
+                // the Pioggia Prevista card. Temperature/wind are instants.
+                data: h.precipitation.slice(r[0] + 1, r[1] + 1),
                 backgroundColor: 'rgba(59, 130, 246, 0.45)',
                 borderColor: 'rgba(59, 130, 246, 0.9)', borderWidth: 1, order: 3
               },
               {
                 type: 'line', label: 'Probabilità (%)', yAxisID: 'pct',
-                data: h.precipitation_probability.slice(r[0], r[1]),
+                data: h.precipitation_probability.slice(r[0] + 1, r[1] + 1),
                 borderColor: '#14b8a6', backgroundColor: 'rgba(20, 184, 166, 0.10)',
                 borderWidth: 1.5, borderDash: [4, 3], pointRadius: 0, tension: 0.3,
                 fill: true, order: 2

@@ -320,6 +320,53 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
       margin-top: 1px;
     }
 
+    /* While it is raining the 90' total gives way to twelve hourly bars:
+       sized to sit where the big .card-value number normally is. */
+    .rain-chart {
+      width: 100%;
+      margin-top: 4px;
+    }
+
+    .rain-bars {
+      display: flex;
+      align-items: flex-end;
+      gap: 2px;
+      height: 44px;
+      border-bottom: 1px solid #e5e7eb;
+    }
+
+    .rain-bar {
+      flex: 1;
+      min-width: 0;
+      border-radius: 2px 2px 0 0;
+      background: var(--accent-blue);
+    }
+
+    .rain-hours {
+      display: flex;
+      gap: 2px;
+      margin-top: 2px;
+    }
+
+    .rain-hours span {
+      flex: 1;
+      min-width: 0;
+      font-size: 0.5rem;
+      color: #9ca3af;
+      font-variant-numeric: tabular-nums;
+      text-align: center;
+      white-space: nowrap;
+      overflow: visible;
+      letter-spacing: -0.02em;
+    }
+
+    .rain-chart-caption {
+      font-size: 0.68rem;
+      color: var(--text-muted);
+      margin-top: 2px;
+      font-variant-numeric: tabular-nums;
+    }
+
     .border-power {
       border-top-color: var(--accent-orange);
     }
@@ -508,6 +555,30 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
 
     .hourly-block {
       width: 100%;
+    }
+
+    .hourly-totals-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(min(100%, 300px), 1fr));
+      gap: 12px 24px;
+      margin-top: 14px;
+    }
+
+    .hourly-totals-title {
+      font-size: 0.8rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      margin-bottom: 4px;
+    }
+
+    .hourly-totals {
+      width: 100%;
+      display: block;
+    }
+
+    .hourly-totals text {
+      font-size: 12px;
+      fill: var(--text-muted);
     }
 
     /* Arrivati dal link di Consumo casa: un lampo per dire quale grafico. */
@@ -897,7 +968,15 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
           </g>
         </svg>
         <div class="card-label">Pioggia Prevista</div>
-        <div class="card-value"><span id="rain-total">&mdash;</span><span class="card-unit">mm/90'</span></div>
+        <div class="card-value" id="rain-value"><span id="rain-total">&mdash;</span><span class="card-unit">mm/90'</span></div>
+
+        <!-- Shown instead of the 90' total while it is actually raining:
+             mm/h for each of the next 12 hours, built by the nowcast script. -->
+        <div id="rain-chart" class="rain-chart" style="display:none;">
+          <div class="rain-bars" id="rain-bars"></div>
+          <div class="rain-hours" id="rain-hours"></div>
+          <div class="rain-chart-caption" id="rain-chart-caption"></div>
+        </div>
 
         <div id="rain-summary"
           style="font-weight:800; font-size:0.75rem; color:var(--text-muted); margin-top:5px; text-transform:uppercase;">
@@ -912,7 +991,7 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
              the current one plus the next 90 minutes. Labels are filled in
              with the bucket's own clock time, so the card never implies a
              resolution the API does not have. -->
-        <div class="rain-row">
+        <div class="rain-row" id="rain-row">
           <div class="rain-item"><span class="rain-when" data-rain-when="0">&nbsp;</span><span class="rain-mm"
               data-rain="0">&mdash;</span><span class="rain-prob" data-rain-prob="0"></span></div>
           <div class="rain-item"><span class="rain-when" data-rain-when="1">&nbsp;</span><span class="rain-mm"
@@ -1094,6 +1173,11 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
         <div class="card-label">Produzione Fotovoltaico</div>
         <div class="card-value"><span data-live="pv.val"><?php echo $p['pv']['val']; ?></span><span
             class="card-unit">W</span></div>
+        <!-- Le ultime 10 letture, come nella card Consumo Casa. -->
+        <div class="eff-bars" data-live-html="pv.bars"><?php echo $p['pv']['bars'] ?? ''; ?></div>
+        <div style="font-size:0.65rem; color:var(--text-muted); margin-top:2px;">
+          ultime 10 letture · max <span data-live="pv.barsMax"><?php echo $p['pv']['barsMax'] ?? ''; ?></span>
+        </div>
 
         <div style="font-weight:800; font-size:0.75rem; color:<?php echo $p['pv']['skyColor']; ?>; margin-top:5px; text-transform:uppercase; <?php echo showStyle($p['pv']['skyText'] !== ''); ?>"
           data-live-show="pv.skyText" data-live-color="pv.skyColor">
@@ -1705,6 +1789,20 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
               <?php endif; ?>
               <span><i style="background:#d1d5db"></i>Ieri <b id="hourly-<?php echo $ch; ?>-yest"></b></span>
             </div>
+            <?php if ($ch === 'casa'): ?>
+              <!-- Totali di oggi, del mese e dell'anno a barre orizzontali:
+                   consumo e le tre sorgenti che lo coprono. Le disegna
+                   renderCasaTotals(). -->
+              <div class="hourly-totals-grid">
+                <?php foreach (['giorno' => 'Oggi', 'mese' => 'Questo mese', 'anno' => "Quest'anno"] as $per => $perLabel): ?>
+                  <div>
+                    <div class="hourly-totals-title"><?php echo $perLabel; ?></div>
+                    <svg class="hourly-totals" id="hourly-casa-totals-<?php echo $per; ?>" role="img"
+                      aria-label="Consumo casa per sorgente, <?php echo htmlspecialchars($perLabel); ?>"></svg>
+                  </div>
+                <?php endforeach; ?>
+              </div>
+            <?php endif; ?>
           </div>
         <?php endforeach; ?>
       </div>
@@ -1891,6 +1989,57 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
           var parts = (ch === 'casa') ? CASA_PARTS.filter(function (pt) { return o[pt.key]; })
             .map(function (pt) { return { key: pt.key, label: pt.label, color: pt.color, vals: o[pt.key].today }; }) : null;
           renderHourly(ch, { today: o[ch].today, yest: o[ch].yest, hour: o.hour, parts: parts });
+        });
+        renderCasaTotals(o);
+      }
+      /**
+       * House consumption and the three sources covering it over today, this
+       * month and this year: one chart per period, horizontal bars on the
+       * period's own scale (the total is the longest).
+       */
+      function renderCasaTotals(o) {
+        if (!o.casa) return;
+        var sum = function (a) { return (a || []).reduce(function (s, v) { return s + v; }, 0); };
+        var totali = o.totali || {};
+        ['giorno', 'mese', 'anno'].forEach(function (per) {
+          var t = totali[per];
+          // Without the server totals, today can still come from the hours.
+          if (!t && per === 'giorno') {
+            t = { casa: sum(o.casa.today) };
+            CASA_PARTS.forEach(function (pt) { if (o[pt.key]) t[pt.key] = sum(o[pt.key].today); });
+          }
+          renderTotalsChart(document.getElementById('hourly-casa-totals-' + per), t);
+        });
+      }
+      function renderTotalsChart(svg, t) {
+        if (!svg) return;
+        svg.parentNode.style.display = t ? '' : 'none';
+        if (!t) return;
+        var tot = t.casa || 0;
+        var rows = [{ label: 'Totale', color: HOURLY_COLORS.casa, wh: tot }].concat(
+          CASA_PARTS.filter(function (pt) { return pt.key in t; }).map(function (pt) {
+            return { label: pt.label, color: pt.color, wh: t[pt.key] };
+          }));
+        var W = svg.clientWidth || 600, rowH = 26, H = rows.length * rowH;
+        var L = 64, R = 108, pw = Math.max(W - L - R, 10);
+        var max = Math.max.apply(null, rows.map(function (r) { return r.wh; }).concat([1]));
+        svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+        svg.setAttribute('height', H);
+        while (svg.firstChild) svg.removeChild(svg.firstChild);
+        function el(name, attrs, text) {
+          var e = document.createElementNS(SVGNS, name);
+          for (var k in attrs) e.setAttribute(k, attrs[k]);
+          if (text != null) e.textContent = text;
+          svg.appendChild(e);
+          return e;
+        }
+        rows.forEach(function (r, i) {
+          var cy = i * rowH + rowH / 2, w = r.wh / max * pw;
+          el('text', { x: L - 8, y: cy + 4, 'text-anchor': 'end' }, r.label);
+          el('rect', { x: L, y: cy - 8, width: pw, height: 16, fill: '#f3f4f6', rx: 3 });
+          if (w > 0) el('rect', { x: L, y: cy - 8, width: w, height: 16, fill: r.color, rx: 3 });
+          var pct = (i > 0 && tot > 0) ? ' (' + Math.round(r.wh / tot * 100) + '%)' : '';
+          el('text', { x: L + pw + 8, y: cy + 4 }, fmtWh(r.wh) + pct);
         });
       }
       function renderHourly(ch, d) {
@@ -2169,6 +2318,12 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
      * "5 minuti" would only be that same bucket wearing a nicer label. Each
      * bucket is shown as mm/h, with the probability read from the hourly
      * series -- the only resolution at which Open-Meteo exposes it.
+     *
+     * Asking for minutely_15 makes Open-Meteo's best_match serve the WHOLE
+     * request from ICON-D2, while previsioni.php (hourly only) gets its own
+     * blend -- and the two can differ by tens of mm/h. So "is it raining" and
+     * the 12-hour chart come from a second, hourly-only request that matches
+     * previsioni.php; the 15-minute series is used only for the dry 90' view.
      */
     (function () {
       var LAT = 46.0186, LON = 11.9931;   // Cesana di Lentiai (BL), 264 m slm
@@ -2181,10 +2336,23 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
         + '&hourly=precipitation_probability'
         + '&forecast_days=2&timezone=UTC';
 
+      // Same model selection as previsioni.php: no minutely_15 in this one.
+      var URL_H = 'https://api.open-meteo.com/v1/forecast'
+        + '?latitude=' + LAT + '&longitude=' + LON
+        + '&hourly=precipitation,precipitation_probability'
+        + '&forecast_days=2&timezone=UTC';
+
+      var rowEl = document.getElementById('rain-row');
       var summaryEl = document.getElementById('rain-summary');
       var totalEl = document.getElementById('rain-total');
       var nextEl = document.getElementById('rain-next');
       var nextTextEl = document.getElementById('rain-next-text');
+      var valueEl = document.getElementById('rain-value');
+      var chartEl = document.getElementById('rain-chart');
+      var barsEl = document.getElementById('rain-bars');
+      var hoursEl = document.getElementById('rain-hours');
+      var captionEl = document.getElementById('rain-chart-caption');
+      var CHART_HOURS = 12;
 
       /** Open-Meteo timestamps come back as "2026-08-29T14:30" in UTC. */
       function ts(s) { return Date.parse(s + ':00Z'); }
@@ -2220,17 +2388,120 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
         summaryEl.textContent = msg;
         summaryEl.style.color = 'var(--text-muted)';
         totalEl.textContent = '—';
+        chartEl.style.display = 'none';
+        valueEl.style.display = '';
+        rowEl.style.display = '';
       }
 
-      function render(data) {
+      /**
+       * Index of the hourly entry covering `t`. Hourly precipitation is the
+       * sum of the PRECEDING hour, so the 08:00 entry is 07:00-08:00.
+       */
+      function hourIndex(times, t) {
+        for (var i = 0; i < times.length; i++) {
+          var end = ts(times[i]);
+          if (t < end && t >= end - 3600000) return i;
+        }
+        return -1;
+      }
+
+      /** Twelve hourly bars from the hour in progress (hourly-only series). */
+      function renderChart(hTimes, hPrec, c) {
+        var bars = [], peak = 0, sum = 0;
+        for (var h = 0; h < CHART_HOURS && c + h < hTimes.length; h++) {
+          var mm = num(hPrec[c + h]);
+          bars.push({ start: ts(hTimes[c + h]) - 3600000, mmh: mm });
+          if (mm !== null) { sum += mm; if (mm > peak) peak = mm; }
+        }
+
+        // At least 2 mm/h full scale, so a drizzle does not look like a storm.
+        var scale = Math.max(peak, 2);
+        var barsHtml = '', hoursHtml = '';
+        for (var b = 0; b < bars.length; b++) {
+          var x = bars[b];
+          var pct = x.mmh === null ? 0 : Math.max(x.mmh >= 0.1 ? 6 : 0, x.mmh / scale * 100);
+          var color = x.mmh !== null && x.mmh >= 0.1 ? describe(x.mmh)[1] : 'var(--text-muted)';
+          var hhmm = function (t) {
+            return new Date(t).toLocaleTimeString('it-IT', { hour: '2-digit', minute: '2-digit', hour12: false });
+          };
+          var from = hhmm(x.start), to = hhmm(x.start + 3600000);
+          barsHtml += '<div class="rain-bar" style="height:' + pct.toFixed(0) + '%;background:' + color
+            + '" title="' + from + '–' + to + ' · ' + fmt(x.mmh) + ' mm"></div>';
+          // Labelled with the START of its hour, so the first column is the
+          // hour we are in (previsioni.php shifts its rain bars to match).
+          // The hour in progress is in bold.
+          hoursHtml += '<span' + (b === 0 ? ' style="font-weight:700;color:var(--text-muted)"' : '') + '>'
+            + from.slice(0, 2) + '</span>';
+        }
+        barsEl.innerHTML = barsHtml;
+        hoursEl.innerHTML = hoursHtml;
+        captionEl.textContent = (sum < 0.05 ? '0' : sum.toFixed(1)) + ' mm in ' + bars.length
+          + ' h · max ' + fmt(peak) + ' mm/h';
+      }
+
+      /**
+       * Rain in the hour in progress or any of the next 12, according to the
+       * hourly series: the 90' total and the 15' row say little then (and
+       * come from a model that may disagree), so show the 12 hours instead.
+       * Returns true when it took over the card.
+       */
+      function renderRaining(hourly, now) {
+        var hTimes = hourly && hourly.hourly && hourly.hourly.time;
+        var hPrec = hourly && hourly.hourly && hourly.hourly.precipitation;
+        if (!hTimes || !hPrec) return false;
+        var c = hourIndex(hTimes, now);
+        if (c < 0) return false;
+
+        // First wet hour of the twelve, and the wettest one.
+        var first = -1, peakIdx = -1, peak = 0;
+        for (var h = 0; h < CHART_HOURS && c + h < hTimes.length; h++) {
+          var mm = num(hPrec[c + h]);
+          if (mm === null || mm < 0.1) continue;
+          if (first < 0) first = h;
+          if (mm > peak) { peak = mm; peakIdx = c + h; }
+        }
+        if (first < 0) return false;
+
+        renderChart(hTimes, hPrec, c);
+        valueEl.style.display = 'none';
+        rowEl.style.display = 'none';
+        chartEl.style.display = '';
+
+        // Raining now: describe this hour. Not yet: describe the wettest one.
+        var at = first === 0 ? c : peakIdx;
+        var prob = num((hourly.hourly.precipitation_probability || [])[at]);
+        var d = describe(num(hPrec[at]));
+        summaryEl.textContent = d[0] + (prob !== null ? ' · ' + Math.round(prob) + '%' : '');
+        summaryEl.style.color = d[1];
+
+        if (first === 0) {
+          nextTextEl.textContent = 'in corso';
+        } else {
+          var startAt = ts(hTimes[c + first]) - 3600000;
+          var mins = Math.max(0, Math.round((startAt - now) / 60000));
+          nextTextEl.textContent = 'inizio ' + (mins < 60 ? 'tra ~' + mins + ' min' :
+            'verso le ' + new Date(startAt).toLocaleTimeString('it-IT',
+              { hour: '2-digit', minute: '2-digit', hour12: false }));
+        }
+        nextEl.style.display = '';
+        return true;
+      }
+
+      function render(data, hourly) {
         var mTimes = data && data.minutely_15 && data.minutely_15.time;
         var mPrec = data && data.minutely_15 && data.minutely_15.precipitation;
+
+        var now = Date.now();
+        if (renderRaining(hourly, now)) return;
+
+        chartEl.style.display = 'none';
+        valueEl.style.display = '';
+        rowEl.style.display = '';
         if (!mTimes || !mPrec) { fail('Previsione non disponibile'); return; }
 
         var hTimes = (data.hourly && data.hourly.time) || [];
         var hProb = (data.hourly && data.hourly.precipitation_probability) || [];
 
-        var now = Date.now();
         var maxMmh = 0, total = 0, maxProb = null, firstWet = null;
 
         // The bucket we are inside right now; the row walks forward from it.
@@ -2286,13 +2557,19 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
         }
       }
 
-      function load() {
-        fetch(URL, { cache: 'no-store' })
+      /** A failed request resolves to null, so one series can still render. */
+      function get(url) {
+        return fetch(url, { cache: 'no-store' })
           .then(function (r) {
             if (!r.ok) throw new Error('HTTP ' + r.status);
             return r.json();
           })
-          .then(render)
+          .catch(function () { return null; });
+      }
+
+      function load() {
+        Promise.all([get(URL), get(URL_H)])
+          .then(function (res) { render(res[0], res[1]); })
           .catch(function () { fail('Previsione non disponibile'); });
       }
 

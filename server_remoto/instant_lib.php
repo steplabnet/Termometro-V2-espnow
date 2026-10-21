@@ -1005,6 +1005,45 @@ function energyHourly(mysqli $link, int $now): ?array
       $out[$ch][$d] = array_map(static fn($v) => round($v, 1), $out[$ch][$d]);
     }
   }
+  $out['totali'] = energyTotals($link, $now);
+  return $out;
+}
+
+/* Consumo casa e le sue tre sorgenti, in Wh, sommati su oggi, mese e anno in
+ * corso (dalle stesse righe di `energia_oraria`). null se le colonne delle
+ * sorgenti non ci sono ancora.
+ */
+function energyTotals(mysqli $link, int $now): ?array
+{
+  $y = (int) date('Y', $now);
+  $m = (int) date('n', $now);
+  $starts = [
+    'giorno' => mktime(0, 0, 0, $m, (int) date('j', $now), $y),
+    'mese' => mktime(0, 0, 0, $m, 1, $y),
+    'anno' => mktime(0, 0, 0, 1, 1, $y),
+  ];
+  $chans = ['casa', 'casa_pv', 'casa_batt', 'casa_grid'];
+  $sel = [];
+  foreach ($starts as $k => $t0) {
+    foreach ($chans as $ch) {
+      $sel[] = "SUM(CASE WHEN ora >= {$t0} THEN {$ch}_wh ELSE 0 END) AS {$k}_{$ch}";
+    }
+  }
+  try {
+    $res = $link->query('SELECT ' . implode(', ', $sel)
+      . " FROM energia_oraria WHERE ora >= {$starts['anno']} AND ora <= {$now}");
+  } catch (Throwable $e) {
+    return null;
+  }
+  if (!$res instanceof mysqli_result || !($r = $res->fetch_assoc())) {
+    return null;
+  }
+  $out = [];
+  foreach (array_keys($starts) as $k) {
+    foreach ($chans as $ch) {
+      $out[$k][$ch] = round((float) ($r["{$k}_{$ch}"] ?? 0), 1);
+    }
+  }
   return $out;
 }
 
@@ -2292,16 +2331,22 @@ function meteo_build_payload(mysqli $link): array
 
   /* Consumo casa, the last 10 readings as they arrived (casa_push in
    * trend_store.php). Scale 0..the highest of the ten, oldest on the left. */
-  $casaSamples = array_values(array_filter(casa_samples(),
-    static fn($s) => is_array($s) && is_numeric($s['t'] ?? null) && is_numeric($s['w'] ?? null)));
-  $casaSamples = array_map(static fn($s) => ['t' => (int) $s['t'], 'w' => (float) $s['w']], $casaSamples);
-  $casaBars = '';
-  $casaTop = max(array_merge([1.0], array_column($casaSamples, 'w')));
-  foreach ($casaSamples as $i => $s) {
-    $casaBars .= '<span class="eff-bar" title="' . date('H:i:s', $s['t']) . ' · ' . round($s['w'])
-      . ' W" style="height:' . round(max(4, $s['w'] / $casaTop * 100)) . '%; background:var(--accent-purple)'
-      . ($i === count($casaSamples) - 1 ? '' : '; opacity:0.55') . ';"></span>';
-  }
+  $lastBars = static function (array $raw, string $color): array {
+    $samples = array_values(array_filter($raw,
+      static fn($s) => is_array($s) && is_numeric($s['t'] ?? null) && is_numeric($s['w'] ?? null)));
+    $samples = array_map(static fn($s) => ['t' => (int) $s['t'], 'w' => (float) $s['w']], $samples);
+    $html = '';
+    $top = max(array_merge([1.0], array_column($samples, 'w')));
+    foreach ($samples as $i => $s) {
+      $html .= '<span class="eff-bar" title="' . date('H:i:s', $s['t']) . ' · ' . round($s['w'])
+        . ' W" style="height:' . round(max(4, $s['w'] / $top * 100)) . '%; background:' . $color
+        . ($i === count($samples) - 1 ? '' : '; opacity:0.55') . ';"></span>';
+    }
+    return [$html, $samples === [] ? '' : fmtW($top)];
+  };
+  [$casaBars, $casaBarsMax] = $lastBars(casa_samples(), 'var(--accent-purple)');
+  // Produzione FV, same strip (pv_push in trend_store.php).
+  [$pvBars, $pvBarsMax] = $lastBars(pv_samples(), 'var(--accent-orange)');
 
   /* Casa + batteria: what the house and the pack are drawing together.
    *
@@ -2422,6 +2467,8 @@ function meteo_build_payload(mysqli $link): array
       'peak' => (string) $pvPeak,
       'yesterday' => ($pvYesterday === null ? '--' : fmtW($pvYesterday)),
       'link' => $pvLink,
+      'bars' => $pvBars,
+      'barsMax' => $pvBarsMax,
     ],
 
     'humi' => [
@@ -2473,7 +2520,7 @@ function meteo_build_payload(mysqli $link): array
       'peak' => fmtW($em_max_casa),
       'loss' => fmtW($battLossW),
       'bars' => $casaBars,
-      'barsMax' => ($casaSamples === []) ? '' : fmtW($casaTop),
+      'barsMax' => $casaBarsMax,
       // Le tre sorgenti del consumo, gia' in percentuale (larghezze pronte per
       // la barra) e in watt (la legenda sotto).
       'mix' => $mix,

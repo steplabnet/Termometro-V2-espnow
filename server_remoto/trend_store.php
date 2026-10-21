@@ -184,14 +184,28 @@ function trend_series(string $field, ?int $seconds = null): array
  */
 const CASA_RAM_FILE = INSTANT_RAM_DIR . '/casa_last.json';
 const CASA_SAMPLES = 10;
+// Same strip on the Produzione Fotovoltaico card.
+const PV_RAM_FILE = INSTANT_RAM_DIR . '/pv_last.json';
 
 /** Append one house-load reading (W) taken at $ts. */
 function casa_push(int $ts, float $w): bool
 {
+    return last_push(CASA_RAM_FILE, $ts, $w);
+}
+
+/** Append one PV production reading (W) taken at $ts. */
+function pv_push(int $ts, float $w): bool
+{
+    return last_push(PV_RAM_FILE, $ts, $w);
+}
+
+/** Append one reading to a last-CASA_SAMPLES file in RAM. */
+function last_push(string $file, int $ts, float $w): bool
+{
     if (!instant_ram_ready()) {
         return false;
     }
-    $fh = @fopen(CASA_RAM_FILE, 'c+');
+    $fh = @fopen($file, 'c+');
     if ($fh === false) {
         return false;
     }
@@ -223,7 +237,18 @@ function casa_push(int $ts, float $w): bool
 /** The last CASA_SAMPLES readings, oldest first: [['t' => ts, 'w' => W], ...]. */
 function casa_samples(): array
 {
-    $raw = is_readable(CASA_RAM_FILE) ? @file_get_contents(CASA_RAM_FILE) : false;
+    return last_samples(CASA_RAM_FILE);
+}
+
+/** The last CASA_SAMPLES PV readings, oldest first. */
+function pv_samples(): array
+{
+    return last_samples(PV_RAM_FILE);
+}
+
+function last_samples(string $file): array
+{
+    $raw = is_readable($file) ? @file_get_contents($file) : false;
     $rows = ($raw === false || $raw === '') ? [] : json_decode($raw, true);
     return is_array($rows) ? $rows : [];
 }
