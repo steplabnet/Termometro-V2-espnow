@@ -215,7 +215,8 @@ function store_write_minmax(mysqli $link, int $now): void
  *   casa_grid / casa_batt / casa_pv = where the house load came from, split
  *          like the mix bar of the Consumo Casa card (meteo_build_payload):
  *          grid first (its import), then the battery's discharge, PV the rest.
- *          The three add up to casa sample by sample, hence hour by hour.
+ *          The three add up to casa sample by sample, hence hour by hour;
+ *   export = energy fed into the grid (-gridPower when < 0).
  *
  * Integrated from every MQTT reading, not from the 10-minute history rows:
  * trapezoids between consecutive readings, split at the hour boundaries so an
@@ -238,6 +239,7 @@ function energy_hourly_accumulate(mysqli $link, ?float $pv, ?float $grid, ?float
     'casa_grid' => null,
     'casa_batt' => null,
     'casa_pv' => null,
+    'export' => ($grid === null) ? null : max(0.0, -$grid),
   ];
   if ($casa !== null) {
     $vals['casa_grid'] = min(max(0.0, $grid), $casa);

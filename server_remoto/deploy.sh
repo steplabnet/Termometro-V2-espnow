@@ -35,6 +35,7 @@ PHP_FILES=(
   index.php
   previsioni.php
   grafico.php
+  energia_giorni.php
   live.php
   instant_lib.php
   instant_store.php

@@ -1009,9 +1009,10 @@ function energyHourly(mysqli $link, int $now): ?array
   return $out;
 }
 
-/* Consumo casa e le sue tre sorgenti, in Wh, sommati su oggi, mese e anno in
- * corso (dalle stesse righe di `energia_oraria`). null se le colonne delle
- * sorgenti non ci sono ancora.
+/* Consumo casa e le sue tre sorgenti, la produzione FV con la parte
+ * immessa in rete e l'energia scaricata dalla batteria, in Wh, sommati su oggi, mese e anno in corso (dalle stesse
+ * righe di `energia_oraria`). Le colonne nate dopo (export) si lasciano fuori
+ * finche' non esistono. null se mancano anche quelle delle sorgenti.
  */
 function energyTotals(mysqli $link, int $now): ?array
 {
@@ -1022,18 +1023,24 @@ function energyTotals(mysqli $link, int $now): ?array
     'mese' => mktime(0, 0, 0, $m, 1, $y),
     'anno' => mktime(0, 0, 0, 1, 1, $y),
   ];
-  $chans = ['casa', 'casa_pv', 'casa_batt', 'casa_grid'];
-  $sel = [];
-  foreach ($starts as $k => $t0) {
-    foreach ($chans as $ch) {
-      $sel[] = "SUM(CASE WHEN ora >= {$t0} THEN {$ch}_wh ELSE 0 END) AS {$k}_{$ch}";
+  $base = ['casa', 'casa_pv', 'casa_batt', 'casa_grid', 'pv', 'batt'];
+  $res = null;
+  foreach ([array_merge($base, ['export']), $base] as $chans) {
+    $sel = [];
+    foreach ($starts as $k => $t0) {
+      foreach ($chans as $ch) {
+        $sel[] = "SUM(CASE WHEN ora >= {$t0} THEN {$ch}_wh ELSE 0 END) AS {$k}_{$ch}";
+      }
     }
-  }
-  try {
-    $res = $link->query('SELECT ' . implode(', ', $sel)
-      . " FROM energia_oraria WHERE ora >= {$starts['anno']} AND ora <= {$now}");
-  } catch (Throwable $e) {
-    return null;
+    try {
+      $res = $link->query('SELECT ' . implode(', ', $sel)
+        . " FROM energia_oraria WHERE ora >= {$starts['anno']} AND ora <= {$now}");
+      if ($res instanceof mysqli_result) {
+        break;
+      }
+    } catch (Throwable $e) {
+      $res = null;
+    }
   }
   if (!$res instanceof mysqli_result || !($r = $res->fetch_assoc())) {
     return null;

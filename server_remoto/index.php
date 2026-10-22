@@ -581,6 +581,26 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
       fill: var(--text-muted);
     }
 
+    .hourly-more {
+      text-align: right;
+      margin-top: 10px;
+    }
+
+    .hourly-more a {
+      display: inline-block;
+      padding: 8px 14px;
+      border-radius: 999px;
+      border: 1px solid #e5e7eb;
+      font-size: 0.85rem;
+      font-weight: 600;
+      color: var(--accent-blue);
+      text-decoration: none;
+    }
+
+    .hourly-more a:hover {
+      border-color: var(--accent-blue);
+    }
+
     /* Arrivati dal link di Consumo casa: un lampo per dire quale grafico. */
     .hourly-block {
       scroll-margin-top: 20px;
@@ -1789,18 +1809,23 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
               <?php endif; ?>
               <span><i style="background:#d1d5db"></i>Ieri <b id="hourly-<?php echo $ch; ?>-yest"></b></span>
             </div>
-            <?php if ($ch === 'casa'): ?>
+            <?php if ($ch === 'casa' || $ch === 'pv'): ?>
               <!-- Totali di oggi, del mese e dell'anno a barre orizzontali:
-                   consumo e le tre sorgenti che lo coprono. Le disegna
-                   renderCasaTotals(). -->
+                   per casa il consumo e le tre sorgenti che lo coprono, per
+                   il FV la produzione, quanta se n'e' usata, quanta e' finita
+                   in rete, quanta ha caricato la batteria e quanta questa ne
+                   ha restituita. Le disegna renderTotals(). -->
               <div class="hourly-totals-grid">
                 <?php foreach (['giorno' => 'Oggi', 'mese' => 'Questo mese', 'anno' => "Quest'anno"] as $per => $perLabel): ?>
                   <div>
                     <div class="hourly-totals-title"><?php echo $perLabel; ?></div>
-                    <svg class="hourly-totals" id="hourly-casa-totals-<?php echo $per; ?>" role="img"
-                      aria-label="Consumo casa per sorgente, <?php echo htmlspecialchars($perLabel); ?>"></svg>
+                    <svg class="hourly-totals" id="hourly-<?php echo $ch; ?>-totals-<?php echo $per; ?>" role="img"
+                      aria-label="<?php echo $ch === 'casa' ? 'Consumo casa per sorgente' : 'Produzione FV usata e immessa'; ?>, <?php echo htmlspecialchars($perLabel); ?>"></svg>
                   </div>
                 <?php endforeach; ?>
+              </div>
+              <div class="hourly-more">
+                <a href="energia_giorni.php">Giorno per giorno &rarr;</a>
               </div>
             <?php endif; ?>
           </div>
@@ -1990,36 +2015,61 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
             .map(function (pt) { return { key: pt.key, label: pt.label, color: pt.color, vals: o[pt.key].today }; }) : null;
           renderHourly(ch, { today: o[ch].today, yest: o[ch].yest, hour: o.hour, parts: parts });
         });
-        renderCasaTotals(o);
+        renderTotals(o);
       }
       /**
-       * House consumption and the three sources covering it over today, this
-       * month and this year: one chart per period, horizontal bars on the
-       * period's own scale (the total is the longest).
+       * Today, this month and this year as horizontal bars, one chart per
+       * period on the period's own scale (the total is the longest): house
+       * consumption and the three sources covering it, and PV production split
+       * into the part used here (house and battery) and the part fed to the
+       * grid.
        */
-      function renderCasaTotals(o) {
-        if (!o.casa) return;
+      function renderTotals(o) {
         var sum = function (a) { return (a || []).reduce(function (s, v) { return s + v; }, 0); };
         var totali = o.totali || {};
         ['giorno', 'mese', 'anno'].forEach(function (per) {
           var t = totali[per];
           // Without the server totals, today can still come from the hours.
           if (!t && per === 'giorno') {
-            t = { casa: sum(o.casa.today) };
-            CASA_PARTS.forEach(function (pt) { if (o[pt.key]) t[pt.key] = sum(o[pt.key].today); });
+            t = {};
+            ['casa', 'pv', 'batt'].concat(CASA_PARTS.map(function (pt) { return pt.key; })).forEach(function (k) {
+              if (o[k]) t[k] = sum(o[k].today);
+            });
           }
-          renderTotalsChart(document.getElementById('hourly-casa-totals-' + per), t);
+          var casaRows = null, pvRows = null;
+          if (t && 'casa' in t) {
+            casaRows = [{ label: 'Totale', color: HOURLY_COLORS.casa, wh: t.casa }].concat(
+              CASA_PARTS.filter(function (pt) { return pt.key in t; }).map(function (pt) {
+                return { label: pt.label, color: pt.color, wh: t[pt.key] };
+              }));
+          }
+          if (t && 'pv' in t) {
+            pvRows = [{ label: 'Totale', color: HOURLY_COLORS.pv, wh: t.pv }];
+            if ('export' in t) {
+              // What PV sent to the battery is what neither the house nor the
+              // grid took: sample by sample that is the charge it covered.
+              var used = Math.max(0, t.pv - t.export);
+              pvRows.push({ label: 'Usata', color: '#16a34a', wh: used },
+                { label: 'Immessa', color: '#3b82f6', wh: Math.min(t.export, t.pv) });
+              if ('casa_pv' in t) {
+                pvRows.push({ label: 'Caricata', color: '#14b8a6', wh: Math.max(0, used - t.casa_pv) });
+              }
+            }
+            // What the battery gave back: not a share of the PV, so no %.
+            if ('batt' in t) {
+              pvRows.push({ label: 'Scaricata', color: '#f59e0b', wh: t.batt, noPct: true });
+            }
+          }
+          renderTotalsChart(document.getElementById('hourly-casa-totals-' + per), casaRows);
+          renderTotalsChart(document.getElementById('hourly-pv-totals-' + per), pvRows);
         });
       }
-      function renderTotalsChart(svg, t) {
+      /** rows[0] is the total; the others show their share of it. */
+      function renderTotalsChart(svg, rows) {
         if (!svg) return;
-        svg.parentNode.style.display = t ? '' : 'none';
-        if (!t) return;
-        var tot = t.casa || 0;
-        var rows = [{ label: 'Totale', color: HOURLY_COLORS.casa, wh: tot }].concat(
-          CASA_PARTS.filter(function (pt) { return pt.key in t; }).map(function (pt) {
-            return { label: pt.label, color: pt.color, wh: t[pt.key] };
-          }));
+        svg.parentNode.style.display = rows ? '' : 'none';
+        if (!rows) return;
+        var tot = rows[0].wh || 0;
         var W = svg.clientWidth || 600, rowH = 26, H = rows.length * rowH;
         var L = 64, R = 108, pw = Math.max(W - L - R, 10);
         var max = Math.max.apply(null, rows.map(function (r) { return r.wh; }).concat([1]));
@@ -2038,7 +2088,7 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
           el('text', { x: L - 8, y: cy + 4, 'text-anchor': 'end' }, r.label);
           el('rect', { x: L, y: cy - 8, width: pw, height: 16, fill: '#f3f4f6', rx: 3 });
           if (w > 0) el('rect', { x: L, y: cy - 8, width: w, height: 16, fill: r.color, rx: 3 });
-          var pct = (i > 0 && tot > 0) ? ' (' + Math.round(r.wh / tot * 100) + '%)' : '';
+          var pct = (i > 0 && tot > 0 && !r.noPct) ? ' (' + Math.round(r.wh / tot * 100) + '%)' : '';
           el('text', { x: L + pw + 8, y: cy + 4 }, fmtWh(r.wh) + pct);
         });
       }
