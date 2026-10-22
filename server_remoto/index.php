@@ -1808,6 +1808,10 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
                 <span><i style="background:var(--accent-red)"></i>Rete <b id="hourly-casa_grid-today"></b></span>
               <?php endif; ?>
               <span><i style="background:#d1d5db"></i>Ieri <b id="hourly-<?php echo $ch; ?>-yest"></b></span>
+              <?php if ($ch === 'pv'): ?>
+                <!-- Cielo sereno per la data di oggi: 3 kWp, 30° verso est, 40°, Lentiai. -->
+                <span><i style="background:none; border-top:2px dashed #f97316; height:0; width:14px;"></i>Teorica sereno <b id="hourly-pv-teo"></b></span>
+              <?php endif; ?>
             </div>
             <?php if ($ch === 'casa' || $ch === 'pv'): ?>
               <!-- Totali di oggi, del mese e dell'anno a barre orizzontali:
@@ -1998,6 +2002,9 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
        */
       var SVGNS = 'http://www.w3.org/2000/svg';
       var HOURLY_COLORS = { pv: '#eab308', casa: '#8b5cf6', batt: '#16a34a' };
+      // Clear-sky theoretical PV for the date the page was loaded on, Wh per
+      // hour (pvClearSkyHourly): computed once here, not on every live update.
+      var PV_TEO = <?php echo json_encode(pvClearSkyHourly(mktime(0, 0, 0))); ?>;
       // Consumo casa stacked by source, bottom to top, in the colours of the
       // card's mix bar. Whatever the parts do not cover (hours from before
       // they were recorded) stays in the plain casa colour on top.
@@ -2018,7 +2025,8 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
           if (!o[ch]) return;
           var parts = (ch === 'casa') ? CASA_PARTS.filter(function (pt) { return o[pt.key]; })
             .map(function (pt) { return { key: pt.key, label: pt.label, color: pt.color, vals: o[pt.key].today }; }) : null;
-          renderHourly(ch, { today: o[ch].today, yest: o[ch].yest, hour: o.hour, parts: parts });
+          renderHourly(ch, { today: o[ch].today, yest: o[ch].yest, hour: o.hour, parts: parts,
+            teo: (ch === 'pv') ? PV_TEO : null });
         });
         renderTotals(o);
       }
@@ -2106,7 +2114,7 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
         var W = svg.clientWidth || 600, H = 220;
         var L = 52, R = 8, T = 10, B = 24;
         var pw = W - L - R, ph = H - T - B, slot = pw / 24;
-        var max = Math.max.apply(null, d.today.concat(d.yest, [100]));
+        var max = Math.max.apply(null, d.today.concat(d.yest, d.teo || [], [100]));
         // A round axis top: 1, 2 or 5 times a power of ten.
         var mag = Math.pow(10, Math.floor(Math.log10(max)));
         var top = [1, 2, 5, 10].map(function (k) { return k * mag; }).filter(function (v) { return v >= max; })[0];
@@ -2161,10 +2169,28 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
             (h <= d.hour ? (d.parts || []).map(function (pt) {
               return '\n  ' + pt.label + ': ' + whH(pt.vals[h]);
             }).join('') : '') +
-            '\nIeri: ' + whH(d.yest[h]);
+            '\nIeri: ' + whH(d.yest[h]) +
+            (d.teo ? '\nTeorica: ' + whH(d.teo[h]) : '');
           hit.appendChild(t);
         }
+        // Clear-sky theoretical production: a dashed line through the middle
+        // of each hour, drawn over the bars.
+        if (d.teo) {
+          var pts = [];
+          for (var k = 0; k < 24; k++) {
+            if (d.teo[k] > 0 || d.teo[k - 1] > 0 || d.teo[k + 1] > 0) {
+              pts.push((L + (k + 0.5) * slot).toFixed(1) + ',' + y(d.teo[k]).toFixed(1));
+            }
+          }
+          if (pts.length) {
+            el('polyline', { points: pts.join(' '), fill: 'none', stroke: '#f97316',
+              'stroke-width': 2, 'stroke-dasharray': '5 4', 'stroke-linejoin': 'round',
+              'pointer-events': 'none' });
+          }
+        }
         var sum = function (a) { return a.reduce(function (s, v) { return s + v; }, 0); };
+        var teoEl = document.getElementById('hourly-' + ch + '-teo');
+        if (teoEl && d.teo) teoEl.textContent = fmtWh(sum(d.teo));
         var tEl = document.getElementById('hourly-' + ch + '-today');
         var yEl = document.getElementById('hourly-' + ch + '-yest');
         if (tEl) tEl.textContent = fmtWh(sum(d.today));

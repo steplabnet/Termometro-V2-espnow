@@ -1015,6 +1015,64 @@ function energyHourly(mysqli $link, int $now): ?array
   return $out;
 }
 
+/* Impianto per la curva teorica del grafico FV: Lentiai (BL), 30° verso est, 40°. */
+defined('PV_SITE_LAT') || define('PV_SITE_LAT', 46.0186);   // Cesana di Lentiai, come LAT/LON in index.php
+defined('PV_SITE_LON') || define('PV_SITE_LON', 11.9931);
+defined('PV_KWP') || define('PV_KWP', 3.0);
+defined('PV_TILT') || define('PV_TILT', 40.0);
+defined('PV_AZIMUTH') || define('PV_AZIMUTH', -30.0);  // 0 = sud, + verso ovest, - verso est
+defined('PV_PR') || define('PV_PR', 0.85);              // perdite: inverter, cavi, temperatura
+
+/* Produzione FV teorica a cielo sereno, Wh per ora locale 0..23 del giorno che
+ * inizia a $day0 (index.php la calcola una volta al caricamento della pagina): posizione del sole (formule NOAA semplificate) campionata
+ * ogni 5 minuti, irradianza diretta col modello di Meinel (massa d'aria di
+ * Kasten-Young), diffusa al 10% della diretta, albedo 0.2, portata sul piano
+ * dei moduli. Niente orizzonte: le montagne attorno non ci sono, quindi
+ * all'alba e al tramonto la curva sta sopra al reale. Nel giorno del cambio
+ * d'ora l'ora doppia si somma, come in energyHourly().
+ */
+function pvClearSkyHourly(int $day0): array
+{
+  $out = array_fill(0, 24, 0.0);
+  $day1 = mktime(0, 0, 0, (int) date('n', $day0), (int) date('j', $day0) + 1, (int) date('Y', $day0));
+  $rad = M_PI / 180;
+  $lat = PV_SITE_LAT * $rad;
+  $tilt = PV_TILT * $rad;
+  $azi = PV_AZIMUTH * $rad;
+  // Normale dei moduli in coordinate est/nord/su.
+  $nE = -sin($tilt) * sin($azi);
+  $nN = -sin($tilt) * cos($azi);
+  $nU = cos($tilt);
+  $step = 300;
+  for ($t = $day0 + $step / 2; $t < $day1; $t += $step) {
+    $n = $t / 86400 + 2440587.5 - 2451545.0;   // giorni da J2000
+    $L = fmod(280.460 + 0.9856474 * $n, 360);
+    $g = fmod(357.528 + 0.9856003 * $n, 360) * $rad;
+    $lam = ($L + 1.915 * sin($g) + 0.020 * sin(2 * $g)) * $rad;
+    $eps = (23.439 - 0.0000004 * $n) * $rad;
+    $ra = atan2(cos($eps) * sin($lam), cos($lam));
+    $dec = asin(sin($eps) * sin($lam));
+    $gmst = fmod(280.46061837 + 360.98564736629 * $n, 360);
+    $ha = ($gmst + PV_SITE_LON) * $rad - $ra;
+    // Versore del sole: est, nord, su.
+    $sE = -cos($dec) * sin($ha);
+    $sN = cos($lat) * sin($dec) - sin($lat) * cos($dec) * cos($ha);
+    $sU = sin($lat) * sin($dec) + cos($lat) * cos($dec) * cos($ha);
+    if ($sU <= 0.01) {
+      continue;
+    }
+    $zen = acos($sU) / $rad;
+    $am = 1 / ($sU + 0.50572 * pow(96.07995 - $zen, -1.6364));
+    $dni = 1353 * pow(0.7, pow($am, 0.678));
+    $dhi = 0.1 * $dni;
+    $ghi = $dni * $sU + $dhi;
+    $cosInc = max(0.0, $sE * $nE + $sN * $nN + $sU * $nU);
+    $poa = $dni * $cosInc + $dhi * (1 + cos($tilt)) / 2 + 0.2 * $ghi * (1 - cos($tilt)) / 2;
+    $out[(int) date('G', (int) $t)] += PV_KWP * $poa * PV_PR * $step / 3600;
+  }
+  return array_map(static fn($v) => round($v, 1), $out);
+}
+
 /* Consumo casa e le sue tre sorgenti, la produzione FV con la parte
  * immessa in rete e l'energia scaricata dalla batteria (queste ultime non
  * prima di ENERGY_PV_FROM), in Wh, sommati su oggi, mese e anno in corso (dalle stesse
