@@ -11,6 +11,7 @@ ini_set('display_errors', true);
 date_default_timezone_set('Europe/Rome');
 
 include('connessione.php');
+require_once __DIR__ . '/instant_lib.php';   // ENERGY_PV_FROM
 
 $today = date('Y-m-d');
 $d = $_GET['d'] ?? $today;
@@ -268,16 +269,19 @@ $titolo = $giorni[(int) date('w', $t0)] . ' ' . $g . ' ' . $mesi[$m] . ' ' . $y;
       </div>
     <?php else:
       $used = max(0.0, $t['pv'] - $t['export']);
+      $pvFrom = strtotime(ENERGY_PV_FROM);
       ?>
       <div class="card">
         <h2>Produzione FV</h2>
-        <?php echo bars([
+        <?php if ($t0 < $pvFrom): ?>
+          <div class="empty">Contatori FV dal <?php echo date('d/m/Y', $pvFrom); ?>.</div>
+        <?php else: echo bars([
           ['Totale', '#eab308', $t['pv']],
           ['Usata', '#16a34a', $used],
           ['Immessa', '#3b82f6', min($t['export'], $t['pv'])],
           ['Caricata', '#14b8a6', max(0.0, $used - $t['casa_pv'])],
           ['Scaricata', '#f59e0b', $t['batt'], true],   // non e' una quota del FV
-        ], "Produzione FV del {$titolo}"); ?>
+        ], "Produzione FV del {$titolo}"); endif; ?>
       </div>
 
       <div class="card casa">

@@ -141,6 +141,12 @@ defined('EM_DETAIL_FIELDS') || define('EM_DETAIL_FIELDS', [
 
 /** Usable capacity of the pack, kWh — only to turn SoC into a "residuo".
  * 5.12 kWh is what the Venus E 3.0 reports as its rated capacity. */
+/** I contatori FV (prodotta, immessa, caricata e scaricata dalla batteria)
+ * sommano solo da questo giorno: prima l'immessa non si misurava e le ore
+ * erano ricostruite. Le righe piu' vecchie restano in energia_oraria per il
+ * consumo casa. Usato anche da energia_giorni.php. */
+defined('ENERGY_PV_FROM') || define('ENERGY_PV_FROM', '2026-10-22');
+
 defined('BATT_CAPACITY_KWH') || define('BATT_CAPACITY_KWH', 5.12);
 
 /** Where the autonomy estimate stops counting: the SoC the pack is expected to
@@ -1010,7 +1016,8 @@ function energyHourly(mysqli $link, int $now): ?array
 }
 
 /* Consumo casa e le sue tre sorgenti, la produzione FV con la parte
- * immessa in rete e l'energia scaricata dalla batteria, in Wh, sommati su oggi, mese e anno in corso (dalle stesse
+ * immessa in rete e l'energia scaricata dalla batteria (queste ultime non
+ * prima di ENERGY_PV_FROM), in Wh, sommati su oggi, mese e anno in corso (dalle stesse
  * righe di `energia_oraria`). Le colonne nate dopo (export) si lasciano fuori
  * finche' non esistono. null se mancano anche quelle delle sorgenti.
  */
@@ -1024,13 +1031,18 @@ function energyTotals(mysqli $link, int $now): ?array
     'anno' => mktime(0, 0, 0, 1, 1, $y),
   ];
   $base = ['casa', 'casa_pv', 'casa_batt', 'casa_grid', 'pv', 'batt'];
+  $pvFrom = (int) strtotime(ENERGY_PV_FROM);
   $res = null;
   foreach ([array_merge($base, ['export']), $base] as $chans) {
     $sel = [];
     foreach ($starts as $k => $t0) {
       foreach ($chans as $ch) {
-        $sel[] = "SUM(CASE WHEN ora >= {$t0} THEN {$ch}_wh ELSE 0 END) AS {$k}_{$ch}";
+        $from = in_array($ch, ['pv', 'export', 'batt'], true) ? max($t0, $pvFrom) : $t0;
+        $sel[] = "SUM(CASE WHEN ora >= {$from} THEN {$ch}_wh ELSE 0 END) AS {$k}_{$ch}";
       }
+      // L'FV usato in casa sullo stesso periodo dei contatori FV, per la
+      // parte caricata in batteria (casa_pv resta quello del consumo casa).
+      $sel[] = 'SUM(CASE WHEN ora >= ' . max($t0, $pvFrom) . " THEN casa_pv_wh ELSE 0 END) AS {$k}_pv_casa";
     }
     try {
       $res = $link->query('SELECT ' . implode(', ', $sel)
@@ -1047,7 +1059,7 @@ function energyTotals(mysqli $link, int $now): ?array
   }
   $out = [];
   foreach (array_keys($starts) as $k) {
-    foreach ($chans as $ch) {
+    foreach (array_merge($chans, ['pv_casa']) as $ch) {
       $out[$k][$ch] = round((float) ($r["{$k}_{$ch}"] ?? 0), 1);
     }
   }

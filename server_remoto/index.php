@@ -1824,6 +1824,11 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
                   </div>
                 <?php endforeach; ?>
               </div>
+              <?php if ($ch === 'pv'): ?>
+                <div class="hourly-totals-title" style="margin-top:8px; font-weight:400;">
+                  Contatori FV dal <?php echo date('d/m/Y', strtotime(ENERGY_PV_FROM)); ?>
+                </div>
+              <?php endif; ?>
               <div class="hourly-more">
                 <a href="energia_giorni.php">Giorno per giorno &rarr;</a>
               </div>
@@ -2051,8 +2056,10 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
               var used = Math.max(0, t.pv - t.export);
               pvRows.push({ label: 'Usata', color: '#16a34a', wh: used },
                 { label: 'Immessa', color: '#3b82f6', wh: Math.min(t.export, t.pv) });
-              if ('casa_pv' in t) {
-                pvRows.push({ label: 'Caricata', color: '#14b8a6', wh: Math.max(0, used - t.casa_pv) });
+              // pv_casa: the house's PV over the PV counters' own period.
+              var pvCasa = ('pv_casa' in t) ? t.pv_casa : t.casa_pv;
+              if (pvCasa != null) {
+                pvRows.push({ label: 'Caricata', color: '#14b8a6', wh: Math.max(0, used - pvCasa) });
               }
             }
             // What the battery gave back: not a share of the PV, so no %.
