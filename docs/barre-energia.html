@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Barre energia Cesana</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@600;800&family=Public+Sans:ital,wght@0,400;0,600;1,400&family=IBM+Plex+Mono:wght@400;600&display=swap" rel="stylesheet">
+<style>
+  /* Layout: una colonna di lettura; ogni grafico e' riprodotto come sulla dashboard, seguito dalla sua legenda riga per riga. */
+  :root {
+    --bg: #f4f6f8;
+    --surface: #ffffff;
+    --fg: #1d2530;
+    --muted: #5b6676;
+    --line: #dde2e8;
+    --track: #edf0f3;
+    --accent: #2563eb;
+    /* I colori delle barre sono quelli della dashboard. */
+    --c-pv: #eab308;
+    --c-used: #16a34a;
+    --c-grid-out: #3b82f6;
+    --c-chg: #14b8a6;
+    --c-dis: #f59e0b;
+    --c-casa: #8b5cf6;
+    --c-batt: #eab308;
+    --c-grid-in: #ef4444;
+    --f-display: 'Archivo', 'Helvetica Neue', Arial, sans-serif;
+    --f-body: 'Public Sans', 'Segoe UI', Roboto, sans-serif;
+    --f-mono: 'IBM Plex Mono', ui-monospace, Consolas, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12161c; --surface: #1a2028; --fg: #e4e8ee; --muted: #9aa5b4;
+      --line: #2c3540; --track: #262e38; --accent: #7aa7ff; color-scheme: dark;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #12161c; --surface: #1a2028; --fg: #e4e8ee; --muted: #9aa5b4;
+    --line: #2c3540; --track: #262e38; --accent: #7aa7ff; color-scheme: dark;
+  }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font: 400 1rem/1.6 var(--f-body);
+    padding-left: max(16px, env(safe-area-inset-left, 0px));
+    padding-right: max(16px, env(safe-area-inset-right, 0px));
+    padding-block: 32px 64px;
+  }
+  main { max-width: 760px; margin: 0 auto; display: grid; gap: 40px; }
+  section { display: grid; gap: 16px; min-width: 0; }
+  h1, h2, h3 { font-family: var(--f-display); text-wrap: balance; margin: 0; line-height: 1.2; }
+  h1 { font-size: 2rem; font-weight: 800; }
+  h2 { font-size: 1.35rem; font-weight: 800; }
+  h3 { font-size: 1.05rem; font-weight: 600; }
+  p { margin: 0; max-width: 65ch; }
+  .lead { color: var(--muted); font-size: 1.05rem; }
+  .eyebrow {
+    font: 600 0.75rem/1 var(--f-mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--muted);
+  }
+  header { display: grid; gap: 10px; }
+  code, .num { font-family: var(--f-mono); font-size: 0.92em; }
+  .num { font-variant-numeric: tabular-nums; }
+  a { color: var(--accent); }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+  /* Riproduzione del grafico */
+  .chart {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 10px;
+    padding: 18px 18px 14px; display: grid; gap: 8px;
+  }
+  .chart-title { font: 600 0.8rem/1 var(--f-body); color: var(--muted); }
+  .bar-row {
+    display: grid; grid-template-columns: 5.6rem minmax(0, 1fr) 8.5rem; gap: 10px; align-items: center;
+    font-size: 0.85rem;
+  }
+  .bar-row .lbl { text-align: right; color: var(--muted); }
+  .bar-row .track { height: 16px; background: var(--track); border-radius: 3px; overflow: hidden; }
+  .bar-row .fill { height: 100%; border-radius: 3px; }
+  .bar-row .val { font-family: var(--f-mono); font-variant-numeric: tabular-nums; color: var(--muted); white-space: nowrap; }
+  .chart .src { font-size: 0.78rem; color: var(--muted); margin-top: 4px; }
+
+  /* Legenda riga per riga */
+  dl.legend { margin: 0; display: grid; gap: 0; border-top: 1px solid var(--line); }
+  .item {
+    display: grid; grid-template-columns: 14px minmax(0, 1fr); gap: 4px 14px;
+    padding-block: 14px; border-bottom: 1px solid var(--line);
+  }
+  .swatch { width: 14px; height: 14px; border-radius: 3px; margin-top: 5px; }
+  .item dt { font-weight: 600; }
+  .tag {
+    display: inline-block; font: 600 0.72rem/1 var(--f-mono); letter-spacing: 0.04em;
+    padding: 4px 6px; margin-right: 6px; border-radius: 4px; vertical-align: 2px;
+    border: 1px solid var(--line); color: var(--muted); text-decoration: none; background: var(--surface);
+  }
+  .item:target { background: var(--track); }
+  .item { scroll-margin-top: 16px; }
+  table.ids { border-collapse: collapse; font-size: 0.88rem; min-width: 560px; }
+  table.ids th, table.ids td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  table.ids th { font: 600 0.75rem/1.2 var(--f-mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); }
+  .table-wrap { overflow-x: auto; }
+  .item dt .num { font-weight: 400; color: var(--muted); margin-left: 8px; }
+  .item dd { margin: 0; grid-column: 2; display: grid; gap: 6px; min-width: 0; }
+  .formula {
+    font-family: var(--f-mono); font-size: 0.85rem; color: var(--fg);
+    background: var(--track); border-radius: 4px; padding: 3px 8px; justify-self: start; max-width: 100%;
+    overflow-x: auto; white-space: nowrap;
+  }
+
+  /* Bilancio: le due equazioni che tengono insieme i grafici */
+  .balance { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr)); }
+  .eq {
+    background: var(--surface); border: 1px solid var(--line); border-radius: 10px; padding: 16px;
+    display: grid; gap: 10px; min-width: 0;
+  }
+  .split { display: flex; height: 26px; border-radius: 4px; overflow: hidden; }
+  .split span { display: flex; align-items: center; justify-content: center; font: 600 0.72rem/1 var(--f-mono); color: #fff; min-width: 0; overflow: hidden; white-space: nowrap; }
+  .eq p { font-size: 0.9rem; }
+
+  ul.notes { margin: 0; padding-left: 1.2rem; display: grid; gap: 10px; max-width: 65ch; }
+  ul.notes li::marker { color: var(--muted); }
+  .periods { display: flex; flex-wrap: wrap; gap: 8px; }
+  .chip {
+    font: 600 0.8rem/1 var(--f-body); padding: 6px 10px; border-radius: 999px; border: 1px solid var(--line);
+    background: var(--surface);
+  }
+
+  @media (max-width: 480px) {
+    .bar-row { grid-template-columns: 4.6rem minmax(0, 1fr); }
+    .bar-row .val { grid-column: 2; font-size: 0.78rem; margin-top: -4px; }
+    h1 { font-size: 1.6rem; }
+  }
+</style>
+
+</head>
+<body>
+<main>
+  <header>
+    <span class="eyebrow">Dashboard Cesana · card “Energia ora per ora”</span>
+    <h1>Come leggere le barre dell'energia</h1>
+    <p class="lead">Sotto i grafici orari “Produzione FV per ora” e “Consumo casa per ora” ci sono tre gruppi di barre orizzontali.
+      Questa pagina spiega cosa misura ogni barra, come viene calcolata e quali limiti hanno i numeri.</p>
+  </header>
+
+  <section>
+    <h2>Come si leggono</h2>
+    <div class="periods" aria-label="Periodi">
+      <span class="chip">Oggi</span><span class="chip">Questo mese</span><span class="chip">Quest'anno</span>
+    </div>
+    <ul class="notes">
+      <li>Ogni gruppo somma lo stesso periodo: da mezzanotte, dal primo del mese o dal primo gennaio fino a ora.</li>
+      <li>La prima barra è il <strong>Totale</strong>. Le altre ne mostrano le parti, con la quota in percentuale tra parentesi.</li>
+      <li>La lunghezza delle barre è in scala dentro ogni gruppo: il Totale è la più lunga. Tra Oggi, mese e anno la scala cambia, quindi le lunghezze di gruppi diversi non si confrontano.</li>
+      <li>I valori sotto 1 kWh sono in Wh, gli altri in kWh con due decimali.</li>
+    </ul>
+    <p>L'esempio usato in tutta la pagina è <strong>giovedì 22 ottobre 2026</strong>, una giornata serena.
+      Si trova anche sulla pagina <a href="https://cesana.steplab.net/energia_giorni.php?d=2026-10-22">Giorno per giorno</a>.</p>
+  </section>
+
+  <section>
+    <span class="eyebrow">Grafico 1</span>
+    <h2>Produzione FV</h2>
+    <p>Dice dove è finita l'energia prodotta dai pannelli, e quanta ne ha restituita la batteria.</p>
+
+    <div class="chart" role="img" aria-label="Produzione FV del 22 ottobre 2026: totale 12,19 kWh, usata 7,57, immessa 4,62, caricata 4,53, scaricata 2,20">
+      <div class="chart-title">Oggi · 22/10/2026</div>
+      <div class="bar-row"><span class="lbl">Totale</span><span class="track"><span class="fill" style="width:100%; background:var(--c-pv)"></span></span><span class="val">12,19 kWh</span></div>
+      <div class="bar-row"><span class="lbl">Usata</span><span class="track"><span class="fill" style="width:62.1%; background:var(--c-used)"></span></span><span class="val">7,57 kWh (62%)</span></div>
+      <div class="bar-row"><span class="lbl">Immessa</span><span class="track"><span class="fill" style="width:37.9%; background:var(--c-grid-out)"></span></span><span class="val">4,62 kWh (38%)</span></div>
+      <div class="bar-row"><span class="lbl">Caricata</span><span class="track"><span class="fill" style="width:37.2%; background:var(--c-chg)"></span></span><span class="val">4,53 kWh (37%)</span></div>
+      <div class="bar-row"><span class="lbl">Scaricata</span><span class="track"><span class="fill" style="width:18%; background:var(--c-dis)"></span></span><span class="val">2,20 kWh</span></div>
+    </div>
+
+    <dl class="legend">
+      <div class="item" id="FV-TOT">
+        <span class="swatch" style="background:var(--c-pv)"></span>
+        <dt><a class="tag" href="#FV-TOT">FV-TOT</a> Totale <span class="num">12,19 kWh</span></dt>
+        <dd><p>Tutta l'energia prodotta dai pannelli nel periodo.</p>
+          <span class="formula">Σ potenza FV × tempo</span></dd>
+      </div>
+      <div class="item" id="FV-USATA">
+        <span class="swatch" style="background:var(--c-used)"></span>
+        <dt><a class="tag" href="#FV-USATA">FV-USATA</a> Usata <span class="num">7,57 kWh · 62%</span></dt>
+        <dd><p>La produzione che non è andata in rete: consumata in casa o messa in batteria.</p>
+          <span class="formula">Usata = Totale − Immessa</span></dd>
+      </div>
+      <div class="item" id="FV-IMM">
+        <span class="swatch" style="background:var(--c-grid-out)"></span>
+        <dt><a class="tag" href="#FV-IMM">FV-IMM</a> Immessa <span class="num">4,62 kWh · 38%</span></dt>
+        <dd><p>La produzione ceduta alla rete. Ora per ora conta al massimo l'FV rimasto dopo la casa:
+          di notte la batteria rimanda in rete qualche watt, e quell'energia non è fotovoltaico.</p>
+          <span class="formula">Immessa = min(immessa misurata, FV − FV usato in casa)</span></dd>
+      </div>
+      <div class="item" id="FV-CAR">
+        <span class="swatch" style="background:var(--c-chg)"></span>
+        <dt><a class="tag" href="#FV-CAR">FV-CAR</a> Caricata <span class="num">4,53 kWh · 37%</span></dt>
+        <dd><p>La parte della produzione andata in batteria: quella che non ha preso né la casa né la rete.
+          Conta solo la ricarica fatta dai pannelli; un'eventuale ricarica dalla rete non c'è.</p>
+          <span class="formula">Caricata = Usata − FV usato in casa</span></dd>
+      </div>
+      <div class="item" id="FV-SCA">
+        <span class="swatch" style="background:var(--c-dis)"></span>
+        <dt><a class="tag" href="#FV-SCA">FV-SCA</a> Scaricata <span class="num">2,20 kWh · senza %</span></dt>
+        <dd><p>L'energia che la batteria ha restituito nel periodo, a qualunque ora.
+          Non è una parte della produzione, quindi non ha la percentuale: può includere energia caricata il giorno prima.</p>
+          <span class="formula">Σ potenza in uscita dalla batteria × tempo</span></dd>
+      </div>
+    </dl>
+  </section>
+
+  <section>
+    <span class="eyebrow">Grafico 2</span>
+    <h2>Consumo casa</h2>
+    <p>Dice quanta energia ha usato la casa e da quale sorgente arrivava.</p>
+
+    <div class="chart" role="img" aria-label="Consumo casa del 22 ottobre 2026: totale 7,52 kWh, da FV 3,04, da batteria 2,16, da rete 2,32">
+      <div class="chart-title">Oggi · 22/10/2026</div>
+      <div class="bar-row"><span class="lbl">Totale</span><span class="track"><span class="fill" style="width:100%; background:var(--c-casa)"></span></span><span class="val">7,52 kWh</span></div>
+      <div class="bar-row"><span class="lbl">FV</span><span class="track"><span class="fill" style="width:40.4%; background:var(--c-used)"></span></span><span class="val">3,04 kWh (40%)</span></div>
+      <div class="bar-row"><span class="lbl">Batteria</span><span class="track"><span class="fill" style="width:28.7%; background:var(--c-batt)"></span></span><span class="val">2,16 kWh (29%)</span></div>
+      <div class="bar-row"><span class="lbl">Rete</span><span class="track"><span class="fill" style="width:30.9%; background:var(--c-grid-in)"></span></span><span class="val">2,32 kWh (31%)</span></div>
+    </div>
+
+    <dl class="legend">
+      <div class="item" id="CASA-TOT">
+        <span class="swatch" style="background:var(--c-casa)"></span>
+        <dt><a class="tag" href="#CASA-TOT">CASA-TOT</a> Totale <span class="num">7,52 kWh</span></dt>
+        <dd><p>Il consumo della casa, senza contare la batteria: un pacco che carica a 800 W non è un elettrodomestico acceso.</p>
+          <span class="formula">Casa = FV + rete − batteria</span>
+          <p style="font-size:0.88rem; color:var(--muted)">Rete è positiva quando si preleva, batteria è positiva quando carica.</p></dd>
+      </div>
+      <div class="item" id="CASA-FV">
+        <span class="swatch" style="background:var(--c-used)"></span>
+        <dt><a class="tag" href="#CASA-FV">CASA-FV</a> FV <span class="num">3,04 kWh · 40%</span></dt>
+        <dd><p>La parte del consumo coperta direttamente dai pannelli.</p>
+          <span class="formula">FV = Casa − Rete − Batteria</span></dd>
+      </div>
+      <div class="item" id="CASA-BATT">
+        <span class="swatch" style="background:var(--c-batt)"></span>
+        <dt><a class="tag" href="#CASA-BATT">CASA-BATT</a> Batteria <span class="num">2,16 kWh · 29%</span></dt>
+        <dd><p>La parte del consumo coperta dalla batteria mentre si scaricava.</p>
+          <span class="formula">Batteria = min(scarica, Casa − Rete)</span></dd>
+      </div>
+      <div class="item" id="CASA-RETE">
+        <span class="swatch" style="background:var(--c-grid-in)"></span>
+        <dt><a class="tag" href="#CASA-RETE">CASA-RETE</a> Rete <span class="num">2,32 kWh · 31%</span></dt>
+        <dd><p>La parte del consumo prelevata dalla rete. Viene contata per prima: tutto quello che arriva dal contatore va alla casa.</p>
+          <span class="formula">Rete = min(prelievo, Casa)</span></dd>
+      </div>
+    </dl>
+    <p>Le tre sorgenti si calcolano lettura per lettura, nell'ordine rete, batteria, FV, e sommano sempre al Totale: 3,04 + 2,16 + 2,32 = 7,52 kWh.</p>
+  </section>
+
+  <section>
+    <h2>Come si incastrano i due grafici</h2>
+    <p>La barra verde compare in entrambi: l'FV usato in casa è la stessa energia vista dai due lati.</p>
+    <div class="balance">
+      <div class="eq">
+        <h3>Dove va la produzione</h3>
+        <div class="split" role="img" aria-label="12,19 kWh di FV: 3,04 in casa, 4,53 in batteria, 4,62 in rete">
+          <span style="flex:3.04; background:var(--c-used)">casa 3,04</span>
+          <span style="flex:4.53; background:var(--c-chg)">batt. 4,53</span>
+          <span style="flex:4.62; background:var(--c-grid-out)">rete 4,62</span>
+        </div>
+        <p><span class="num">FV totale = FV in casa + Caricata + Immessa</span><br>
+          <span class="num">12,19 = 3,04 + 4,53 + 4,62</span></p>
+        <p>Usata è la somma delle prime due: 3,04 + 4,53 = 7,57 kWh.</p>
+      </div>
+      <div class="eq">
+        <h3>Da dove arriva il consumo</h3>
+        <div class="split" role="img" aria-label="7,52 kWh di consumo: 3,04 da FV, 2,16 da batteria, 2,32 da rete">
+          <span style="flex:3.04; background:var(--c-used)">FV 3,04</span>
+          <span style="flex:2.16; background:var(--c-batt); color:#1d2530">batt. 2,16</span>
+          <span style="flex:2.32; background:var(--c-grid-in)">rete 2,32</span>
+        </div>
+        <p><span class="num">Casa = FV + Batteria + Rete</span><br>
+          <span class="num">7,52 = 3,04 + 2,16 + 2,32</span></p>
+        <p>La Batteria del consumo (2,16) è quasi tutta la Scaricata (2,20): quasi tutta l'energia restituita dal pacco va alla casa.</p>
+      </div>
+    </div>
+  </section>
+
+  <section id="codice">
+    <h2>Dove si cambiano nel codice</h2>
+    <p>Ogni barra ha un ID. Lo stesso ID è scritto in un commento accanto a dove la barra viene calcolata o disegnata,
+      quindi basta cercarlo (per esempio <code>FV-CAR</code>) nei file del server.</p>
+    <div class="table-wrap">
+      <table class="ids">
+        <thead><tr><th>ID</th><th>Barra</th><th>Disegnata in</th><th>Dati da</th></tr></thead>
+        <tbody>
+          <tr><td><a class="tag" href="#FV-TOT">FV-TOT</a></td><td>FV · Totale</td><td rowspan="5"><code>index.php</code> → <code>renderTotals()</code><br><code>energia_giorni.php</code></td><td><code>pv</code> in <code>energyTotals()</code></td></tr>
+          <tr><td><a class="tag" href="#FV-USATA">FV-USATA</a></td><td>FV · Usata</td><td>calcolata: <code>pv − pv_grid</code></td></tr>
+          <tr><td><a class="tag" href="#FV-IMM">FV-IMM</a></td><td>FV · Immessa</td><td><code>pv_grid</code> in <code>energyTotals()</code></td></tr>
+          <tr><td><a class="tag" href="#FV-CAR">FV-CAR</a></td><td>FV · Caricata</td><td>calcolata: Usata − <code>pv_casa</code></td></tr>
+          <tr><td><a class="tag" href="#FV-SCA">FV-SCA</a></td><td>FV · Scaricata</td><td><code>batt</code> in <code>energyTotals()</code></td></tr>
+          <tr><td><a class="tag" href="#CASA-TOT">CASA-TOT</a></td><td>Casa · Totale</td><td rowspan="4"><code>index.php</code> → <code>renderTotals()</code>, <code>CASA_PARTS</code><br><code>energia_giorni.php</code></td><td><code>casa</code></td></tr>
+          <tr><td><a class="tag" href="#CASA-FV">CASA-FV</a></td><td>Casa · FV</td><td><code>casa_pv</code></td></tr>
+          <tr><td><a class="tag" href="#CASA-BATT">CASA-BATT</a></td><td>Casa · Batteria</td><td><code>casa_batt</code></td></tr>
+          <tr><td><a class="tag" href="#CASA-RETE">CASA-RETE</a></td><td>Casa · Rete</td><td><code>casa_grid</code></td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>I valori per ora si accumulano in <code>store_lib.php</code> → <code>energy_hourly_accumulate()</code> (tabella <code>energia_oraria</code>),
+      e si sommano per periodo in <code>instant_lib.php</code> → <code>energyTotals()</code>.</p>
+  </section>
+
+  <section>
+    <h2>Da dove vengono i numeri</h2>
+    <ul class="notes">
+      <li>A ogni lettura dal quadro (FV, rete, batteria, ogni pochi secondi) il server calcola l'energia passata dalla lettura precedente e la somma nell'ora in corso, in Wh. Le barre sommano queste ore.</li>
+      <li>Un buco nelle letture fino a 5 minuti si colma tra i due valori vicini. Oltre i 5 minuti quel tratto non si conta, e i totali di quel giorno escono un po' bassi.</li>
+      <li>I contatori della Produzione FV partono dal <strong>22/10/2026</strong>, il primo giorno in cui l'immessa si misura ora per ora. Per questo mese e anno del grafico FV oggi coincidono con i giorni da quella data.</li>
+      <li>Il Consumo casa parte dal <strong>18/08/2026</strong>. Le ore prima del 18/10/2026 alle 14:00 sono stime ricostruite dalle letture ogni 10 minuti dello storico: sul periodo misurato la stima sbaglia di circa il 2%.</li>
+      <li>Il Venus E ha contatori suoi, mostrati nella card Energia. Rispetto a quelli la Caricata di queste barre è circa il 3% più bassa, la Scaricata un po' più alta.</li>
+      <li>La pagina <a href="https://cesana.steplab.net/energia_giorni.php">Giorno per giorno</a> mostra gli stessi due grafici per un giorno a scelta, con le frecce per scorrere i giorni.</li>
+    </ul>
+  </section>
+</main>
+</body>
+</html>

@@ -91,6 +91,11 @@ BATTERY_IDLE_W = 15
 # reported as "no data" rather than as a frozen last reading.
 BATTERY_STALE_S = 600
 
+# The remote dashboard's live payload: its oraria.totali are the day's energy
+# bars (docs/barre-energia.html), fetched rather than re-integrated here so the
+# report and the web page can never disagree.
+REMOTE_LIVE_URL = "https://cesana.steplab.net/live.php?wait=0"
+
 # Grid voltage below this means the inverter has no AC line (blackout, breaker
 # open, plug pulled). The Venus reads ~230 V when connected and drops to 0 —
 # the threshold only has to sit clear of both.
@@ -1112,58 +1117,142 @@ def format_temperatures(row=None):
 
 
 def format_energy(row=None):
-    """Production and consumption, mirroring the cards of the remote dashboard
-    (server_remoto/index.php): produzione, scambio rete, prelievo, consumo casa.
+    """Production and consumption as bar groups: the power right now, split
+    the way the remote dashboard splits it, then today's energy bars.
 
-    Same block shape as the temperature report: value on the headline, the
-    24h context in italics underneath."""
+    The house load is the dashboard's (server_remoto/store_lib.php): pv + grid
+    minus the battery, so a pack charging at 800 W is not counted as an
+    appliance. The local casa_power (pv + grid) still includes it."""
     row = row if row is not None else fetch_latest()
     pv   = row.get("pv_power")   if row else None
     grid = row.get("grid_power") if row else None
-    casa = row.get("casa_power") if row else None
-    if casa is None and pv is not None and grid is not None:
-        casa = pv + grid          # same definition the dashboard uses
     if pv is None and grid is None:
         return ("⚡ Energia\nNessun dato dal Shelly Pro EM-50 "
                 "(meter fermo o mqtt_receiver.py non in esecuzione).")
 
-    max_pv              = window_extremes("energia", "pv_power")[1]
-    min_grid, max_grid  = window_extremes("energia", "grid_power")
-    max_casa            = window_extremes("energia", "casa_power")[1]
+    batt_row = fetch_battery()
+    batt = batt_row.get("battery_power") if batt_row else None   # > 0 in carica
+    try:
+        batt = float(batt) if batt is not None else None
+    except (TypeError, ValueError):
+        batt = None
 
     lines = report_header("⚡ Energia", row.get("timestamp"))
 
-    lines.append(f"☀️ <b>Produzione FV</b>   {fmt_w(pv)}")
-    lines.append(f"      <i>picco 24h {fmt_w(max_pv)}</i>")
+    # Where the PV is going: the house first, then the export it actually
+    # made, the rest into the battery (as FV-USATA / FV-IMM / FV-CAR).
+    casa = (max(0.0, pv + grid - (batt or 0.0))
+            if pv is not None and grid is not None else None)
+    casa_grid = casa_batt = casa_pv = None
+    if casa is not None:
+        casa_grid = min(max(0.0, grid), casa)
+        casa_batt = min(max(0.0, -(batt or 0.0)), casa - casa_grid)
+        casa_pv = max(0.0, casa - casa_grid - casa_batt)
 
-    if grid is None:
-        lines.append("🔌 <b>Scambio rete</b>   --")
-    else:
-        if grid < 0:
-            flow = "↑ immissione"
-        elif grid > 5:
-            flow = "↓ prelievo"
-        else:
-            flow = "equilibrio"
-        lines.append(f"🔌 <b>Scambio rete</b>   {fmt_w(abs(grid))}   ·   {flow}")
-        lines.append(f"      <i>max 24h  ↓ {fmt_w(max(0.0, max_grid) if max_grid is not None else None)}"
-                     f"   ·   ↑ {fmt_w(abs(min(0.0, min_grid)) if min_grid is not None else None)}</i>")
+    if pv is not None and pv < 1:
+        # Night: four empty bars say less than one line.
+        lines.append("<b>☀️ Produzione FV adesso</b>   0 W")
+    elif pv is not None:
+        rows = [("Totale", pv, False, BAR_PV)]
+        if casa_pv is not None:
+            pv_grid = min(max(0.0, -grid), max(0.0, pv - casa_pv))
+            rows += [("Casa", casa_pv, False, BAR_USED),
+                     ("Batteria", max(0.0, pv - casa_pv - pv_grid), False, BAR_CHARGE),
+                     ("Immessa", pv_grid, False, BAR_EXPORT)]
+        lines.append(bar_block("☀️ Produzione FV adesso", rows, fmt=fmt_w))
 
-        draw = max(0.0, grid)
-        lines.append(f"⬇️ <b>Prelievo rete</b>   {fmt_w(draw)}")
-        detail = ("100% da fotovoltaico" if grid <= 5
-                  else (f"{round(min(100, draw / casa * 100))}% del consumo"
-                        if casa and casa > 0 else "dalla rete"))
-        lines.append(f"      <i>{detail}</i>")
+    if casa is not None:
+        rows = [("Totale", casa, False, BAR_CASA), ("FV", casa_pv, False, BAR_USED)]
+        if batt is not None:
+            rows.append(("Batteria", casa_batt, False, BAR_BATT))
+        rows.append(("Rete", casa_grid, False, BAR_GRID))
+        lines.append("")
+        lines.append(bar_block("🏠 Consumo casa adesso", rows, fmt=fmt_w))
 
-    if casa is None:
-        lines.append("🏠 <b>Consumo casa</b>   --")
-    else:
-        lines.append(f"🏠 <b>Consumo casa</b>   {fmt_w(casa)}")
-        share_pv = (f"{round(min(100, pv / casa * 100))}% da fotovoltaico   ·   "
-                    if pv is not None and casa > 0 else "")
-        lines.append(f"      <i>{share_pv}picco 24h {fmt_w(max_casa)}</i>")
+    bars = format_energy_bars()
+    if bars:
+        lines.append("")
+        lines.append(bars)
     return "\n".join(lines)
+
+
+def fetch_energy_totals(period="giorno"):
+    """Wh totals for one period of the dashboard bars, or None when the server
+    cannot be reached."""
+    try:
+        r = requests.get(REMOTE_LIVE_URL, timeout=8)
+        r.raise_for_status()
+        return ((r.json().get("oraria") or {}).get("totali") or {}).get(period)
+    except (requests.exceptions.RequestException, ValueError, AttributeError) as e:
+        log(f"[report] energy totals: {e}")
+        return None
+
+
+def fmt_wh(wh):
+    """Same switch as fmtWh() on the dashboard: Wh below 1 kWh."""
+    return f"{wh / 1000:.2f} kWh" if wh >= 1000 else f"{round(wh)} Wh"
+
+
+# Bar colours: Telegram text has no colour, so the bars are emoji circles,
+# the closest ones to the dashboard's colours (no teal circle: brown for the
+# PV that went into the battery).
+BAR_PV, BAR_USED, BAR_EXPORT = "🟡", "🟢", "🔵"
+BAR_CHARGE, BAR_DISCHARGE = "🟤", "🟠"
+BAR_CASA, BAR_BATT, BAR_GRID = "🟣", "🟡", "🔴"
+
+
+def emoji_bar(value, vmax, square, width=10):
+    """A bar of `width` circles at most; anything above zero shows at least one."""
+    cells = round(max(0.0, value) / vmax * width) if vmax > 0 else 0
+    return square * (cells or (1 if value > 0 else 0))
+
+
+def bar_block(title, rows, fmt=fmt_wh):
+    """One group of bars. rows[0] is the total; the others get their share of
+    it unless flagged no_pct. Scaled on the longest row, as renderTotalsChart()
+    does. `fmt` prints the values (Wh or W).
+
+    Emoji have no fixed width, so the bar goes last: label, value and share
+    sit in <code> and stay aligned. Inline <code>, not <pre>: Telegram puts a
+    "copy code" button under every <pre>."""
+    vmax = max([r[1] for r in rows] + [1])
+    total = rows[0][1]
+    out = [f"<b>{title}</b>"]
+    for i, (label, v, no_pct, square) in enumerate(rows):
+        pct = f" {round(v / total * 100):>3}%" if i and total > 0 and not no_pct else "     "
+        out.append(f"<code>{label:<9} {fmt(v):>9}{pct}</code> {emoji_bar(v, vmax, square)}")
+    return "\n".join(out)
+
+
+def format_energy_bars():
+    """Today's production and consumption bars, the text twin of the dashboard's
+    "Energia ora per ora" totals. Bar IDs as in docs/barre-energia.html."""
+    t = fetch_energy_totals()
+    if not t:
+        return None
+    blocks = []
+    if "pv" in t:
+        rows = [("Totale", t["pv"], False, BAR_PV)]                               # [FV-TOT]
+        if "export" in t:
+            pv_grid = t.get("pv_grid", min(t["export"], t["pv"]))
+            used = max(0.0, t["pv"] - pv_grid)
+            rows += [("Usata", used, False, BAR_USED),                            # [FV-USATA]
+                     ("Immessa", pv_grid, False, BAR_EXPORT)]                     # [FV-IMM]
+            pv_casa = t.get("pv_casa", t.get("casa_pv"))
+            if pv_casa is not None:
+                rows.append(("Caricata", max(0.0, used - pv_casa), False, BAR_CHARGE))  # [FV-CAR]
+        if "batt" in t:
+            rows.append(("Scaricata", t["batt"], True, BAR_DISCHARGE))            # [FV-SCA]
+        blocks.append(bar_block("☀️ Produzione FV oggi", rows))
+    if "casa" in t:
+        rows = [("Totale", t["casa"], False, BAR_CASA)]                           # [CASA-TOT]
+        rows += [(label, t[key], False, square)
+                 for key, label, square in (("casa_pv", "FV", BAR_USED),          # [CASA-FV]
+                                            ("casa_batt", "Batteria", BAR_BATT),  # [CASA-BATT]
+                                            ("casa_grid", "Rete", BAR_GRID))      # [CASA-RETE]
+                 if key in t]
+        blocks.append(bar_block("🏠 Consumo casa oggi", rows))
+    return "\n\n".join(blocks) or None
 
 
 # ── Battery report ──────────────────────────────────────────────────────────

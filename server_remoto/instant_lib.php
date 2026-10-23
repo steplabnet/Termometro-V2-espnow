@@ -177,6 +177,21 @@ defined('BATT_PV_OFF_W') || define('BATT_PV_OFF_W', 10.0);
  * non stanno mai esattamente a zero. */
 defined('BATT_COVER_W') || define('BATT_COVER_W', 30.0);
 
+/** Card "Carichi consigliati": energia minima nel pacco, in kWh, perche' valga
+ * la pena accendere un elettrodomestico (oltre al FV sopra il consumo casa). */
+defined('CARICHI_MIN_BATT_KWH') || define('CARICHI_MIN_BATT_KWH', 1.8);
+
+/** I carichi della card e l'avanzo FV, in watt, che serve per il pallino
+ * verde: la batteria eroga al massimo 800 W, quindi e' la parte del carico
+ * che resta al fotovoltaico. Sotto questa soglia (ma col requisito base
+ * soddisfatto) il pallino e' giallo. */
+defined('CARICHI') || define('CARICHI', [
+  'Lavatrice' => 700,
+  'Lavastoviglie' => 700,
+  'Piastra induzione' => 100,
+  'Forno' => 1200,
+]);
+
 /** How far back the autonomy estimate looks. Long enough that a kettle does
  * not set the slope, short enough to follow the evening as it changes. */
 defined('BATT_ETA_WINDOW') || define('BATT_ETA_WINDOW', 1800);
@@ -1098,10 +1113,10 @@ function energyTotals(mysqli $link, int $now): ?array
         $from = in_array($ch, ['pv', 'export', 'batt'], true) ? max($t0, $pvFrom) : $t0;
         $sel[] = "SUM(CASE WHEN ora >= {$from} THEN {$ch}_wh ELSE 0 END) AS {$k}_{$ch}";
       }
-      // L'FV usato in casa sullo stesso periodo dei contatori FV, per la
+      // [FV-CAR] L'FV usato in casa sullo stesso periodo dei contatori FV, per la
       // parte caricata in batteria (casa_pv resta quello del consumo casa).
       $sel[] = 'SUM(CASE WHEN ora >= ' . max($t0, $pvFrom) . " THEN casa_pv_wh ELSE 0 END) AS {$k}_pv_casa";
-      // L'FV finito in rete, ora per ora: l'immessa, ma mai piu' di quanto
+      // [FV-IMM] L'FV finito in rete, ora per ora: l'immessa, ma mai piu' di quanto
       // l'FV aveva lasciato dopo la casa. Di notte la batteria rimanda in rete
       // qualche watt, e quella immessa non e' fotovoltaico.
       if (in_array('export', $chans, true)) {
@@ -2471,6 +2486,35 @@ function meteo_build_payload(mysqli $link): array
     ];
   }
 
+  /* Carichi consigliati: quali elettrodomestici accendere adesso. Il requisito
+   * e' lo stesso per tutti -- il fotovoltaico supera il consumo casa e nel
+   * pacco restano almeno CARICHI_MIN_BATT_KWH -- e la soglia di ogni carico
+   * (avanzo FV che, coi 800 W della batteria, lo regge) decide verde o giallo. */
+  $carichiResiduo = ($safeBattSoc0 === null) ? null : $safeBattSoc0 / 100 * BATT_CAPACITY_KWH;
+  $carichiSurplus = ($safePv0 !== null && $safeCasa0 !== null) ? $safePv0 - $safeCasa0 : null;
+  $carichiPvOk = ($carichiSurplus !== null && $carichiSurplus > 0);
+  $carichiBattOk = ($carichiResiduo !== null && $carichiResiduo >= CARICHI_MIN_BATT_KWH);
+  $carichiOk = $carichiPvOk && $carichiBattOk;
+  $carichiList = '';
+  // Nome in nero e un pallino: verde l'avanzo FV raggiunge la soglia del
+  // carico, giallo no, rosso nessun avanzo FV, grigio batteria sotto soglia.
+  // In ordine di distanza dal verde: l'avanzo e' lo stesso per tutti, quindi
+  // basta ordinare per soglia, la piu' bassa in cima.
+  $carichiSorted = CARICHI;
+  asort($carichiSorted);
+  foreach ($carichiSorted as $nome => $w) {
+    $col = !$carichiPvOk ? 'var(--accent-red)'
+      : (!$carichiBattOk ? 'var(--text-muted)'
+        : (($carichiSurplus >= $w) ? 'var(--accent-green)' : 'var(--accent-yellow)'));
+    $carichiList .= '<div class="load-row"><span class="load-dot" style="background:' . $col . ';"></span>'
+      . $nome . '</div>';
+  }
+  // Perche' no: la prima condizione che manca, detta con i numeri.
+  $carichiWhy = $carichiOk ? 'Avanzo FV ' . fmtW($carichiSurplus)
+    : (($carichiSurplus === null || $carichiResiduo === null) ? 'Dati non disponibili'
+      : (!$carichiPvOk ? 'FV sotto il consumo casa'
+        : 'Batteria sotto ' . number_format(CARICHI_MIN_BATT_KWH, 1) . ' kWh'));
+
   // How much of the load is NOT bought from the grid -- covered by the panels
   // directly or by the battery giving back. Computed from the import rather
   // than from pvPower, because with a battery in the middle the PV figure on
@@ -2555,6 +2599,16 @@ function meteo_build_payload(mysqli $link): array
       'link' => $pvLink,
       'bars' => $pvBars,
       'barsMax' => $pvBarsMax,
+    ],
+
+    'carichi' => [
+      'ok' => $carichiOk,
+      'state' => $carichiOk ? 'Puoi accendere' : 'Non ora',
+      'stateColor' => $carichiOk ? 'var(--accent-green)' : 'var(--accent-red)',
+      'why' => $carichiWhy,
+      'surplus' => ($carichiSurplus === null) ? '--' : fmtW($carichiSurplus),
+      'residuo' => ($carichiResiduo === null) ? '--' : number_format($carichiResiduo, 2) . ' kWh',
+      'list' => $carichiList,
     ],
 
     'humi' => [

@@ -746,6 +746,29 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
       font-weight: 700;
     }
 
+    /* Card Carichi consigliati: un elettrodomestico per riga, nome in nero e
+       un pallino il cui colore arriva dal payload. */
+    .load-list {
+      margin-top: 8px;
+      font-size: 0.8rem;
+      font-weight: 700;
+      color: var(--text-main);
+    }
+
+    .load-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 2px 0;
+    }
+
+    .load-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
     /* Card Rendimento: le ultime 10 misure come barrette. */
     .eff-bars {
       display: flex;
@@ -1216,6 +1239,40 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
         </div>
       </a>
     </div>
+
+    <?php if ($emAvailable && !empty($p['battAvailable'])): ?>
+      <!-- 4b. Carichi consigliati: via libera quando il FV supera il consumo
+           casa e il pacco ha almeno 1,8 kWh. Verde se l'avanzo FV, coi 800 W
+           della batteria, regge il carico; giallo se no. -->
+      <div class="card border-power" data-card="carichi">
+        <a href="<?php echo $p['pv']['link']; ?>" data-live-href="pv.link">
+          <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-power" viewBox="0 0 24 24"
+            fill="currentColor">
+            <!-- plug -->
+            <path d="M8 2h2v5H8V2zm6 0h2v5h-2V2z" />
+            <path d="M6 7h12v4a6 6 0 0 1-5 5.9V22h-2v-5.1A6 6 0 0 1 6 11V7z" />
+          </svg>
+          <div class="card-label">Carichi consigliati</div>
+          <div class="flow-state" style="font-size:1rem; color:<?php echo $p['carichi']['stateColor']; ?>;"
+            data-live="carichi.state" data-live-color="carichi.stateColor"><?php echo $p['carichi']['state']; ?></div>
+          <div style="font-size:0.7rem; color:var(--text-muted); margin-top:2px;"
+            data-live="carichi.why"><?php echo $p['carichi']['why']; ?></div>
+          <div class="load-list" data-live-html="carichi.list"><?php echo $p['carichi']['list']; ?></div>
+          <div class="mix-legend">
+            <span style="color:var(--accent-green);">&#9679; FV + batteria</span>
+            <span style="color:var(--accent-yellow);">&#9679; poco FV</span>
+            <span style="color:var(--accent-red);">&#9679; niente avanzo FV</span>
+            <span style="color:var(--text-muted);">&#9679; batteria bassa</span>
+          </div>
+          <div class="minmax-row">
+            <div class="minmax-item"><span class="minmax-label">Avanzo FV</span><span class="minmax-val"
+                data-live="carichi.surplus"><?php echo $p['carichi']['surplus']; ?></span></div>
+            <div class="minmax-item"><span class="minmax-label">Batteria</span><span class="minmax-val"
+                data-live="carichi.residuo"><?php echo $p['carichi']['residuo']; ?></span></div>
+          </div>
+        </a>
+      </div>
+    <?php endif; ?>
 
     <!-- 5. Umidità -->
     <div class="card border-humi" data-card="humi">
@@ -2009,9 +2066,9 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
       // card's mix bar. Whatever the parts do not cover (hours from before
       // they were recorded) stays in the plain casa colour on top.
       var CASA_PARTS = [
-        { key: 'casa_pv', label: 'FV', color: '#16a34a' },
-        { key: 'casa_batt', label: 'Batteria', color: '#eab308' },
-        { key: 'casa_grid', label: 'Rete', color: '#ef4444' }
+        { key: 'casa_pv', label: 'FV', color: '#16a34a' },          // [CASA-FV]
+        { key: 'casa_batt', label: 'Batteria', color: '#eab308' },  // [CASA-BATT]
+        { key: 'casa_grid', label: 'Rete', color: '#ef4444' }        // [CASA-RETE]
       ];
       function fmtWh(wh) {
         return wh >= 1000 ? (wh / 1000).toFixed(2) + ' kWh' : Math.round(wh) + ' Wh';
@@ -2031,6 +2088,9 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
         renderTotals(o);
       }
       /**
+       * Bar IDs ([FV-TOT], [CASA-RETE], ...) are explained in
+       * docs/barre-energia.html.
+       *
        * Today, this month and this year as horizontal bars, one chart per
        * period on the period's own scale (the total is the longest): house
        * consumption and the three sources covering it, and PV production split
@@ -2051,13 +2111,13 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
           }
           var casaRows = null, pvRows = null;
           if (t && 'casa' in t) {
-            casaRows = [{ label: 'Totale', color: HOURLY_COLORS.casa, wh: t.casa }].concat(
+            casaRows = [{ label: 'Totale', color: HOURLY_COLORS.casa, wh: t.casa }].concat(  // [CASA-TOT]
               CASA_PARTS.filter(function (pt) { return pt.key in t; }).map(function (pt) {
                 return { label: pt.label, color: pt.color, wh: t[pt.key] };
               }));
           }
           if (t && 'pv' in t) {
-            pvRows = [{ label: 'Totale', color: HOURLY_COLORS.pv, wh: t.pv }];
+            pvRows = [{ label: 'Totale', color: HOURLY_COLORS.pv, wh: t.pv }];  // [FV-TOT]
             if ('export' in t) {
               // What PV sent to the battery is what neither the house nor the
               // grid took: sample by sample that is the charge it covered.
@@ -2065,17 +2125,17 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
               // battery fed back to the grid (energyTotals).
               var pvGrid = ('pv_grid' in t) ? t.pv_grid : Math.min(t.export, t.pv);
               var used = Math.max(0, t.pv - pvGrid);
-              pvRows.push({ label: 'Usata', color: '#16a34a', wh: used },
-                { label: 'Immessa', color: '#3b82f6', wh: pvGrid });
+              pvRows.push({ label: 'Usata', color: '#16a34a', wh: used },  // [FV-USATA]
+                { label: 'Immessa', color: '#3b82f6', wh: pvGrid });          // [FV-IMM]
               // pv_casa: the house's PV over the PV counters' own period.
               var pvCasa = ('pv_casa' in t) ? t.pv_casa : t.casa_pv;
               if (pvCasa != null) {
-                pvRows.push({ label: 'Caricata', color: '#14b8a6', wh: Math.max(0, used - pvCasa) });
+                pvRows.push({ label: 'Caricata', color: '#14b8a6', wh: Math.max(0, used - pvCasa) });  // [FV-CAR]
               }
             }
             // What the battery gave back: not a share of the PV, so no %.
             if ('batt' in t) {
-              pvRows.push({ label: 'Scaricata', color: '#f59e0b', wh: t.batt, noPct: true });
+              pvRows.push({ label: 'Scaricata', color: '#f59e0b', wh: t.batt, noPct: true });  // [FV-SCA]
             }
           }
           renderTotalsChart(document.getElementById('hourly-casa-totals-' + per), casaRows);

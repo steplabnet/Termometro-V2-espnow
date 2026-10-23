@@ -231,20 +231,21 @@ function store_write_minmax(mysqli $link, int $now): void
  */
 function energy_hourly_accumulate(mysqli $link, ?float $pv, ?float $grid, ?float $batt, int $now): void
 {
-  $casa = ($pv === null || $grid === null) ? null : max(0.0, $pv + $grid - ($batt ?? 0.0));
+  // ID delle barre ([CASA-TOT], [FV-SCA], ...): vedi docs/barre-energia.html.
+  $casa = ($pv === null || $grid === null) ? null : max(0.0, $pv + $grid - ($batt ?? 0.0));  // [CASA-TOT]
   $vals = [
-    'pv' => ($pv === null) ? null : max(0.0, $pv),
+    'pv' => ($pv === null) ? null : max(0.0, $pv),                // [FV-TOT]
     'casa' => $casa,
-    'batt' => ($batt === null) ? null : max(0.0, -$batt),
+    'batt' => ($batt === null) ? null : max(0.0, -$batt),         // [FV-SCA]
     'casa_grid' => null,
     'casa_batt' => null,
     'casa_pv' => null,
-    'export' => ($grid === null) ? null : max(0.0, -$grid),
+    'export' => ($grid === null) ? null : max(0.0, -$grid),       // [FV-IMM]
   ];
   if ($casa !== null) {
-    $vals['casa_grid'] = min(max(0.0, $grid), $casa);
-    $vals['casa_batt'] = min(max(0.0, -($batt ?? 0.0)), $casa - $vals['casa_grid']);
-    $vals['casa_pv'] = max(0.0, $casa - $vals['casa_grid'] - $vals['casa_batt']);
+    $vals['casa_grid'] = min(max(0.0, $grid), $casa);                                   // [CASA-RETE]
+    $vals['casa_batt'] = min(max(0.0, -($batt ?? 0.0)), $casa - $vals['casa_grid']);  // [CASA-BATT]
+    $vals['casa_pv'] = max(0.0, $casa - $vals['casa_grid'] - $vals['casa_batt']);     // [CASA-FV]
   }
   if (!array_filter($vals, static fn($v) => $v !== null)) {
     return;   // no meter reading in this message: keep the previous samples

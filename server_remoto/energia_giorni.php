@@ -3,6 +3,7 @@
  * manca) le stesse barre orizzontali della card "Energia ora per ora" di
  * index.php -- produzione FV (usata, di cui in batteria, immessa) e consumo
  * casa con le tre sorgenti -- sommate dalle righe di `energia_oraria`.
+ * ID delle barre ([FV-TOT], [CASA-RETE], ...): vedi docs/barre-energia.html.
  * Le ore prima del 18/10/2026 sono ricostruite dalle letture ogni 10 minuti di
  * dati_meteo, quindi sono stime.
  */
@@ -278,21 +279,21 @@ $titolo = $giorni[(int) date('w', $t0)] . ' ' . $g . ' ' . $mesi[$m] . ' ' . $y;
         <?php if ($t0 < $pvFrom): ?>
           <div class="empty">Contatori FV dal <?php echo date('d/m/Y', $pvFrom); ?>.</div>
         <?php else: echo bars([
-          ['Totale', '#eab308', $t['pv']],
-          ['Usata', '#16a34a', $used],
-          ['Immessa', '#3b82f6', $t['pv_grid']],
-          ['Caricata', '#14b8a6', max(0.0, $used - $t['casa_pv'])],
-          ['Scaricata', '#f59e0b', $t['batt'], true],   // non e' una quota del FV
+          ['Totale', '#eab308', $t['pv']],                              // [FV-TOT]
+          ['Usata', '#16a34a', $used],                                  // [FV-USATA]
+          ['Immessa', '#3b82f6', $t['pv_grid']],                        // [FV-IMM]
+          ['Caricata', '#14b8a6', max(0.0, $used - $t['casa_pv'])],     // [FV-CAR]
+          ['Scaricata', '#f59e0b', $t['batt'], true],   // [FV-SCA] non e' una quota del FV
         ], "Produzione FV del {$titolo}"); endif; ?>
       </div>
 
       <div class="card casa">
         <h2>Consumo casa</h2>
         <?php echo bars([
-          ['Totale', '#8b5cf6', $t['casa']],
-          ['FV', '#16a34a', $t['casa_pv']],
-          ['Batteria', '#eab308', $t['casa_batt']],
-          ['Rete', '#ef4444', $t['casa_grid']],
+          ['Totale', '#8b5cf6', $t['casa']],         // [CASA-TOT]
+          ['FV', '#16a34a', $t['casa_pv']],          // [CASA-FV]
+          ['Batteria', '#eab308', $t['casa_batt']],  // [CASA-BATT]
+          ['Rete', '#ef4444', $t['casa_grid']],      // [CASA-RETE]
         ], "Consumo casa del {$titolo}"); ?>
       </div>
 
