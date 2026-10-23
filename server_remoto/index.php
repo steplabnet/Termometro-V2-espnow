@@ -2061,9 +2061,12 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
             if ('export' in t) {
               // What PV sent to the battery is what neither the house nor the
               // grid took: sample by sample that is the charge it covered.
-              var used = Math.max(0, t.pv - t.export);
+              // pv_grid: the export the PV actually made, without what the
+              // battery fed back to the grid (energyTotals).
+              var pvGrid = ('pv_grid' in t) ? t.pv_grid : Math.min(t.export, t.pv);
+              var used = Math.max(0, t.pv - pvGrid);
               pvRows.push({ label: 'Usata', color: '#16a34a', wh: used },
-                { label: 'Immessa', color: '#3b82f6', wh: Math.min(t.export, t.pv) });
+                { label: 'Immessa', color: '#3b82f6', wh: pvGrid });
               // pv_casa: the house's PV over the PV counters' own period.
               var pvCasa = ('pv_casa' in t) ? t.pv_casa : t.casa_pv;
               if (pvCasa != null) {

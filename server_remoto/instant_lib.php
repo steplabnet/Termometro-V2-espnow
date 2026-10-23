@@ -1101,6 +1101,13 @@ function energyTotals(mysqli $link, int $now): ?array
       // L'FV usato in casa sullo stesso periodo dei contatori FV, per la
       // parte caricata in batteria (casa_pv resta quello del consumo casa).
       $sel[] = 'SUM(CASE WHEN ora >= ' . max($t0, $pvFrom) . " THEN casa_pv_wh ELSE 0 END) AS {$k}_pv_casa";
+      // L'FV finito in rete, ora per ora: l'immessa, ma mai piu' di quanto
+      // l'FV aveva lasciato dopo la casa. Di notte la batteria rimanda in rete
+      // qualche watt, e quella immessa non e' fotovoltaico.
+      if (in_array('export', $chans, true)) {
+        $sel[] = 'SUM(CASE WHEN ora >= ' . max($t0, $pvFrom)
+          . " THEN LEAST(export_wh, GREATEST(0, pv_wh - casa_pv_wh)) ELSE 0 END) AS {$k}_pv_grid";
+      }
     }
     try {
       $res = $link->query('SELECT ' . implode(', ', $sel)
@@ -1117,8 +1124,10 @@ function energyTotals(mysqli $link, int $now): ?array
   }
   $out = [];
   foreach (array_keys($starts) as $k) {
-    foreach (array_merge($chans, ['pv_casa']) as $ch) {
-      $out[$k][$ch] = round((float) ($r["{$k}_{$ch}"] ?? 0), 1);
+    foreach (array_merge($chans, ['pv_casa', 'pv_grid']) as $ch) {
+      if (array_key_exists("{$k}_{$ch}", $r)) {
+        $out[$k][$ch] = round((float) $r["{$k}_{$ch}"], 1);
+      }
     }
   }
   return $out;

@@ -36,11 +36,13 @@ try {
 $chans = ['pv', 'casa', 'batt', 'casa_pv', 'casa_batt', 'casa_grid', 'export'];
 $t = null;
 try {
-  $sel = implode(', ', array_map(static fn($c) => "SUM({$c}_wh) AS {$c}", $chans));
+  $sel = implode(', ', array_map(static fn($c) => "SUM({$c}_wh) AS {$c}", $chans))
+    // L'FV finito in rete, come in energyTotals(): non l'immessa della batteria.
+    . ', SUM(LEAST(export_wh, GREATEST(0, pv_wh - casa_pv_wh))) AS pv_grid';
   $r = $link->query("SELECT COUNT(*) AS n, {$sel} FROM energia_oraria WHERE ora >= {$t0} AND ora < {$t1}");
   $row = ($r instanceof mysqli_result) ? $r->fetch_assoc() : null;
   if ($row && (int) $row['n'] > 0) {
-    $t = array_map('floatval', array_intersect_key($row, array_flip($chans)));
+    $t = array_map('floatval', array_intersect_key($row, array_flip(array_merge($chans, ['pv_grid']))));
   }
 } catch (Throwable $e) {
 }
@@ -268,7 +270,7 @@ $titolo = $giorni[(int) date('w', $t0)] . ' ' . $g . ' ' . $mesi[$m] . ' ' . $y;
         <div class="empty">Nessun dato per questo giorno.</div>
       </div>
     <?php else:
-      $used = max(0.0, $t['pv'] - $t['export']);
+      $used = max(0.0, $t['pv'] - $t['pv_grid']);
       $pvFrom = strtotime(ENERGY_PV_FROM);
       ?>
       <div class="card">
@@ -278,7 +280,7 @@ $titolo = $giorni[(int) date('w', $t0)] . ' ' . $g . ' ' . $mesi[$m] . ' ' . $y;
         <?php else: echo bars([
           ['Totale', '#eab308', $t['pv']],
           ['Usata', '#16a34a', $used],
-          ['Immessa', '#3b82f6', min($t['export'], $t['pv'])],
+          ['Immessa', '#3b82f6', $t['pv_grid']],
           ['Caricata', '#14b8a6', max(0.0, $used - $t['casa_pv'])],
           ['Scaricata', '#f59e0b', $t['batt'], true],   // non e' una quota del FV
         ], "Produzione FV del {$titolo}"); endif; ?>
