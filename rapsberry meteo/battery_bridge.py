@@ -54,7 +54,7 @@ except ImportError:
 # Give the Venus a DHCP reservation on its WIRED port and put its address here.
 # It has to be the cabled interface, which is a SECOND address with its own MAC:
 # the wifi one (192.168.1.217 here) answers on the LAN but refuses port 502.
-BATTERY_HOST = "192.168.1.153"  # Venus E, wired port (MAC dc:04:5a:7d:ef:ec)
+BATTERY_HOST = "192.168.1.154"  # Venus E, wired port (MAC dc:04:5a:7d:ef:ec)
 BATTERY_PORT = 502
 BATTERY_UNIT = 1                # Modbus unit/slave id; 2, 3... for further units
 POLL_INTERVAL = 5               # seconds between reads

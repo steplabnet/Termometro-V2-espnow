@@ -52,16 +52,23 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
 
 <head>
   <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#f1f5f9">
   <title>Dashboard Meteo Cesana</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
   <style>
     :root {
-      --bg-color: #f0f2f5;
+      --bg-color: #f1f5f9;
       --card-bg: #ffffff;
-      --text-main: #1f2937;
-      --text-muted: #6b7280;
+      --text-main: #0f172a;
+      --text-muted: #64748b;
+      --text-faint: #94a3b8;
+      --line: #e2e8f0;
+      --track: #e2e8f0;
+      --card-border: rgba(15, 23, 42, 0.06);
+      --radius: 20px;
+      --gap: 18px;
       --accent-blue: #3b82f6;
       --accent-orange: #f59e0b;
       --accent-red: #ef4444;
@@ -71,7 +78,8 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
       --accent-purple: #8b5cf6;
       --accent-dry: #92400e;
       --accent-green: #16a34a;
-      --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+      --shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 10px 28px -14px rgba(15, 23, 42, 0.18);
+      --shadow-hover: 0 1px 2px rgba(15, 23, 42, 0.05), 0 18px 36px -16px rgba(15, 23, 42, 0.28);
     }
 
     * {
@@ -80,11 +88,23 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
       padding: 0;
     }
 
+    html {
+      -webkit-text-size-adjust: 100%;
+      -webkit-tap-highlight-color: transparent;
+    }
+
     body {
-      font-family: 'Inter', sans-serif;
-      background-color: var(--bg-color);
+      font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+      background: radial-gradient(1200px 600px at 10% -10%, #e0f2fe 0%, transparent 60%),
+        radial-gradient(900px 500px at 100% 0%, #fef3c7 0%, transparent 55%),
+        var(--bg-color);
+      background-attachment: fixed;
       color: var(--text-main);
-      padding: 20px;
+      padding: 0 20px 28px;
+      padding-left: max(20px, env(safe-area-inset-left));
+      padding-right: max(20px, env(safe-area-inset-right));
+      -webkit-font-smoothing: antialiased;
+      font-feature-settings: 'cv11', 'ss01';
     }
 
     a {
@@ -97,43 +117,78 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
       height: 100%;
     }
 
+    /* Testata fissa e traslucida: titolo a sinistra, i due orologi a destra.
+       Su telefono va su due righe centrate (vedi la media query in fondo). */
     header {
-      text-align: center;
-      margin-bottom: 30px;
+      position: sticky;
+      top: 0;
+      z-index: 10;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px 16px;
+      flex-wrap: wrap;
+      max-width: 1240px;
+      margin: 0 auto 22px;
+      padding: 14px 4px;
+      padding-top: max(14px, env(safe-area-inset-top));
+      background: rgba(241, 245, 249, 0.72);
+      -webkit-backdrop-filter: saturate(180%) blur(14px);
+      backdrop-filter: saturate(180%) blur(14px);
+      border-bottom: 1px solid var(--card-border);
     }
 
     header h1 {
       font-weight: 800;
-      font-size: 1.5rem;
+      font-size: 1.35rem;
+      letter-spacing: -0.02em;
     }
 
     .dashboard-grid {
       display: grid;
-      gap: 20px;
-      max-width: 1200px;
+      gap: var(--gap);
+      max-width: 1240px;
       margin: 0 auto;
-      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      grid-template-columns: repeat(auto-fill, minmax(270px, 1fr));
     }
 
+    /* Il colore della card resta nel bordo alto (le classi border-* e gli
+       stati discharging/exporting/drawing lo cambiano), solo piu' sottile. */
     .card {
+      position: relative;
       background: var(--card-bg);
-      border-radius: 16px;
-      padding: 20px;
+      border-radius: var(--radius);
+      padding: 20px 18px 16px;
       box-shadow: var(--shadow);
-      border-top: 5px solid transparent;
-      transition: transform 0.2s;
-      min-height: 250px;
+      border: 1px solid var(--card-border);
+      border-top: 3px solid transparent;
+      transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.3s ease;
+      min-height: 240px;
+      min-width: 0;   /* senza, il contenuto largo allarga la colonna della griglia */
+      overflow: hidden;
     }
 
-    .card:hover {
-      transform: translateY(-3px);
+    @media (hover: hover) {
+      .card:hover {
+        transform: translateY(-2px);
+        box-shadow: var(--shadow-hover);
+      }
     }
 
+    .card > a:active {
+      opacity: 0.85;
+    }
+
+    /* L'icona sta in una pastiglia tinta del suo stesso colore. */
     .card-icon {
-      width: 48px;
-      height: 48px;
-      margin-bottom: 10px;
+      width: 46px;
+      height: 46px;
+      padding: 10px;
+      margin-bottom: 12px;
+      border-radius: 14px;
       fill: currentColor;
+      background: color-mix(in srgb, currentColor 12%, transparent);
+      flex-shrink: 0;
     }
 
     .icon-temp {
@@ -181,32 +236,42 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
     }
 
     .card-label {
-      font-size: 0.75rem;
+      font-size: 0.7rem;
       font-weight: 600;
       color: var(--text-muted);
       text-transform: uppercase;
-      margin-bottom: 5px;
+      letter-spacing: 0.07em;
+      margin-bottom: 6px;
+      text-align: center;
     }
 
     .card-value {
-      font-size: 2.2rem;
+      font-size: 2.4rem;
       font-weight: 800;
       line-height: 1;
+      letter-spacing: -0.03em;
+      font-variant-numeric: tabular-nums;
     }
 
     .card-unit {
-      font-size: 1rem;
+      font-size: 0.95rem;
+      font-weight: 600;
+      letter-spacing: 0;
       color: var(--text-muted);
-      margin-left: 3px;
+      margin-left: 4px;
     }
 
     .minmax-row {
       display: flex;
       justify-content: center;
       width: 100%;
-      padding-top: 15px;
-      border-top: 1px solid #eee;
+      padding-top: 12px;
+      border-top: 1px solid var(--line);
       margin-top: auto;
+    }
+
+    .minmax-row + .minmax-row {
+      margin-top: 10px;
     }
 
     .minmax-item {
@@ -215,15 +280,23 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
       flex-direction: column;
       align-items: center;
       text-align: center;
-      font-size: 0.75rem;
+      font-size: 0.78rem;
+      font-variant-numeric: tabular-nums;
+      min-width: 0;
+    }
+
+    .minmax-item + .minmax-item {
+      border-left: 1px solid var(--line);
     }
 
     .minmax-label {
       display: block;
-      color: #9ca3af;
-      font-size: 0.65rem;
+      color: var(--text-faint);
+      font-size: 0.6rem;
+      font-weight: 600;
+      letter-spacing: 0.06em;
       text-transform: uppercase;
-      margin-bottom: 2px;
+      margin-bottom: 3px;
     }
 
     .ice-prediction {
@@ -283,7 +356,7 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
       justify-content: space-between;
       width: 100%;
       padding-top: 15px;
-      border-top: 1px solid #eee;
+      border-top: 1px solid var(--line);
       margin-top: auto;
       gap: 2px;
     }
@@ -298,7 +371,7 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
     }
 
     .rain-when {
-      color: #9ca3af;
+      color: var(--text-faint);
       font-size: 0.6rem;
       font-variant-numeric: tabular-nums;
       text-transform: uppercase;
@@ -315,7 +388,7 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
 
     .rain-prob {
       font-size: 0.6rem;
-      color: #9ca3af;
+      color: var(--text-faint);
       font-variant-numeric: tabular-nums;
       margin-top: 1px;
     }
@@ -332,7 +405,7 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
       align-items: flex-end;
       gap: 2px;
       height: 44px;
-      border-bottom: 1px solid #e5e7eb;
+      border-bottom: 1px solid var(--line);
     }
 
     .rain-bar {
@@ -352,7 +425,7 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
       flex: 1;
       min-width: 0;
       font-size: 0.5rem;
-      color: #9ca3af;
+      color: var(--text-faint);
       font-variant-numeric: tabular-nums;
       text-align: center;
       white-space: nowrap;
@@ -590,7 +663,7 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
       display: inline-block;
       padding: 8px 14px;
       border-radius: 999px;
-      border: 1px solid #e5e7eb;
+      border: 1px solid var(--line);
       font-size: 0.85rem;
       font-weight: 600;
       color: var(--accent-blue);
@@ -603,7 +676,7 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
 
     /* Arrivati dal link di Consumo casa: un lampo per dire quale grafico. */
     .hourly-block {
-      scroll-margin-top: 20px;
+      scroll-margin-top: 90px;   /* sotto la testata fissa */
       border-radius: 12px;
     }
 
@@ -656,7 +729,7 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
       font-weight: 600;
       text-transform: uppercase;
       letter-spacing: 0.05em;
-      color: #9ca3af;
+      color: var(--text-faint);
       margin: 10px 0 3px;
       text-align: left;
     }
@@ -707,7 +780,7 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
       height: 8px;
       margin-top: 10px;
       border-radius: 999px;
-      background: #e5e7eb;
+      background: var(--track);
       overflow: hidden;
     }
 
@@ -727,7 +800,7 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
       height: 8px;
       margin-top: 10px;
       border-radius: 999px;
-      background: #e5e7eb;
+      background: var(--track);
       overflow: hidden;
     }
 
@@ -903,15 +976,44 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
       margin-right: -4px;
     }
 
+    /* I due orologi in una pillola, con un pallino "live" che pulsa verde
+       finche' il poller riceve risposte e diventa rosso quando smette. */
     .header-meta {
       display: flex;
       flex-wrap: wrap;
       justify-content: center;
-      align-items: baseline;
+      align-items: center;
       gap: 6px;
-      font-size: 0.85rem;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+      font-size: 0.8rem;
+      font-weight: 600;
       font-variant-numeric: tabular-nums;
-      color: var(--text-muted);
+      color: var(--text-main);
+    }
+
+    .header-meta::before {
+      content: '';
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--accent-green);
+      box-shadow: 0 0 0 0 rgba(22, 163, 74, 0.5);
+      animation: live-dot 2s infinite;
+    }
+
+    .header-meta:has(#live-updated.stale)::before {
+      background: var(--accent-red);
+      animation: none;
+    }
+
+    @keyframes live-dot {
+      0% { box-shadow: 0 0 0 0 rgba(22, 163, 74, 0.45); }
+      70% { box-shadow: 0 0 0 7px rgba(22, 163, 74, 0); }
+      100% { box-shadow: 0 0 0 0 rgba(22, 163, 74, 0); }
     }
 
     .header-meta .meta-label {
@@ -930,6 +1032,109 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
     #live-updated.stale {
       color: var(--accent-red);
       font-weight: 700;
+    }
+
+    footer {
+      margin-top: 36px;
+      text-align: center;
+      font-size: 0.75rem;
+      color: var(--text-faint);
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .card, .header-meta::before { transition: none; animation: none; }
+    }
+
+    /* Tablet: card un po' piu' strette, cosi' ne stanno due per riga. */
+    @media (max-width: 900px) {
+      :root { --gap: 14px; }
+
+      .dashboard-grid {
+        grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+      }
+    }
+
+    /* Telefono: due colonne. Le card da un numero solo (temperature, umidita',
+       Piave, potenze, i due link) stanno affiancate e compatte; tutte le altre
+       -- liste, griglie di valori, grafici -- prendono la riga intera. Il
+       flusso "dense" riempie i buchi che lasciano le card larghe. */
+    @media (max-width: 600px) {
+      :root { --gap: 10px; --radius: 18px; }
+
+      body {
+        padding: 0 10px 20px;
+        padding-left: max(10px, env(safe-area-inset-left));
+        padding-right: max(10px, env(safe-area-inset-right));
+      }
+
+      header {
+        justify-content: center;
+        text-align: center;
+        margin-bottom: 14px;
+        padding: 10px 0;
+        padding-top: max(10px, env(safe-area-inset-top));
+      }
+
+      header h1 { font-size: 1.1rem; width: 100%; }
+
+      html, body { overflow-x: clip; }
+
+      .header-meta { font-size: 0.72rem; padding: 4px 10px; }
+
+      .dashboard-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-auto-flow: row dense;
+      }
+
+      .card {
+        grid-column: 1 / -1;
+        min-height: 0;
+        padding: 16px 14px 14px;
+      }
+
+      .card[data-card="tempSole"], .card[data-card="tempOmbra"],
+      .card[data-card="tempInterno"], .card[data-card="humi"],
+      .card[data-card="piave"], .card[data-card="pv"],
+      .card[data-card="grid"], .card[data-card="prelievo"],
+      .card.border-feedback, .card.border-multi {
+        grid-column: auto;
+        padding: 14px 10px 12px;
+      }
+
+      .card-icon {
+        width: 40px;
+        height: 40px;
+        padding: 8px;
+        border-radius: 12px;
+        margin-bottom: 8px;
+      }
+
+      .card-value { font-size: 2rem; }
+
+      .card[data-card="tempSole"] .card-value, .card[data-card="tempOmbra"] .card-value,
+      .card[data-card="tempInterno"] .card-value, .card[data-card="humi"] .card-value,
+      .card[data-card="piave"] .card-value, .card[data-card="pv"] .card-value,
+      .card[data-card="grid"] .card-value, .card[data-card="prelievo"] .card-value {
+        font-size: 1.65rem;
+      }
+
+      .card.border-feedback .card-value, .card.border-multi .card-value {
+        font-size: 1rem !important;
+      }
+
+      .card-label { font-size: 0.62rem; letter-spacing: 0.05em; }
+
+      .card-unit { font-size: 0.8rem; }
+
+      .minmax-item { font-size: 0.72rem; }
+
+      .minmax-label { font-size: 0.55rem; letter-spacing: 0.03em; }
+
+      .diag-rows { font-size: 0.78rem; gap: 3px 8px; }
+
+      .hourly-chart { height: 180px; }
+
+      .hourly-legend { gap: 6px 12px; font-size: 0.72rem; }
     }
   </style>
 </head>
@@ -1050,6 +1255,98 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
         </div>
       </a>
     </div>
+
+    <!-- 4. Produzione Fotovoltaico (Shelly Pro EM-50, canale em1:1) -->
+    <div class="card border-power <?php echo $p['pv']['night'] ? 'night-mode' : ''; ?>" data-card="pv">
+      <a href="<?php echo $p['pv']['link']; ?>" data-live-href="pv.link">
+
+        <!-- Day icon: solar panel + lightning -->
+        <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-power icon-day" viewBox="0 0 24 24"
+          fill="currentColor">
+          <!-- panel -->
+          <path d="M3 11h18l-1 8H4l-1-8zm2 2 .5 4h13L19 13H5z" opacity="0.9" />
+          <path d="M4 9h16v2H4V9z" />
+          <!-- panel grid -->
+          <path d="M8 11.5v7M12 11.5v7M16 11.5v7" opacity="0.35" />
+          <path d="M5.8 14.5h12.4" opacity="0.35" />
+          <!-- lightning -->
+          <path d="M13 2 8 12h4l-1 10 5-10h-4l1-10z" />
+        </svg>
+
+        <!-- Night icon: solar panel + moon -->
+        <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-night" viewBox="0 0 24 24" fill="currentColor">
+          <!-- moon -->
+          <path
+            d="M18.5 2.5c-3.6.6-6.3 3.7-6.3 7.5 0 4.2 3.4 7.6 7.6 7.6 1.1 0 2.1-.2 3-.6-1.2 2.8-4 4.8-7.2 4.8-4.3 0-7.8-3.5-7.8-7.8 0-3.8 2.7-6.9 6.3-7.5-.6-.2-1.1-.3-1.6-.3z"
+            opacity="0.9" />
+          <!-- panel -->
+          <path d="M3 11h18l-1 8H4l-1-8zm2 2 .5 4h13L19 13H5z" opacity="0.55" />
+          <path d="M4 9h16v2H4V9z" opacity="0.55" />
+          <!-- panel grid -->
+          <path d="M8 11.5v7M12 11.5v7M16 11.5v7" opacity="0.25" />
+          <path d="M5.8 14.5h12.4" opacity="0.25" />
+        </svg>
+
+        <div class="card-label">Produzione Fotovoltaico</div>
+        <div class="card-value"><span data-live="pv.val"><?php echo $p['pv']['val']; ?></span><span
+            class="card-unit">W</span></div>
+        <!-- Le ultime 10 letture, come nella card Consumo Casa. -->
+        <div class="eff-bars" data-live-html="pv.bars"><?php echo $p['pv']['bars'] ?? ''; ?></div>
+        <div style="font-size:0.65rem; color:var(--text-muted); margin-top:2px;">
+          ultime 10 letture · max <span data-live="pv.barsMax"><?php echo $p['pv']['barsMax'] ?? ''; ?></span>
+        </div>
+
+        <div style="font-weight:800; font-size:0.75rem; color:<?php echo $p['pv']['skyColor']; ?>; margin-top:5px; text-transform:uppercase; <?php echo showStyle($p['pv']['skyText'] !== ''); ?>"
+          data-live-show="pv.skyText" data-live-color="pv.skyColor">
+          &#9728; <span data-live="pv.skyText"><?php echo $p['pv']['skyText']; ?></span>
+        </div>
+
+        <div class="minmax-row">
+          <div class="minmax-item">
+            <span class="minmax-label">Picco 24h</span>
+            <span class="minmax-val" data-live="pv.peak"><?php echo $p['pv']['peak']; ?></span>
+          </div>
+          <div class="minmax-item">
+            <span class="minmax-label">Ieri stessa ora</span>
+            <span class="minmax-val" data-live="pv.yesterday"><?php echo $p['pv']['yesterday']; ?></span>
+          </div>
+        </div>
+      </a>
+    </div>
+
+    <?php if ($emAvailable && !empty($p['battAvailable'])): ?>
+      <!-- 4b. Carichi consigliati: via libera quando il FV supera il consumo
+           casa e il pacco e' almeno al 30%. Verde se l'avanzo FV, coi 800 W
+           della batteria, regge il carico; giallo se no. -->
+      <div class="card border-power" data-card="carichi">
+        <a href="<?php echo $p['pv']['link']; ?>" data-live-href="pv.link">
+          <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-power" viewBox="0 0 24 24"
+            fill="currentColor">
+            <!-- plug -->
+            <path d="M8 2h2v5H8V2zm6 0h2v5h-2V2z" />
+            <path d="M6 7h12v4a6 6 0 0 1-5 5.9V22h-2v-5.1A6 6 0 0 1 6 11V7z" />
+          </svg>
+          <div class="card-label">Carichi consigliati</div>
+          <div class="flow-state" style="font-size:1rem; color:<?php echo $p['carichi']['stateColor']; ?>;"
+            data-live="carichi.state" data-live-color="carichi.stateColor"><?php echo $p['carichi']['state']; ?></div>
+          <div style="font-size:0.7rem; color:var(--text-muted); margin-top:2px;"
+            data-live="carichi.why"><?php echo $p['carichi']['why']; ?></div>
+          <div class="load-list" data-live-html="carichi.list"><?php echo $p['carichi']['list']; ?></div>
+          <div class="mix-legend">
+            <span style="color:var(--accent-green);">&#9679; FV + batteria</span>
+            <span style="color:var(--accent-yellow);">&#9679; poco FV</span>
+            <span style="color:var(--accent-red);">&#9679; niente avanzo FV</span>
+            <span style="color:var(--text-muted);">&#9679; batteria bassa</span>
+          </div>
+          <div class="minmax-row">
+            <div class="minmax-item"><span class="minmax-label">Avanzo FV</span><span class="minmax-val"
+                data-live="carichi.surplus"><?php echo $p['carichi']['surplus']; ?></span></div>
+            <div class="minmax-item"><span class="minmax-label">Batteria</span><span class="minmax-val"
+                data-live="carichi.residuo"><?php echo $p['carichi']['residuo']; ?></span></div>
+          </div>
+        </a>
+      </div>
+    <?php endif; ?>
 
     <!-- 4. Pressione / Forecast -->
     <!-- Every icon variant is in the DOM; the poller shows the one that matches
@@ -1181,98 +1478,6 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
         </div>
       </a>
     </div>
-
-    <!-- 4. Produzione Fotovoltaico (Shelly Pro EM-50, canale em1:1) -->
-    <div class="card border-power <?php echo $p['pv']['night'] ? 'night-mode' : ''; ?>" data-card="pv">
-      <a href="<?php echo $p['pv']['link']; ?>" data-live-href="pv.link">
-
-        <!-- Day icon: solar panel + lightning -->
-        <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-power icon-day" viewBox="0 0 24 24"
-          fill="currentColor">
-          <!-- panel -->
-          <path d="M3 11h18l-1 8H4l-1-8zm2 2 .5 4h13L19 13H5z" opacity="0.9" />
-          <path d="M4 9h16v2H4V9z" />
-          <!-- panel grid -->
-          <path d="M8 11.5v7M12 11.5v7M16 11.5v7" opacity="0.35" />
-          <path d="M5.8 14.5h12.4" opacity="0.35" />
-          <!-- lightning -->
-          <path d="M13 2 8 12h4l-1 10 5-10h-4l1-10z" />
-        </svg>
-
-        <!-- Night icon: solar panel + moon -->
-        <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-night" viewBox="0 0 24 24" fill="currentColor">
-          <!-- moon -->
-          <path
-            d="M18.5 2.5c-3.6.6-6.3 3.7-6.3 7.5 0 4.2 3.4 7.6 7.6 7.6 1.1 0 2.1-.2 3-.6-1.2 2.8-4 4.8-7.2 4.8-4.3 0-7.8-3.5-7.8-7.8 0-3.8 2.7-6.9 6.3-7.5-.6-.2-1.1-.3-1.6-.3z"
-            opacity="0.9" />
-          <!-- panel -->
-          <path d="M3 11h18l-1 8H4l-1-8zm2 2 .5 4h13L19 13H5z" opacity="0.55" />
-          <path d="M4 9h16v2H4V9z" opacity="0.55" />
-          <!-- panel grid -->
-          <path d="M8 11.5v7M12 11.5v7M16 11.5v7" opacity="0.25" />
-          <path d="M5.8 14.5h12.4" opacity="0.25" />
-        </svg>
-
-        <div class="card-label">Produzione Fotovoltaico</div>
-        <div class="card-value"><span data-live="pv.val"><?php echo $p['pv']['val']; ?></span><span
-            class="card-unit">W</span></div>
-        <!-- Le ultime 10 letture, come nella card Consumo Casa. -->
-        <div class="eff-bars" data-live-html="pv.bars"><?php echo $p['pv']['bars'] ?? ''; ?></div>
-        <div style="font-size:0.65rem; color:var(--text-muted); margin-top:2px;">
-          ultime 10 letture · max <span data-live="pv.barsMax"><?php echo $p['pv']['barsMax'] ?? ''; ?></span>
-        </div>
-
-        <div style="font-weight:800; font-size:0.75rem; color:<?php echo $p['pv']['skyColor']; ?>; margin-top:5px; text-transform:uppercase; <?php echo showStyle($p['pv']['skyText'] !== ''); ?>"
-          data-live-show="pv.skyText" data-live-color="pv.skyColor">
-          &#9728; <span data-live="pv.skyText"><?php echo $p['pv']['skyText']; ?></span>
-        </div>
-
-        <div class="minmax-row">
-          <div class="minmax-item">
-            <span class="minmax-label">Picco 24h</span>
-            <span class="minmax-val" data-live="pv.peak"><?php echo $p['pv']['peak']; ?></span>
-          </div>
-          <div class="minmax-item">
-            <span class="minmax-label">Ieri stessa ora</span>
-            <span class="minmax-val" data-live="pv.yesterday"><?php echo $p['pv']['yesterday']; ?></span>
-          </div>
-        </div>
-      </a>
-    </div>
-
-    <?php if ($emAvailable && !empty($p['battAvailable'])): ?>
-      <!-- 4b. Carichi consigliati: via libera quando il FV supera il consumo
-           casa e il pacco ha almeno 1,8 kWh. Verde se l'avanzo FV, coi 800 W
-           della batteria, regge il carico; giallo se no. -->
-      <div class="card border-power" data-card="carichi">
-        <a href="<?php echo $p['pv']['link']; ?>" data-live-href="pv.link">
-          <svg xmlns="http://www.w3.org/2000/svg" class="card-icon icon-power" viewBox="0 0 24 24"
-            fill="currentColor">
-            <!-- plug -->
-            <path d="M8 2h2v5H8V2zm6 0h2v5h-2V2z" />
-            <path d="M6 7h12v4a6 6 0 0 1-5 5.9V22h-2v-5.1A6 6 0 0 1 6 11V7z" />
-          </svg>
-          <div class="card-label">Carichi consigliati</div>
-          <div class="flow-state" style="font-size:1rem; color:<?php echo $p['carichi']['stateColor']; ?>;"
-            data-live="carichi.state" data-live-color="carichi.stateColor"><?php echo $p['carichi']['state']; ?></div>
-          <div style="font-size:0.7rem; color:var(--text-muted); margin-top:2px;"
-            data-live="carichi.why"><?php echo $p['carichi']['why']; ?></div>
-          <div class="load-list" data-live-html="carichi.list"><?php echo $p['carichi']['list']; ?></div>
-          <div class="mix-legend">
-            <span style="color:var(--accent-green);">&#9679; FV + batteria</span>
-            <span style="color:var(--accent-yellow);">&#9679; poco FV</span>
-            <span style="color:var(--accent-red);">&#9679; niente avanzo FV</span>
-            <span style="color:var(--text-muted);">&#9679; batteria bassa</span>
-          </div>
-          <div class="minmax-row">
-            <div class="minmax-item"><span class="minmax-label">Avanzo FV</span><span class="minmax-val"
-                data-live="carichi.surplus"><?php echo $p['carichi']['surplus']; ?></span></div>
-            <div class="minmax-item"><span class="minmax-label">Batteria</span><span class="minmax-val"
-                data-live="carichi.residuo"><?php echo $p['carichi']['residuo']; ?></span></div>
-          </div>
-        </a>
-      </div>
-    <?php endif; ?>
 
     <!-- 5. Umidità -->
     <div class="card border-humi" data-card="humi">
@@ -1992,7 +2197,7 @@ $casaHref = !empty($p['oraria']['casaShow']) ? '#oraria-casa' : 'grafico.php?var
     </div>
   </div>
 
-  <footer style="margin-top:40px; text-align:center; font-size:0.8rem; color:var(--text-muted);">
+  <footer>
     &copy; <?php echo date("Y"); ?> Cesana Beach | Alt: 264m slm | Powered by Steplab
   </footer>
 

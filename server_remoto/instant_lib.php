@@ -177,9 +177,9 @@ defined('BATT_PV_OFF_W') || define('BATT_PV_OFF_W', 10.0);
  * non stanno mai esattamente a zero. */
 defined('BATT_COVER_W') || define('BATT_COVER_W', 30.0);
 
-/** Card "Carichi consigliati": energia minima nel pacco, in kWh, perche' valga
- * la pena accendere un elettrodomestico (oltre al FV sopra il consumo casa). */
-defined('CARICHI_MIN_BATT_KWH') || define('CARICHI_MIN_BATT_KWH', 1.8);
+/** Card "Carichi consigliati": carica minima del pacco, in %, perche' valga la
+ * pena accendere un elettrodomestico (oltre al FV sopra il consumo casa). */
+defined('CARICHI_MIN_BATT_SOC') || define('CARICHI_MIN_BATT_SOC', 30.0);
 
 /** I carichi della card e l'avanzo FV, in watt, che serve per il pallino
  * verde: la batteria eroga al massimo 800 W, quindi e' la parte del carico
@@ -2488,12 +2488,12 @@ function meteo_build_payload(mysqli $link): array
 
   /* Carichi consigliati: quali elettrodomestici accendere adesso. Il requisito
    * e' lo stesso per tutti -- il fotovoltaico supera il consumo casa e nel
-   * pacco restano almeno CARICHI_MIN_BATT_KWH -- e la soglia di ogni carico
+   * pacco e' almeno al CARICHI_MIN_BATT_SOC -- e la soglia di ogni carico
    * (avanzo FV che, coi 800 W della batteria, lo regge) decide verde o giallo. */
   $carichiResiduo = ($safeBattSoc0 === null) ? null : $safeBattSoc0 / 100 * BATT_CAPACITY_KWH;
   $carichiSurplus = ($safePv0 !== null && $safeCasa0 !== null) ? $safePv0 - $safeCasa0 : null;
   $carichiPvOk = ($carichiSurplus !== null && $carichiSurplus > 0);
-  $carichiBattOk = ($carichiResiduo !== null && $carichiResiduo >= CARICHI_MIN_BATT_KWH);
+  $carichiBattOk = ($safeBattSoc0 !== null && $safeBattSoc0 >= CARICHI_MIN_BATT_SOC);
   $carichiOk = $carichiPvOk && $carichiBattOk;
   $carichiList = '';
   // Nome in nero e un pallino: verde l'avanzo FV raggiunge la soglia del
@@ -2513,7 +2513,7 @@ function meteo_build_payload(mysqli $link): array
   $carichiWhy = $carichiOk ? 'Avanzo FV ' . fmtW($carichiSurplus)
     : (($carichiSurplus === null || $carichiResiduo === null) ? 'Dati non disponibili'
       : (!$carichiPvOk ? 'FV sotto il consumo casa'
-        : 'Batteria sotto ' . number_format(CARICHI_MIN_BATT_KWH, 1) . ' kWh'));
+        : 'Batteria sotto il ' . round(CARICHI_MIN_BATT_SOC) . '%'));
 
   // How much of the load is NOT bought from the grid -- covered by the panels
   // directly or by the battery giving back. Computed from the import rather
@@ -2607,7 +2607,8 @@ function meteo_build_payload(mysqli $link): array
       'stateColor' => $carichiOk ? 'var(--accent-green)' : 'var(--accent-red)',
       'why' => $carichiWhy,
       'surplus' => ($carichiSurplus === null) ? '--' : fmtW($carichiSurplus),
-      'residuo' => ($carichiResiduo === null) ? '--' : number_format($carichiResiduo, 2) . ' kWh',
+      'residuo' => ($carichiResiduo === null) ? '--'
+        : round($safeBattSoc0) . '% · ' . number_format($carichiResiduo, 2) . ' kWh',
       'list' => $carichiList,
     ],
 
