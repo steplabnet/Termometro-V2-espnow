@@ -47,6 +47,9 @@ TARGETS=(
   "carichi.php|/var/www/html|"
   "battery_bridge.py|/var/www/html|meteo-battery.service"
   "check_energy.py|/var/www/html|"
+  "pi_health.sh|/var/www/html|"
+  "meteo-health.service|/var/www/html|"
+  "meteo-health.timer|/var/www/html|"
 )
 
 sh_remote() { "$PLINK" -ssh -batch -pw "$PI_PASS" "$PI_USER@$PI_HOST" "$@"; }

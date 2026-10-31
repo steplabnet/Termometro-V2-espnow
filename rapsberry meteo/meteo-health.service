@@ -1,0 +1,9 @@
+[Unit]
+Description=Stazione Meteo health check (network, services) with automatic recovery
+After=network.target
+
+[Service]
+Type=oneshot
+# Through bash, not the shebang: works whatever the file mode after a deploy.
+ExecStart=/bin/bash /var/www/html/pi_health.sh
+TimeoutStartSec=5min

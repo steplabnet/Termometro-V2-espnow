@@ -56,7 +56,9 @@ PV_ZERO_THRESHOLD = 10.0     # PV production below this is noise -> recorded as 
 # So a channel that has gone quiet on MQTT is read straight off the device over
 # HTTP and fed through the same path as a message. Whenever the notifications
 # do work the poller finds the channel fresh and does nothing.
-SHELLY_HTTP_HOST = "192.168.1.182"   # shellyproem50-441d6474e384.local
+# By mDNS name, not IP: DHCP moved the meter from .182 to .183 (seen
+# 2026-10-30) and the poller went silent, leaving PV and house load NULL.
+SHELLY_HTTP_HOST = "shellyproem50-441d6474e384.local"
 SHELLY_HTTP_INTERVAL = 5             # seconds between checks
 SHELLY_HTTP_STALE = 15               # a channel quiet this long is polled
 SHELLY_HTTP_TIMEOUT = 3

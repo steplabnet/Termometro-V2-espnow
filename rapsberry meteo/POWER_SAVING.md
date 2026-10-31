@@ -27,7 +27,7 @@ Backup of the original: `/boot/firmware/config.txt.bak-20261008-165248`
   `wayvnc.service wayvnc-control.service bluetooth.service hciuart.service cups.service cups.socket cups.path cups-browsed.service ModemManager.service triggerhappy.service triggerhappy.socket glamor-test.service rp1-test.service rpi-display-backlight.service`
 
 ### Deliberately left unchanged
-- Wi-Fi power save: it was already `on` (`iw dev wlan0 get power_save`).
+- Wi-Fi power save: it was already `on` (`iw dev wlan0 get power_save`). It was turned **off** on 2026-10-31 to fix the dropouts (see `AUTO_RECOVERY.md`).
 - `eth0` / NetworkManager "Wired connection 1": still enabled.
 - USB: the Tinkerforge Master Brick (`brickd`) is connected through the VIA USB hub.
 - `dtparam=i2c_arm=on`: `meteo.py` imports `board`/`busio`, and it costs nothing.
@@ -71,7 +71,7 @@ sudo reboot
 ## Verify after any change
 ```sh
 systemctl --failed --no-legend
-systemctl is-active meteo meteo-receiver meteo-alarms meteo-crono meteo-crono-remote meteo-battery mosquitto apache2 brickd tailscaled watchdog
+systemctl is-active meteo meteo-receiver meteo-alarms meteo-crono meteo-crono-remote meteo-battery mosquitto apache2 brickd tailscaled watchdog meteo-health.timer
 python3 /var/www/html/check_energy.py      # should end with "5 ok, 0 failed"
 ```
 If you run it in the first minute after boot, step 3 may fail because no energy rows have arrived yet. Re-run it.
